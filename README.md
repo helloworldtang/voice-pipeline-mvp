@@ -50,6 +50,10 @@ ln -sf "$(pwd)/.venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntim
 | TTS 首音地板 | kokoro 660ms、melo 156ms（**无增量流**：首片到手 = 整句合成完成）|
 | TTS 单点收益 | 只换引擎，端到端口径B 从 1120ms → **713ms** |
 | 端到端口径B（LLM 为 sim，即本机侧下界）| kokoro 964~1120ms / melo **713ms** |
+| 端到端口径B（**真 LLM = qwen-flash**，melo）| **1109ms**（账单：llm_first_token 380ms / first_sentence_done 409ms）|
+
+**接上真 LLM 之后，端到端口径B 从 713ms 涨到 1109ms。** 713ms 是"本机侧下界"，
+不是可对外报的延迟；含真 LLM 的数字才是。`scripts/probe_llm.py` 单独量 LLM 那一格。
 
 **TTS 是最大的单项开销。** 300ms 在「EOU 之后才开始动」的前提下数学上不可达
 （TTS 地板 156ms + EOU 判停 200~300ms + ASR 尾延迟 ~120ms 已超 500ms），
@@ -66,7 +70,8 @@ uv run python scripts/demo_serial.py   # sim 全链：waterfall + 双口径账�
 
 ./scripts/download_models.sh  # 拉真实模型（~400MB，不进仓）
 uv run python scripts/calibrate.py --silence-ms 200,300   # 本机延迟校准 → bench/*.json
-uv run python scripts/demo_real.py --tts melo             # real 全链（真模型）端到端
+uv run python scripts/demo_real.py --tts melo             # real 全链（真模型 + 真 LLM）端到端
+uv run python scripts/probe_llm.py                        # 单独量 LLM 那一格：首 token / 首完整句
 
 uv run ruff check .           # lint（含 import 排序 / 死代码 / 简化）
 uv run ruff format --check .  # 格式门禁（与 CI 一致，漏跑会 push 后红）
@@ -137,7 +142,7 @@ uv run python scripts/live_client.py --url ws://localhost:8000/ws   # 需 pyaudi
 
 | 项 | 现状 | 影响 | 后续 |
 |---|---|---|---|
-| **真 LLM（DeepSeek）未接** | `real` 模式里 ASR/TTS 是真模型，**LLM 仍是 `SimLlm`** | 端到端口径B 只是「本机侧下界」，不含真实 LLM 首 token 延迟 | provider 接口已就绪，接 DeepSeek 流式即可 |
+| **真 LLM 选型已定，代价已入账** | real 模式接 **DashScope `qwen-flash`**（`providers/llm/qwen_llm.py`），本机实测首 token 367ms / 首完整句 522ms，是候选里最快的非思考型档 | 端到端口径B 因此从 713ms（sim 下界）涨到 **1109ms**；300ms 只剩投机命中一条路，而命中率实测 1/27 | 无 key 时 `auto` 退回 SimLlm **并告警**（静默退回会让账单少算一格，护栏就是那条日志）；DeepSeek 现役模型默认开思考链，见 `scripts/probe_llm.py` |
 | **回声抑制未做** | barge-in 仅 L1 能量判定 | 外放会自激误触发；一期靠入耳式耳机**物理隔离** | 文本↔ASR 重合抑制 / 软件 AEC（二期） |
 | **打断尾音未量化** | `barge_in_latency_ms` 只记服务端检测时刻 | 不含客户端播放缓冲残留音频的实际停播耗时 | 需带播放队列的真机测量 |
 | **scripted 客户端未做** | 只有 live（`scripts/live_client.py`） | CI 里没有「回放固定音频走 WS」的确定性回归 | 补 `client/scripted_client.py` |

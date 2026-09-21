@@ -4,13 +4,15 @@
   1. 真实链路的 waterfall 每段到底多少毫秒
   2. 口径B（用户说完 → AI 首音）落在哪
 
-LLM 目前还是 sim（没有 API key），所以这里的数字只覆盖 ASR+TTS 本机侧，
-LLM 那一格在接入后单独补测，不做推算。
+LLM 现在是真的：默认走 `build_llm("auto")`，有 DASHSCOPE_API_KEY 就用 qwen-flash，
+没有就退回 SimLlm 并告警——**告警时账单里 LLM 那一格是 0ms，只是本机侧下界，
+不要对外当真实延迟报**（`scripts/probe_llm.py` 量的是 LLM 单独那一格）。
 
 用法：
   uv run python scripts/demo_real.py                 # 默认探针句
   uv run python scripts/demo_real.py --text "…"      # 指定「用户说了什么」
   uv run python scripts/demo_real.py --engine paraformer
+  uv run python scripts/demo_real.py --llm sim       # 强制替身，用于和真 LLM 对照
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import soxr
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from voice_pipeline.providers import sherpa as R  # noqa: E402
+from voice_pipeline.providers.factory import build_llm  # noqa: E402
 from voice_pipeline.providers.vad import SileroVad  # noqa: E402
 from voice_pipeline.server.session import Session  # noqa: E402
 
@@ -46,11 +49,13 @@ async def main() -> int:
     ap.add_argument("--text", default="我想问一下明天的天气怎么样")
     ap.add_argument("--engine", default="transducer", choices=["transducer", "paraformer"])
     ap.add_argument("--tts", default="kokoro", choices=["kokoro", "melo"])
+    ap.add_argument("--llm", default="auto", choices=["auto", "qwen", "sim"])
     ap.add_argument("--silence-ms", type=int, default=300, help="EOU 前追加的静音")
     args = ap.parse_args()
 
     engine = R.TransducerStreamingAsr if args.engine == "transducer" else R.ParaformerStreamingAsr
-    print(f"机器: {machine()}   ASR={args.engine}   TTS={args.tts}")
+    llm = build_llm(args.llm)
+    print(f"机器: {machine()}   ASR={args.engine}   TTS={args.tts}   LLM={type(llm).__name__}")
 
     t0 = time.perf_counter()
     tts = R.build_tts_engine(args.tts, num_threads=4)
@@ -63,7 +68,7 @@ async def main() -> int:
     user_ms = len(user_pcm) / 16000 * 1000
     print(f"模拟用户说话 {user_ms:.0f}ms（合成语音上行）")
 
-    session = Session(mode="real", asr=asr, tts=tts)
+    session = Session(mode="real", asr=asr, llm=llm, tts=tts)
     frame = 3200  # 上行 100ms @16k
     stream = []
     for i in range(0, len(user_pcm), frame):
