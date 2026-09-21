@@ -26,6 +26,7 @@ class SessionBegin(BaseModel):
     type: Literal["session.begin"] = "session.begin"
     sample_rate: int = 16000
     client: str = "unknown"
+    mode: Literal["echo", "serial"] = "serial"
 
 
 class Interrupt(BaseModel):
@@ -35,6 +36,37 @@ class Interrupt(BaseModel):
 
 class SessionEnd(BaseModel):
     type: Literal["session.end"] = "session.end"
+
+
+class AsrPartial(BaseModel):
+    type: Literal["asr.partial"] = "asr.partial"
+    text: str
+
+
+class AsrFinal(BaseModel):
+    type: Literal["asr.final"] = "asr.final"
+    text: str
+
+
+class TurnStart(BaseModel):
+    type: Literal["turn.start"] = "turn.start"
+
+
+class TtsSentence(BaseModel):
+    type: Literal["tts.sentence"] = "tts.sentence"
+    seq: int
+    text: str
+
+
+class AudioChunk(BaseModel):
+    type: Literal["audio.chunk"] = "audio.chunk"
+    seq: int
+    bytes_len: int
+
+
+class TurnEnd(BaseModel):
+    type: Literal["turn.end"] = "turn.end"
+    metrics: dict[str, float]
 
 
 class SessionReady(BaseModel):
@@ -57,7 +89,15 @@ class ErrorEvent(BaseModel):
 
 ClientFrame = Annotated[SessionBegin | Interrupt | SessionEnd, Field(discriminator="type")]
 ServerEvent = Annotated[
-    SessionReady | SessionClosed | ErrorEvent,
+    SessionReady
+    | SessionClosed
+    | ErrorEvent
+    | AsrPartial
+    | AsrFinal
+    | TurnStart
+    | TtsSentence
+    | AudioChunk
+    | TurnEnd,
     Field(discriminator="type"),
 ]
 
@@ -72,6 +112,6 @@ def parse_client_frame(raw: str) -> SessionBegin | Interrupt | SessionEnd:
         raise ProtocolError(code="bad_frame", message=str(exc)) from exc
 
 
-def dump_event(event: SessionReady | SessionClosed | ErrorEvent) -> str:
+def dump_event(event: BaseModel) -> str:
     """序列化下行事件帧。"""
     return event.model_dump_json()

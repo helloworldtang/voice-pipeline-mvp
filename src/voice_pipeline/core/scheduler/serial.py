@@ -1,0 +1,77 @@
+"""serial 调度：忠实复现质疑方的时序模型——EOU 之后才启动 LLM。
+
+它是 A/B 实验的对照组：实测若落在 1.2~1.9s 区间，就证明了「在串行前提下质疑方的算术完全成立」，
+分歧不在数字而在时序模型（见背景与基线 §二）。
+"""
+
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+
+from voice_pipeline.audio.chunker import Chunker
+from voice_pipeline.core.sentence_splitter import SentenceSplitter
+from voice_pipeline.metrics.events import TurnMetrics
+from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
+from voice_pipeline.server.protocol import AsrFinal, TtsSentence, TurnEnd, TurnStart
+
+from .base import AudioFragment, TurnItem
+
+
+class SerialScheduler:
+    def __init__(
+        self,
+        asr: AsrProvider,
+        llm: LlmProvider,
+        tts: TtsProvider,
+        metrics: TurnMetrics,
+        splitter: SentenceSplitter | None = None,
+        chunker: Chunker | None = None,
+    ) -> None:
+        self._asr = asr
+        self._llm = llm
+        self._tts = tts
+        self._metrics = metrics
+        self._splitter = splitter or SentenceSplitter()
+        self._chunker = chunker or Chunker()
+
+    async def on_audio(self, chunk: bytes) -> None:
+        await self._asr.push_audio(chunk)
+
+    async def on_end_of_utterance(self) -> AsyncIterator[TurnItem]:
+        self._metrics.mark("utterance_end")
+        yield TurnStart()
+
+        transcript = await self._asr.finalize()
+        yield AsrFinal(text=transcript)
+
+        sentence_seq = 0
+        saw_token = False
+        async for piece in self._llm.astream(transcript):
+            if not saw_token:
+                self._metrics.mark("llm_first_token")
+                saw_token = True
+            for sentence in self._splitter.feed(piece):
+                sentence_seq += 1
+                if sentence_seq == 1:
+                    self._metrics.mark("first_sentence_done")
+                async for item in self._synthesize(sentence, sentence_seq):
+                    yield item
+
+        tail = self._splitter.flush()
+        if tail:
+            sentence_seq += 1
+            async for item in self._synthesize(tail, sentence_seq):
+                yield item
+
+        self._metrics.mark("turn_end")
+        yield TurnEnd(metrics=self._metrics.bill())
+
+    async def _synthesize(self, sentence: str, seq: int) -> AsyncIterator[TurnItem]:
+        self._metrics.sentences += 1
+        yield TtsSentence(seq=seq, text=sentence)
+        async for block in self._tts.synth(sentence):
+            self._metrics.mark("tts_first_chunk")
+            for chunk in self._chunker.feed(block):
+                self._metrics.mark("first_audio_out")
+                self._metrics.audio_bytes += len(chunk)
+                yield AudioFragment(seq=self._chunker.next_seq(), data=chunk)

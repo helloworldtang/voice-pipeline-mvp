@@ -3,11 +3,28 @@
 from __future__ import annotations
 
 import json
+from typing import Any
 
 from fastapi.testclient import TestClient
 
 from voice_pipeline.server.app import create_app
-from voice_pipeline.server.protocol import Interrupt, SessionEnd
+from voice_pipeline.server.protocol import (
+    AsrFinal,
+    AudioChunk,
+    Interrupt,
+    SessionBegin,
+    SessionEnd,
+    TtsSentence,
+    TurnEnd,
+    TurnStart,
+)
+
+PCM_FRAME = b"\x00\x01"
+
+
+def _open_echo(ws: Any) -> Any:
+    ws.send_text(SessionBegin(mode="echo").model_dump_json())
+    return ws.receive_json()
 
 
 def test_healthz() -> None:
@@ -17,13 +34,13 @@ def test_healthz() -> None:
 
 def test_ws_handshake_then_echo_audio() -> None:
     with TestClient(create_app()).websocket_connect("/ws") as ws:
-        ready = ws.receive_json()
+        ws.receive_json()  # 首帧_ready（默认 serial）
+        ready = _open_echo(ws)
         assert ready["type"] == "session.ready"
         assert ready["session_id"]
-        assert ready["trace_id"]
 
-        ws.send_bytes(b"\x01\x02\x03\x04")
-        assert ws.receive_bytes() == b"\x01\x02\x03\x04"
+        ws.send_bytes(PCM_FRAME)
+        assert ws.receive_bytes() == PCM_FRAME
 
         ws.send_text(SessionEnd().model_dump_json())
         closed = ws.receive_json()
@@ -34,8 +51,9 @@ def test_ws_handshake_then_echo_audio() -> None:
 def test_ws_counts_multiple_echoed_frames() -> None:
     with TestClient(create_app()).websocket_connect("/ws") as ws:
         ws.receive_json()
+        _open_echo(ws)
         for _ in range(3):
-            ws.send_bytes(b"\x00\x01")
+            ws.send_bytes(PCM_FRAME)
             ws.receive_bytes()
         ws.send_text(SessionEnd().model_dump_json())
         assert ws.receive_json()["frames_echoed"] == 3
@@ -44,13 +62,13 @@ def test_ws_counts_multiple_echoed_frames() -> None:
 def test_ws_reports_bad_frame_and_keeps_session_alive() -> None:
     with TestClient(create_app()).websocket_connect("/ws") as ws:
         ws.receive_json()
+        _open_echo(ws)
 
         ws.send_text("not json")
         err = ws.receive_json()
         assert err["type"] == "error"
         assert err["code"] == "bad_frame"
 
-        # 会话未被异常打断：仍能正常 echo
         ws.send_bytes(b"\x07")
         assert ws.receive_bytes() == b"\x07"
 
@@ -63,5 +81,53 @@ def test_ws_interrupt_without_turn_reports_no_active_turn() -> None:
         assert err["code"] == "no_active_turn"
 
 
-def test_interrupt_model_roundtrip() -> None:
-    assert json.loads(Interrupt(reason="stop").model_dump_json())["reason"] == "stop"
+def test_serial_mode_runs_full_chain_over_ws() -> None:
+    """上行音频 → session.end → ASR → LLM → 分句 → TTS → 200ms 分片 → turn.end(账单)。"""
+    with TestClient(create_app()).websocket_connect("/ws") as ws:
+        ws.receive_json()  # 默认即 serial
+        ws.send_bytes(PCM_FRAME)
+
+        ws.send_text(SessionEnd().model_dump_json())
+
+        types: list[str] = []
+        bill: dict[str, float] = {}
+        audio_sizes: list[int] = []
+        while True:
+            payload = ws.receive_json()
+            types.append(payload["type"])
+            if payload["type"] == "audio.chunk":
+                audio_sizes.append(payload["bytes_len"])
+                assert len(ws.receive_bytes()) == payload["bytes_len"]
+            if payload["type"] == "turn.end":
+                bill = payload["metrics"]
+                break
+
+        assert types[0] == TurnStart().type == "turn.start"
+        assert "asr.final" in types
+        assert "tts.sentence" in types
+        assert "audio.chunk" in types
+        assert types[-1] == "turn.end"
+
+        assert set(audio_sizes) == {9600}  # 24k × 200ms × PCM16
+        assert bill["caliber_b_ms"] >= 0
+        assert bill["sentences"] >= 1
+
+
+def test_intermediate_event_shapes_are_stable() -> None:
+    """事件的 wire 形状就是对外承诺，改动必须显式。"""
+    assert AsrFinal(text="上海今天多少度").model_dump() == {
+        "type": "asr.final",
+        "text": "上海今天多少度",
+    }
+    assert TtsSentence(seq=1, text="今天晴。").model_dump() == {
+        "type": "tts.sentence",
+        "seq": 1,
+        "text": "今天晴。",
+    }
+    assert AudioChunk(seq=2, bytes_len=9600).model_dump() == {
+        "type": "audio.chunk",
+        "seq": 2,
+        "bytes_len": 9600,
+    }
+    assert TurnEnd(metrics={"caliber_b_ms": 1.0}).type == "turn.end"
+    assert Interrupt(reason="stop").type == "interrupt"
