@@ -26,7 +26,7 @@ class SessionBegin(BaseModel):
     type: Literal["session.begin"] = "session.begin"
     sample_rate: int = 16000
     client: str = "unknown"
-    mode: Literal["echo", "serial"] = "serial"
+    mode: Literal["echo", "serial", "real"] = "serial"
 
 
 class Interrupt(BaseModel):

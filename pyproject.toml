@@ -38,10 +38,14 @@ src = ["src", "tests"]
 select = ["E", "W", "F", "I", "B", "C4", "UP", "SIM"]
 
 [tool.mypy]
-python_version = "3.10"
+python_version = "3.12"
 strict = true
 warn_unreachable = true
 files = ["src", "tests"]
+# sherpa-onnx 未随 wheel 提供 py.typed / stubs —— 与其假装，不如显式忽略
+[[tool.mypy.overrides]]
+module = ["sherpa_onnx.*", "soxr.*"]
+ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = ["tests.*"]

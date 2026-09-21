@@ -16,6 +16,7 @@ from voice_pipeline.core.sentence_splitter import SentenceSplitter
 from voice_pipeline.metrics.events import SessionClock, TurnMetrics
 from voice_pipeline.providers.asr.sim_asr import SimAsr
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
+from voice_pipeline.providers.factory import build_providers
 from voice_pipeline.providers.llm.sim_llm import SimLlm
 from voice_pipeline.providers.tts.sim_tts import SimTts
 
@@ -42,6 +43,9 @@ class Session:
         if mode == "echo":
             self._scheduler: SerialScheduler | None = None
         else:
+            if asr is None and llm is None and tts is None:
+                providers = build_providers("real" if mode == "real" else "sim")
+                asr, llm, tts = providers.asr, providers.llm, providers.tts
             self._scheduler = SerialScheduler(
                 asr=asr or SimAsr(),
                 llm=llm or SimLlm(),
