@@ -28,7 +28,8 @@ ln -sf "$(pwd)/.venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntim
 - ✅ **M0 骨架**：质量门禁 + WS echo 服务 + sim 三替身
 - ✅ **M1 serial 全链**：serial 调度 + 句末切句 + TTS 分片 + waterfall 账单（`scripts/demo_serial.py`）
 - ✅ **M2a real 接入 + 本机校准**：真模型跑通 ASR → LLM → TTS，`real` 模式已进 WS
-- ⬜ M2b EOU 判停（韵律 + 语义两路） / M3 barge-in + live 客户端 / M4 pipelined / M5 收尾发版
+- ✅ **M4 pipelined 投机调度**：用户说完前把 LLM+TTS 算完，EOU 后即刻播音；命中时口径B **179ms**（melo + 250ms 静音），首音 ≤300ms 达标。作废（答错问题）与打断（不留悬挂任务）两条纪律单测覆盖（`tests/test_pipelined.py`）
+- ⬜ M2b EOU 判停（韵律 + 语义两路） / M3 barge-in + live 客户端 / M5 收尾发版
 
 代码按 `技术方案.md` §9 的里程碑推进。每个数字都必须能被一条命令复现。
 
@@ -45,6 +46,9 @@ ln -sf "$(pwd)/.venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntim
 **TTS 是最大的单项开销。** 300ms 在「EOU 之后才开始动」的前提下数学上不可达
 （TTS 地板 156ms + EOU 判停 200~300ms + ASR 尾延迟 ~120ms 已超 500ms），
 只能靠**投机执行**把 TTS 藏进用户说话的尾段——这是 M4 的主线。
+
+| 端到端口径B（命中投机，melo + 250ms 静音窗）| **179ms** —— 首音 ≤300ms 达标（`scripts/bench_schedulers.py`）|
+| 端到端口径B（未命中投机，退化串行）| 713ms（melo 地板）|
 
 ## 快速开始
 

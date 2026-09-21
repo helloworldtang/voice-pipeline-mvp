@@ -2,10 +2,14 @@
 
 它是 A/B 实验的对照组：实测若落在 1.2~1.9s 区间，就证明了「在串行前提下质疑方的算术完全成立」，
 分歧不在数字而在时序模型（见背景与基线 §二）。
+
+注：即便是对照组也要把 TTS 卸到线程池（`asyncio.to_thread`）——否则一次合成就会堵死
+整个事件循环，对照组测出来就不再是「慢」而是「坏」，A/B 失去意义。
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 
 from voice_pipeline.audio.chunker import Chunker
@@ -36,6 +40,10 @@ class SerialScheduler:
 
     async def on_audio(self, chunk: bytes) -> None:
         await self._asr.push_audio(chunk)
+
+    def cancel(self) -> None:
+        """barge-in：本类没有后台 speculative 工作，仅需复位由 EOU 驱动的状态。"""
+        self._splitter = SentenceSplitter()
 
     async def on_end_of_utterance(self) -> AsyncIterator[TurnItem]:
         self._metrics.mark("utterance_end")
@@ -69,9 +77,9 @@ class SerialScheduler:
     async def _synthesize(self, sentence: str, seq: int) -> AsyncIterator[TurnItem]:
         self._metrics.sentences += 1
         yield TtsSentence(seq=seq, text=sentence)
-        async for block in self._tts.synth(sentence):
-            self._metrics.mark("tts_first_chunk")
-            for chunk in self._chunker.feed(block):
-                self._metrics.mark("first_audio_out")
-                self._metrics.audio_bytes += len(chunk)
-                yield AudioFragment(seq=self._chunker.next_seq(), data=chunk)
+        pcm = await asyncio.to_thread(self._tts.synth_blocking, sentence)
+        self._metrics.mark("tts_first_chunk")
+        for chunk in self._chunker.feed(pcm):
+            self._metrics.mark("first_audio_out")
+            self._metrics.audio_bytes += len(chunk)
+            yield AudioFragment(seq=self._chunker.next_seq(), data=chunk)

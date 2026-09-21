@@ -9,6 +9,7 @@ scripts/calibrate.py 实测，不能引用厂商宣传值。
 
 from __future__ import annotations
 
+import asyncio
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
@@ -207,10 +208,14 @@ class BaseTts(ABC):
             sr = self.out_sample_rate
         return samples, sr
 
-    async def synth(self, sentence: str) -> AsyncIterator[bytes]:
+    def synth_blocking(self, sentence: str) -> bytes:
+        """同步阻塞合成：**必须在线程池里调用**，否则会堵死事件循环。"""
         samples, sr = self.generate(sentence)
-        pcm = pcm16_bytes(samples)
-        step = int(sr * self._chunk_ms / 1000) * 2
+        return pcm16_bytes(samples)
+
+    async def synth(self, sentence: str) -> AsyncIterator[bytes]:
+        pcm = await asyncio.to_thread(self.synth_blocking, sentence)
+        step = int(self.out_sample_rate * self._chunk_ms / 1000) * 2
         for off in range(0, len(pcm), step):
             yield pcm[off : off + step]
 
@@ -253,7 +258,7 @@ class BaseTts(ABC):
 class KokoroTts(BaseTts):
     """kokoro-multi-lang v1.1 int8，24kHz 原生，多音色，音质最好。
 
-    代价：RTF ~0.6，且 modelo 是整句一次性产出（回调只触发一次），
+    代价：RTF ~0.6，且整句一次性产出（回调只触发一次），
     首音必须等整句合成完。本机实测一个字「好」也要 636ms。
     """
 
