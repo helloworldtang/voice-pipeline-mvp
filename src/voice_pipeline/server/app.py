@@ -53,6 +53,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             dump_event(SessionReady(session_id=session.session_id, trace_id=session.trace_id))
         )
 
+        async def drain_turn() -> None:
+            async for item in session.finish():
+                if isinstance(item, AudioFragment):
+                    await websocket.send_text(
+                        dump_event(AudioChunk(seq=item.seq, bytes_len=len(item.data)))
+                    )
+                    await websocket.send_bytes(item.data)
+                else:
+                    await websocket.send_text(dump_event(item))
+            await websocket.send_text(
+                dump_event(
+                    SessionClosed(
+                        session_id=session.session_id,
+                        frames_echoed=session.frames_echoed,
+                    )
+                )
+            )
+
         try:
             while True:
                 message: MutableMapping[str, Any] = await websocket.receive()
@@ -63,6 +81,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if isinstance(audio, bytes):
                     for fragment in await session.on_audio(audio):
                         await websocket.send_bytes(fragment.data)
+                    # real 模式：EOU 判停器触发即自动收尾，不必等客户端 session.end
+                    if session.pending_end():
+                        await drain_turn()
+                        break
                     continue
 
                 text = message.get("text")
@@ -87,22 +109,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     continue
 
                 if isinstance(frame, SessionEnd):
-                    async for item in session.finish():
-                        if isinstance(item, AudioFragment):
-                            await websocket.send_text(
-                                dump_event(AudioChunk(seq=item.seq, bytes_len=len(item.data)))
-                            )
-                            await websocket.send_bytes(item.data)
-                        else:
-                            await websocket.send_text(dump_event(item))
-                    await websocket.send_text(
-                        dump_event(
-                            SessionClosed(
-                                session_id=session.session_id,
-                                frames_echoed=session.frames_echoed,
-                            )
-                        )
-                    )
+                    await drain_turn()
                     break
 
                 if isinstance(frame, Interrupt):

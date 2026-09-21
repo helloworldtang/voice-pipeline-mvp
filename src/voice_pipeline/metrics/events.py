@@ -44,6 +44,11 @@ class TurnMetrics:
     marks: dict[str, float] = field(default_factory=dict)
     sentences: int = 0
     audio_bytes: int = 0
+    # EOU 判停指标（§3 / §12.4）：抢话与漏判是一等验收指标
+    premature_eou: bool = False  # FP：判停后窗口内用户又开口 = 抢话
+    missed_eou: bool = False  # FN：该判未判，用户闭嘴后仍在干等
+    eou_latency_ms: float = -1.0  # 判停时刻的静音时长（残余间隙里判停占的一段）
+    eou_mode: str = ""  # 本次判停用的门控档
 
     def mark(self, name: str) -> None:
         if name not in self.marks:
@@ -65,6 +70,15 @@ class TurnMetrics:
             "sentences": float(self.sentences),
             "audio_bytes": float(self.audio_bytes),
         }
+        # EOU 判停指标（§3 / §12.4）：抢话/漏判是一等验收指标
+        # eou_mode 编码：0=conservative, 1=semantic, 2=aggressive, -1=未用判停器
+        _mode_code = {"conservative": 0.0, "semantic": 1.0, "aggressive": 2.0}.get(
+            self.eou_mode, -1.0
+        )
+        bill["eou_mode"] = _mode_code
+        bill["premature_eou"] = 1.0 if self.premature_eou else 0.0
+        bill["missed_eou"] = 1.0 if self.missed_eou else 0.0
+        bill["eou_latency_ms"] = round(self.eou_latency_ms, 3)
         if first_audio is not None and vad_onset is not None:
             bill["caliber_a_ms"] = round(first_audio - vad_onset, 3)
         for point in WATERFALL_POINTS:

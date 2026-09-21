@@ -103,6 +103,9 @@ class PipelinedScheduler:
         await self._asr.push_audio(chunk)
         self._maybe_speculate()
 
+    def text(self) -> str:
+        return self._asr.text()
+
     def _maybe_speculate(self) -> None:
         if not self._speculate:
             return

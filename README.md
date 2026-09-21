@@ -28,8 +28,9 @@ ln -sf "$(pwd)/.venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntim
 - ✅ **M0 骨架**：质量门禁 + WS echo 服务 + sim 三替身
 - ✅ **M1 serial 全链**：serial 调度 + 句末切句 + TTS 分片 + waterfall 账单（`scripts/demo_serial.py`）
 - ✅ **M2a real 接入 + 本机校准**：真模型跑通 ASR → LLM → TTS，`real` 模式已进 WS
+- ✅ **M2b EOU 判停（四路融合 + 三档门控）**：`core/eou.py` 实现 L0 能量 + L1 静音 + L2 韵律终顿 + L3 语义完整融合，conservative/semantic/aggressive 三档；real 模式 WS 自动判停、不再依赖客户端 `session.end`；抢话 `premature_eou` 与漏判 `missed_eou` 进账单。L2/L3 默认用模型无关启发式，神经网络版（Smart Turn v3 / turn-detector INT8）留作同接口可插拔升级（D2）
 - ✅ **M4 pipelined 投机调度**：用户说完前把 LLM+TTS 算完，EOU 后即刻播音；命中时口径B **179ms**（melo + 250ms 静音），首音 ≤300ms 达标。作废（答错问题）与打断（不留悬挂任务）两条纪律单测覆盖（`tests/test_pipelined.py`）
-- ⬜ M2b EOU 判停（韵律 + 语义两路） / M3 barge-in + live 客户端 / M5 收尾发版
+- ⬜ M3 barge-in + live 客户端 / M5 收尾发版
 
 代码按 `技术方案.md` §9 的里程碑推进。每个数字都必须能被一条命令复现。
 

@@ -27,6 +27,10 @@ TurnItem = Union[ServerEvent, AudioFragment]  # noqa: UP007 - 运行时别名
 class Scheduler(Protocol):
     async def on_audio(self, chunk: bytes) -> None: ...
 
+    def text(self) -> str:
+        """当前 ASR partial（EOU 语义判停用）。"""
+        ...
+
     def on_end_of_utterance(self) -> AsyncIterator[TurnItem]: ...
 
     def cancel(self) -> None:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from voice_pipeline.core.eou import FusedEou, GatingMode
 from voice_pipeline.providers.asr.sim_asr import SimAsr
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.providers.llm.sim_llm import SimLlm
@@ -39,3 +40,12 @@ def build_providers(mode: str = "sim", asr_engine: str = DEFAULT_ASR_ENGINE) -> 
 
     msg = f"unknown provider mode: {mode}"
     raise ValueError(msg)
+
+
+def build_eou(gating: GatingMode = GatingMode.CONSERVATIVE, sample_rate: int = 16000) -> FusedEou:
+    """组装 EOU 判停器（M2b）。
+
+    默认用模型无关的启发式 L2(韵律)/L3(语义)；生产可把 `silence`/`prosody`/`semantic`
+    换成 Silero VAD 或神经网络版（Smart Turn v3 / turn-detector INT8），接口不变（D2）。
+    """
+    return FusedEou(gating=gating, sample_rate=sample_rate)

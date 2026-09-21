@@ -41,6 +41,9 @@ class SerialScheduler:
     async def on_audio(self, chunk: bytes) -> None:
         await self._asr.push_audio(chunk)
 
+    def text(self) -> str:
+        return self._asr.text()
+
     def cancel(self) -> None:
         """barge-in：本类没有后台 speculative 工作，仅需复位由 EOU 驱动的状态。"""
         self._splitter = SentenceSplitter()
