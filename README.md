@@ -8,6 +8,19 @@
 - 立项背景、评论区存档、验收基线：`背景与基线.md`
 - 技术选型、架构、协议、里程碑：`技术方案.md`
 
+## 本机准备（macOS）
+
+```bash
+uv python pin 3.12          # sherpa-onnx 的 wheel 在 3.13+ 上有坑
+./scripts/download_models.sh  # ASR/TTS/VAD，约 400MB，落 models/
+uv add onnxruntime            # sherpa-onnx 的 wheel 不带 libonnxruntime.dylib
+ln -sf "$(pwd)/.venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntime."*".dylib" \
+        "$(pwd)/.venv/lib/python3.12/site-packages/sherpa_onnx/lib/libonnxruntime.dylib"
+```
+
+> 两个坑都已实测：① wheel 缺 `libonnxruntime.dylib`，即使 cp312/cp314 也一样，需软链补上；
+> ② GitHub release 直连不通，模型走 HF 镜像。
+
 ## 当前进度
 
 - ✅ **M0 骨架**：质量门禁 + WS echo 服务 + sim 三替身

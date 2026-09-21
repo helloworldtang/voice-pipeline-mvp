@@ -9,6 +9,8 @@ dependencies = [
     "uvicorn[standard]>=0.30",
     "pydantic-settings>=2.5",
     "sherpa-onnx>=1.13.8",
+    "onnxruntime>=1.24.3",
+    "soxr>=1.1.0",
 ]
 
 [dependency-groups]
