@@ -14,7 +14,10 @@
 
 ## 进展
 - **M0 骨架已完成**（2026-09-21，commit 1d91f9d）：git + pyproject(uv/ruff/mypy strict/pytest) + CI(py3.10/3.12) + WS echo 服务 + sim 三替身 + 22 项测试全绿。
-- **M1 serial 全链已完成**（commit d4d765f）：分句 + TTS 分片 + waterfall 双口径账单 + `scripts/demo_serial.py`；44 项测试全绿。下一步按 M2 → M3 → M4 → M5 推进。
+- **M1 serial 全链已完成**（commit d4d765f）：分句 + TTS 分片 + waterfall 双口径账单 + `scripts/demo_serial.py`；44 项测试全绿。
+- **M2a real 接入 + 本机校准**（015cfd9）/ **M4 pipelined 投机调度**（33b3705，命中时口径B **179ms**）/ **M2b EOU 四路融合判停**（e07539c）均已完成。
+- **M3 barge-in 三层 + 状态机 + live 客户端已完成**（本次）：`turn_fsm.py` + `barge_in.py` + `AudioStop` + WS 三路并发（接收/`run_turn`/`pump`，outbox 解耦）+ `scripts/live_client.py`；71 项测试全绿。细节与诚实边界见技术方案 **§14**。
+- **剩余**：仅 M5 收尾发版（README 承诺映射表/对比定位/差距表 + LICENSE + 发版检查单）。
 - 门禁命令：`uv run ruff check .` / `uv run mypy` / `uv run pytest`（均需全绿才可合并）。
 - **本机（Apple M5）real 环境的两个坑（已写进 README「本机准备」）**：① sherpa-onnx wheel **不带 libonnxruntime.dylib**（cp312/cp314 皆缺）→ `uv add onnxruntime` 后软链到 `sherpa_onnx/lib/libonnxruntime.dylib`；② GitHub release 直连不通，模型一律走 **hf-mirror**（`./scripts/download_models.sh`）。
 - 本机 Python 固定 **3.12**（`.python-version`）；uv 默认会拉 3.14。
@@ -26,6 +29,7 @@
 - **live 麦克风客户端 = 一期做**，依赖入耳式耳机物理隔离回声；软件 AEC 列差距表二期。
 - **EOU 语义判停 = M2 主线**（LiveKit turn-detector INT8），不是升级位。
 - 里程碑（编号不变，内容加重）：M2 = real 接入 + 本机校准 + EOU 判停；M3 = barge-in 三层 + live 客户端。
+- **WS 并发不变量（M3 起，勿退化回串行）**：接收循环 / `run_turn` / `pump` 三路并发，中间用 outbox 队列解耦。串行模型下播音期间收不到上行帧，barge-in 永远触发不了。**关连接前必须 `await outbox.join()` 等 pump 排空**（pump 每发一项调 `task_done()`）——否则 `finally` 的 `pump_task.cancel()` 会吞掉 `turn.end`，客户端表现为**无报错挂死**。pytest 已加 `timeout=30` 把挂起变成明确失败。
 
 ## 文档里的坑
 - 「M5 本机校准」的 M5 指 **Apple M5 芯片**，不是里程碑 M5 —— 同字冲突，已全文消歧为「本机（Apple M5）校准」。

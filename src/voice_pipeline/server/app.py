@@ -2,11 +2,20 @@
 
 两种模式（session.begin.mode）：
 - `echo`：上行音频原样回发，用于量 WS 链路本身的序列化开销（M0 回归）
-- `serial`：真实链路 ASR → LLM → 分句 → TTS → 200ms 分片（M1 起）
+- `serial` / `pipelined`：真实链路 ASR → LLM → 分句 → TTS（M1 起）
+
+M3 并发模型：上行接收与下行发送是两条并发路径。
+- 接收循环：audio 帧 → session.on_audio（内含 barge-in L1 检测）；控制帧 → 状态变更。
+- 一轮的生成（run_turn）跑在后台任务里，把 TurnItem 投进 session.outbox。
+- pump 协程从 outbox 取出发送，独占 websocket.send，避免与 AudioStop 竞态。
+
+这样 AI 播放期间客户端仍在上行麦克风帧，打断检测能持续运行——barge-in 才触发得了。
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
 from typing import Any
@@ -14,10 +23,11 @@ from typing import Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 
 from voice_pipeline.config import Settings
-from voice_pipeline.core.scheduler.base import AudioFragment
+from voice_pipeline.core.scheduler.base import AudioFragment, TurnItem
 
 from .protocol import (
     AudioChunk,
+    AudioStop,
     ErrorEvent,
     Interrupt,
     ProtocolError,
@@ -53,24 +63,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             dump_event(SessionReady(session_id=session.session_id, trace_id=session.trace_id))
         )
 
-        async def drain_turn() -> None:
-            async for item in session.finish():
-                if isinstance(item, AudioFragment):
-                    await websocket.send_text(
-                        dump_event(AudioChunk(seq=item.seq, bytes_len=len(item.data)))
-                    )
-                    await websocket.send_bytes(item.data)
-                else:
-                    await websocket.send_text(dump_event(item))
-            await websocket.send_text(
-                dump_event(
-                    SessionClosed(
-                        session_id=session.session_id,
-                        frames_echoed=session.frames_echoed,
-                    )
-                )
-            )
+        async def pump(outbox: asyncio.Queue[TurnItem | AudioStop]) -> None:
+            """统一发送协程：独占 websocket.send，从 outbox 取 TurnItem 下发。"""
+            try:
+                while True:
+                    item = await outbox.get()
+                    if isinstance(item, AudioFragment):
+                        await websocket.send_text(
+                            dump_event(AudioChunk(seq=item.seq, bytes_len=len(item.data)))
+                        )
+                        await websocket.send_bytes(item.data)
+                    else:
+                        await websocket.send_text(dump_event(item))
+                    outbox.task_done()
+            except asyncio.CancelledError:
+                return
 
+        pump_task = asyncio.create_task(pump(session.outbox))
+        turn_task: asyncio.Task[None] | None = None
         try:
             while True:
                 message: MutableMapping[str, Any] = await websocket.receive()
@@ -81,10 +91,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 if isinstance(audio, bytes):
                     for fragment in await session.on_audio(audio):
                         await websocket.send_bytes(fragment.data)
-                    # real 模式：EOU 判停器触发即自动收尾，不必等客户端 session.end
-                    if session.pending_end():
-                        await drain_turn()
-                        break
+                    # 播放期间的新帧已在 on_audio 内做 barge-in 检测并往 outbox 投 AudioStop；
+                    # real 模式下 EOU 判停触发即自动起一轮（不依赖客户端 session.end）。
+                    if not session._turn_running and session.pending_end():
+                        turn_task = asyncio.create_task(session.run_turn())
                     continue
 
                 text = message.get("text")
@@ -100,7 +110,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     continue
 
                 if isinstance(frame, SessionBegin):
+                    # 换模式即重建会话（含新的 outbox 与 pump）
                     session = Session(mode=frame.mode)
+                    pump_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await pump_task
+                    pump_task = asyncio.create_task(pump(session.outbox))
                     await websocket.send_text(
                         dump_event(
                             SessionReady(session_id=session.session_id, trace_id=session.trace_id)
@@ -109,16 +124,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     continue
 
                 if isinstance(frame, SessionEnd):
-                    await drain_turn()
+                    # 显式结束会话：确保本轮跑完（sim 模式靠这个驱动一轮；real 模式若已在跑
+                    # 则不重复），然后回 session.closed 并关闭连接。real 模式持续对话时不靠
+                    # 这个，靠 EOU 自动判停。
+                    if not session._turn_running:
+                        turn_task = asyncio.create_task(session.run_turn())
+                    if turn_task is not None:
+                        with contextlib.suppress(asyncio.CancelledError):
+                            await turn_task
+                    # 关键：run_turn 把本轮所有 TurnItem 投进了 outbox，但 pump 是独立协程，
+                    # 此刻可能还没发完（尤其是 turn.end）。必须先等 pump 把队列排空，再发
+                    # session.closed 并 break——否则 break 后的 finally 会 cancel pump，
+                    # 剩余事件（含 turn.end）永远到不了客户端，测试/客户端就卡在等 turn.end。
+                    await session.outbox.join()
+                    await websocket.send_text(
+                        dump_event(
+                            SessionClosed(
+                                session_id=session.session_id,
+                                frames_echoed=session.frames_echoed,
+                            )
+                        )
+                    )
                     break
 
-                if isinstance(frame, Interrupt):
-                    # M1 尚无进行中的 turn 可打断：如实回错，不留静默失败
+                if isinstance(frame, Interrupt) and not session.barge_in(source="client"):
+                    # 客户端主动打断（按键 / 本地回声检测）：触发三层 barge-in；
+                    # 没有进行中的轮次则回 no_active_turn 错误。
                     await websocket.send_text(
-                        dump_event(ErrorEvent(code="no_active_turn", message="no turn in progress"))
+                        dump_event(
+                            ErrorEvent(code="no_active_turn", message="no turn in progress")
+                        )
                     )
         except WebSocketDisconnect:
             return
+        finally:
+            pump_task.cancel()
+            if turn_task is not None:
+                turn_task.cancel()
 
     return app
 

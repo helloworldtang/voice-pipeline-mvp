@@ -30,7 +30,14 @@ ln -sf "$(pwd)/.venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntim
 - ✅ **M2a real 接入 + 本机校准**：真模型跑通 ASR → LLM → TTS，`real` 模式已进 WS
 - ✅ **M2b EOU 判停（四路融合 + 三档门控）**：`core/eou.py` 实现 L0 能量 + L1 静音 + L2 韵律终顿 + L3 语义完整融合，conservative/semantic/aggressive 三档；real 模式 WS 自动判停、不再依赖客户端 `session.end`；抢话 `premature_eou` 与漏判 `missed_eou` 进账单。L2/L3 默认用模型无关启发式，神经网络版（Smart Turn v3 / turn-detector INT8）留作同接口可插拔升级（D2）
 - ✅ **M4 pipelined 投机调度**：用户说完前把 LLM+TTS 算完，EOU 后即刻播音；命中时口径B **179ms**（melo + 250ms 静音），首音 ≤300ms 达标。作废（答错问题）与打断（不留悬挂任务）两条纪律单测覆盖（`tests/test_pipelined.py`）
-- ⬜ M3 barge-in + live 客户端 / M5 收尾发版
+- ✅ **M3 barge-in 三层 + 状态机 + live 客户端**（详见技术方案 §14）：
+  - `core/turn_fsm.py`：IDLE / LISTENING / THINKING / SPEAKING / INTERRUPTED + 合法转换表，非法转换在 `strict` 下抛 `IllegalTransition`
+  - `core/barge_in.py`：L1 检测（能量阈值 + 连续帧去抖），接口可插拔换成 AEC/VAD
+  - L2 播放层：`scheduler.cancel()` 掐掉在飞计算，并下发 `audio.stop` 让播放端丢弃已排队未出声的分片；L3 语义层：本轮作废、状态机回 LISTENING，**等用户把插话说完再答**（不重开一轮、不一刀切静音）
+  - WS 改为三路并发（接收循环 / `run_turn` / 发送 `pump`），中间用 outbox 队列解耦——AI 播放期间仍在上行麦克风帧，打断检测才跑得起来
+  - 账单新增 `barge_in_count` / `barge_in_latency_ms`
+  - live 麦克风客户端 `scripts/live_client.py`（pyaudio 16k 上行 / 24k 下行播放 + 本地打断检测）
+- ⬜ M5 收尾发版
 
 代码按 `技术方案.md` §9 的里程碑推进。每个数字都必须能被一条命令复现。
 
@@ -69,8 +76,18 @@ uv run uvicorn voice_pipeline.server.app:app --port 8000
 curl localhost:8000/healthz
 ```
 
-WS 协议：`session.begin{mode: echo|serial|real}` → 上行 PCM16 音频帧 → `session.end` 触发一轮。
-echo 量 WS 链路本身的开销；serial 用 sim 三替身跑同构链路；real 用真模型（缺模型会明确报错）。
+WS 协议：`session.begin{mode: echo|serial|real}` → 上行 PCM16 音频帧 → `session.end` 触发一轮
+（real 模式由 EOU 自动判停，不必显式 `session.end`）；`interrupt` 触发打断，下行 `audio.stop`
+通知播放端停播。echo 量 WS 链路本身的开销；serial 用 sim 三替身跑同构链路；real 用真模型（缺模型会明确报错）。
+
+live 真机试跑（M3）：
+
+```bash
+uv run python scripts/live_client.py --url ws://localhost:8000/ws   # 需 pyaudio + websockets
+```
+
+> ⚠️ **回声隔离是硬前提**：一期的打断检测是纯能量判定，外放会被 AI 自己的声音自激误触发。
+> 必须戴**入耳式耳机**做物理隔离；软件 AEC 列入二期差距表（见技术方案 §14）。
 
 ## 许可
 

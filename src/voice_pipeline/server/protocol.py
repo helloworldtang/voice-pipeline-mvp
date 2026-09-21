@@ -69,6 +69,17 @@ class TurnEnd(BaseModel):
     metrics: dict[str, float]
 
 
+class AudioStop(BaseModel):
+    """播放端应立即丢弃已排队、尚未出声的音频分片。
+
+    barge-in 的 L2：服务端 cancel 了在飞计算，但已经 send 出去的音频分片追不回来，
+    只能由客户端在收到本事件后停止播放队列里剩下的块。没有它就「AI 嘴上停了、
+    耳朵里还在自己回声」。
+    """
+
+    type: Literal["audio.stop"] = "audio.stop"
+
+
 class SessionReady(BaseModel):
     type: Literal["session.ready"] = "session.ready"
     session_id: str

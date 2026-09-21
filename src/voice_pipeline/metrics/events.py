@@ -49,6 +49,9 @@ class TurnMetrics:
     missed_eou: bool = False  # FN：该判未判，用户闭嘴后仍在干等
     eou_latency_ms: float = -1.0  # 判停时刻的静音时长（残余间隙里判停占的一段）
     eou_mode: str = ""  # 本次判停用的门控档
+    # barge-in 指标（M3）：用户插话打断 AI 的次数与时刻
+    barge_in_count: int = 0  # 本轮被打断次数
+    barge_in_latency_ms: float = -1.0  # 最近一次打断发生的会话钟时刻（ms）
 
     def mark(self, name: str) -> None:
         if name not in self.marks:
@@ -79,6 +82,9 @@ class TurnMetrics:
         bill["premature_eou"] = 1.0 if self.premature_eou else 0.0
         bill["missed_eou"] = 1.0 if self.missed_eou else 0.0
         bill["eou_latency_ms"] = round(self.eou_latency_ms, 3)
+        # barge-in 指标（M3）
+        bill["barge_in_count"] = float(self.barge_in_count)
+        bill["barge_in_latency_ms"] = round(self.barge_in_latency_ms, 3)
         if first_audio is not None and vad_onset is not None:
             bill["caliber_a_ms"] = round(first_audio - vad_onset, 3)
         for point in WATERFALL_POINTS:
