@@ -68,7 +68,12 @@ def build(mode: str, asr: object, tts: object, grace_ms: float) -> object:
     llm = SimLlm()
     if mode == "pipelined":
         return PipelinedScheduler(
-            asr=asr, llm=llm, tts=tts, metrics=metrics, splitter=splitter, chunker=chunker,
+            asr=asr,
+            llm=llm,
+            tts=tts,
+            metrics=metrics,
+            splitter=splitter,
+            chunker=chunker,
             grace_ms=grace_ms,
         )
     return SerialScheduler(
@@ -180,10 +185,7 @@ async def main() -> None:
         f"机器: {platform.machine()} / macOS {platform.mac_ver()[0]}   "
         f"Python {platform.python_version()}"
     )
-    print(
-        f"模型加载 {load_ms:.0f}ms   ASR={args.asr}   下行TTS={args.tts}   "
-        f"上行语音源=kokoro"
-    )
+    print(f"模型加载 {load_ms:.0f}ms   ASR={args.asr}   下行TTS={args.tts}   上行语音源=kokoro")
 
     rows: list[Row] = []
     for utterance in USER_UTTERANCES:

@@ -68,7 +68,8 @@ uv run python scripts/demo_serial.py   # sim 全链：waterfall + 双口径账�
 uv run python scripts/calibrate.py --silence-ms 200,300   # 本机延迟校准 → bench/*.json
 uv run python scripts/demo_real.py --tts melo             # real 全链（真模型）端到端
 
-uv run ruff check .           # lint
+uv run ruff check .           # lint（含 import 排序 / 死代码 / 简化）
+uv run ruff format --check .  # 格式门禁（与 CI 一致，漏跑会 push 后红）
 uv run mypy                   # 类型门禁（strict）
 uv run pytest                 # 测试（sim 零模型零网络；real 用例缺模型自动跳过）
 
@@ -88,6 +89,78 @@ uv run python scripts/live_client.py --url ws://localhost:8000/ws   # 需 pyaudi
 
 > ⚠️ **回声隔离是硬前提**：一期的打断检测是纯能量判定，外放会被 AI 自己的声音自激误触发。
 > 必须戴**入耳式耳机**做物理隔离；软件 AEC 列入二期差距表（见技术方案 §14）。
+
+## 承诺映射表（文章 / 评论区承诺 → 兑现它的代码）
+
+> 认领标准：**表里的每个模块都真实存在于本仓**，点开能读到实现、跑通能复现数字。
+> 设计意图里画过、但最终没这么做或没做的，一律列进下面的差距表，不在这里充数。
+
+| 承诺（出处） | 兑现它的代码 | 复现证据 |
+|---|---|---|
+| 文章第一板：句末标点切句，不切逗号 | `core/sentence_splitter.py` | `tests/test_sentence_splitter.py` |
+| 文章第三板：24kHz / 200ms / PCM16 可配置 | `audio/chunker.py`（`AudioParams`） | `tests/test_chunker.py` |
+| 文章 barge-in 三层 | L1 `core/barge_in.py`、L2/L3 `server/session.py`、状态机 `core/turn_fsm.py` | `tests/test_bargein.py` |
+| 评论区：滑动窗口语义提交 / 预生成 / 纠偏作废 | `core/scheduler/pipelined.py` | `tests/test_pipelined.py` |
+| 质疑方时序模型（A/B 对照组） | `core/scheduler/serial.py` | `tests/test_serial_pipeline.py` |
+| 双口径账单 + waterfall（回应「300ms 怎么得到的」） | `metrics/events.py`（`bill()` / `waterfall()`） | `scripts/demo_serial.py` |
+| 能量门控（评论区「星🎈」） | `core/eou.py` 的 L0 能量 + L1 静音两路 | 见差距表：**ASR 前置** gate 未做 |
+| EOU 四路融合判停（声学→VAD→韵律→语义） | `core/eou.py` | `tests/test_eou.py` |
+| WS 会话服务 + 三路并发（收 / 跑一轮 / 发） | `server/app.py` + `server/session.py` | `tests/test_ws.py` |
+| provider 插件层（sim / real 一键切） | `providers/factory.py` + `providers/base.py` | `tests/test_factory.py` |
+| live 麦克风客户端（真人对讲） | `scripts/live_client.py` | 见差距表：scripted 客户端未做 |
+| 本机（Apple M5）延迟校准 | `scripts/calibrate.py` | 技术方案 §13（`bench/*.json`） |
+
+文章第二板「连接预热」是**部分兑现**：模型构造即加载、进程内常驻（省去每次调用重载），
+但「预建连接 + 预合成静音帧」的 WarmPool 没做——详见差距表。
+
+## 对比定位
+
+**本仓不是什么**：不是通用 agent 编排框架（pipecat / LiveKit Agents 那种），不是语音 SaaS，
+不提供 GPU 推理服务。
+
+**本仓是什么**：一个**可复现的延迟实验台 + 准生产级 WS 服务骨架**，把文章的机制做成可跑代码、
+把评论区的争论做成可复现实验。它比「读文章」多给三样东西：
+
+1. **双口径账单 + waterfall**：口径A（用户开口→AI 首音）缺 `vad_onset` 时**如实留空、不填补**；
+   口径B（用户说完→AI 首音）是工程目标。每个外发数字都能被一条命令复现。
+2. **A/B 调度器**：`serial`（对照组，复现质疑方 1.2~1.9s 的算术）vs `pipelined`（实验组，投机流水线），
+   同机同 provider、只换调度——把「300ms 是否可能」变成一个能跑的实验，而不是互相嘴仗。
+3. **可靠性纪律的单测**：投机作废（答错必须作废）、打断（不留悬挂任务）、状态机合法转换、
+   竞态专项（挂死要能被门禁抓住）。
+
+**选型立场**：自研 FastAPI + WebSocket，不二开框架——因为要的是**能逐行解释的延迟账**，
+不是框架黑盒。sherpa-onnx 全本地、可离线、无 GPU 依赖。
+
+## 差距表（离「真生产」还有多远）
+
+> 这一节是**交付物本身**，不是免责声明。生产级 = 修到位的功能 + 如实声明的差距。
+
+| 项 | 现状 | 影响 | 后续 |
+|---|---|---|---|
+| **真 LLM（DeepSeek）未接** | `real` 模式里 ASR/TTS 是真模型，**LLM 仍是 `SimLlm`** | 端到端口径B 只是「本机侧下界」，不含真实 LLM 首 token 延迟 | provider 接口已就绪，接 DeepSeek 流式即可 |
+| **回声抑制未做** | barge-in 仅 L1 能量判定 | 外放会自激误触发；一期靠入耳式耳机**物理隔离** | 文本↔ASR 重合抑制 / 软件 AEC（二期） |
+| **打断尾音未量化** | `barge_in_latency_ms` 只记服务端检测时刻 | 不含客户端播放缓冲残留音频的实际停播耗时 | 需带播放队列的真机测量 |
+| **scripted 客户端未做** | 只有 live（`scripts/live_client.py`） | CI 里没有「回放固定音频走 WS」的确定性回归 | 补 `client/scripted_client.py` |
+| **JSONL 事件流落盘未做** | 账单在内存 / 脚本打印 | 无可观测性落盘，事后无法回溯单轮时间线 | 每轮 waterfall 落 JSONL |
+| **有界队列未接线** | `DualPriorityQueue` 已实现且有单测，但 WS 主链路用的是**无界 outbox** | 背压/丢弃计数在真实链路未生效 | 接进 `server/app.py` |
+| **无 Docker / compose** | 本机 `uvicorn` 可跑 | 没有容器化部署形态 | 补 Dockerfile + compose + healthcheck |
+| **EOU L2/L3 是启发式** | 非神经网络版（省依赖、可离线） | 中文准确率未经神经模型实测 | D2：同接口换 turn-detector INT8 / Smart Turn v3 |
+| **WarmPool「预合成静音帧」未做** | 仅模型常驻 | 首音前少一档可优化的常量延迟 | 见技术方案 §13.4 |
+| 并发压测 / 鉴权 TLS / 媒体面 / 音色克隆 | 未做 | 单会话参考实现，非集群 | **范围外**，见下 |
+
+**明确的范围外**（不要悄悄做进去）：商用抗噪与人声干扰、并发压测、硬件 AEC、鉴权/TLS、
+媒体面（FreeSWITCH / WebRTC / 唇形）、音色克隆（zipvoice）。
+
+## 发版检查单
+
+- [x] 质量门禁四件套全绿：`ruff check` / `ruff format --check` / `mypy`(strict) / `pytest`
+- [x] CI 与本地同命令同结果（py3.10 / py3.12 矩阵）
+- [x] LICENSE = MIT（见 `LICENSE`）
+- [x] README：本机准备 / 快速开始 / 承诺映射表 / 对比定位 / 差距表
+- [x] 技术方案：§13 本机实测、§14 M3 实现与诚实边界
+- [x] sim 模式零模型零网络（CI 可跑）；real 用例缺模型自动跳过
+- [ ] Docker / compose（**列差距表**，非阻塞发版）
+- [ ] `git push`（本轮按要求**不 push**，先在本地验收）
 
 ## 许可
 

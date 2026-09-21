@@ -17,8 +17,10 @@
 - **M1 serial 全链已完成**（commit d4d765f）：分句 + TTS 分片 + waterfall 双口径账单 + `scripts/demo_serial.py`；44 项测试全绿。
 - **M2a real 接入 + 本机校准**（015cfd9）/ **M4 pipelined 投机调度**（33b3705，命中时口径B **179ms**）/ **M2b EOU 四路融合判停**（e07539c）均已完成。
 - **M3 barge-in 三层 + 状态机 + live 客户端已完成**（本次）：`turn_fsm.py` + `barge_in.py` + `AudioStop` + WS 三路并发（接收/`run_turn`/`pump`，outbox 解耦）+ `scripts/live_client.py`；71 项测试全绿。细节与诚实边界见技术方案 **§14**。
-- **剩余**：仅 M5 收尾发版（README 承诺映射表/对比定位/差距表 + LICENSE + 发版检查单）。
-- 门禁命令：`uv run ruff check .` / `uv run mypy` / `uv run pytest`（均需全绿才可合并）。
+- **M5 收尾发版已完成**（本地，未 push）：README 补齐「承诺映射表（逐项对齐真实文件）+ 对比定位 + 差距表 + 发版检查单」；LICENSE(MIT) 已在；技术方案 §5 加「设计意图≠实际落盘」差异说明、M5 行标 ✅。
+- **⚠️ M5 诚实盘点发现的重要事实（勿再当"已完成"）**：① **real 模式 LLM 仍是 `SimLlm`**，真 DeepSeek 未接（端到端口径B 只是本机侧下界）；② scripted 客户端未做（§4.5 承诺 live+scripted）；③ JSONL 事件流落盘未做（§4.5 #4）；④ `DualPriorityQueue` 有实现有单测但**未接进 WS 主链路**（用无界 outbox）；⑤ 无 Dockerfile/compose；⑥ barge-in 无回声抑制（仅 L1 能量）、尾音未量化；⑦ ASR 前置 energy gate 未做、WarmPool 未做；⑧ EOU L2/L3 为启发式。以上全部已列入 README 差距表。
+- **全部里程碑（M0–M5）代码与文档完成**，本地 commit，**未 push**（用户要求先本地验收）。
+- 门禁命令（四件套，均需全绿才可合并；漏跑 format 会 push 后 CI 红）：`uv run ruff check .` / **`uv run ruff format --check .`** / `uv run mypy` / `uv run pytest`。⚠️ 2026-09-21 M5 发现此前只跑前三项，导致 4 个文件未格式化、CI 必红；已补齐并统一修好。
 - **本机（Apple M5）real 环境的两个坑（已写进 README「本机准备」）**：① sherpa-onnx wheel **不带 libonnxruntime.dylib**（cp312/cp314 皆缺）→ `uv add onnxruntime` 后软链到 `sherpa_onnx/lib/libonnxruntime.dylib`；② GitHub release 直连不通，模型一律走 **hf-mirror**（`./scripts/download_models.sh`）。
 - 本机 Python 固定 **3.12**（`.python-version`）；uv 默认会拉 3.14。
 - **EOU 判停**：原方案只有语义一路，2026-09-21 调研后补上**声学/韵律一路**（L2），改为四路（能量→VAD→韵律→语义）。依据与待决策点 D1–D5 见技术方案 §12。视觉/唇形属「说话人归属」层，不解决判停，不进一期。

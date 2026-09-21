@@ -41,9 +41,7 @@ class IllegalTransition(ValueError):
 _TRANSITIONS: dict[TurnState, frozenset[TurnState]] = {
     TurnState.IDLE: frozenset({TurnState.LISTENING}),
     TurnState.LISTENING: frozenset({TurnState.THINKING}),
-    TurnState.THINKING: frozenset(
-        {TurnState.SPEAKING, TurnState.INTERRUPTED, TurnState.LISTENING}
-    ),
+    TurnState.THINKING: frozenset({TurnState.SPEAKING, TurnState.INTERRUPTED, TurnState.LISTENING}),
     TurnState.SPEAKING: frozenset({TurnState.LISTENING, TurnState.INTERRUPTED}),
     TurnState.INTERRUPTED: frozenset({TurnState.LISTENING, TurnState.IDLE}),
 }

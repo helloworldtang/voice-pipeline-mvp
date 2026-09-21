@@ -151,9 +151,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     # 客户端主动打断（按键 / 本地回声检测）：触发三层 barge-in；
                     # 没有进行中的轮次则回 no_active_turn 错误。
                     await websocket.send_text(
-                        dump_event(
-                            ErrorEvent(code="no_active_turn", message="no turn in progress")
-                        )
+                        dump_event(ErrorEvent(code="no_active_turn", message="no turn in progress"))
                     )
         except WebSocketDisconnect:
             return

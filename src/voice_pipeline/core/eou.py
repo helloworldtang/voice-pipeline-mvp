@@ -110,8 +110,10 @@ class VadSilenceEou:
         pass
 
     def should_end(self) -> bool:
-        return self._has_speech and self._total_speech >= self.min_speech_ms and (
-            self._silence >= self.min_silence_ms
+        return (
+            self._has_speech
+            and self._total_speech >= self.min_speech_ms
+            and (self._silence >= self.min_silence_ms)
         )
 
     def reset(self) -> None:
