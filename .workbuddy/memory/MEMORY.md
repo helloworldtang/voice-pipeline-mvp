@@ -15,7 +15,11 @@
 ## 进展
 - **M0 骨架已完成**（2026-09-21，commit 1d91f9d）：git + pyproject(uv/ruff/mypy strict/pytest) + CI(py3.10/3.12) + WS echo 服务 + sim 三替身 + 22 项测试全绿。
 - **M1 serial 全链已完成**（commit d4d765f）：分句 + TTS 分片 + waterfall 双口径账单 + `scripts/demo_serial.py`；44 项测试全绿。
-- **M2a real 接入 + 本机校准**（015cfd9）/ **M4 pipelined 投机调度**（33b3705，命中时口径B **179ms**）/ **M2b EOU 四路融合判停**（e07539c）均已完成。
+- **M2a real 接入 + 本机校准**（015cfd9）/ **M4 pipelined 投机调度**（33b3705）/ **M2b EOU 四路融合判停**（e07539c）均已完成。
+  ⚠️ **2026-09-22 实测推翻 M4 的成绩口径**：「命中时 179ms」是 sim LLM + 挑最好一轮的产物。真 LLM（qwen-flash）下
+  命中率 **1/24 = 4%**，pipelined p50 2491ms 比 serial 1840ms **慢 651ms** —— **投机是净负债，不是优化**。
+  机制：投机要在「静音窗 + grace」内跑完 LLM 首完整句 522ms + TTS ~200ms，窗口不够；加大 grace 能买命中率，
+  未命中时却是纯亏损。完整账在 `docs/实验报告.md`。**对外不要再报 179ms / 81ms / 534ms。**
 - **M3 barge-in 三层 + 状态机 + live 客户端已完成**（本次）：`turn_fsm.py` + `barge_in.py` + `AudioStop` + WS 三路并发（接收/`run_turn`/`pump`，outbox 解耦）+ `scripts/live_client.py`；71 项测试全绿。细节与诚实边界见技术方案 **§14**。
 - **M5 收尾发版已完成**（本地，未 push）：README 补齐「承诺映射表（逐项对齐真实文件）+ 对比定位 + 差距表 + 发版检查单」；LICENSE(MIT) 已在；技术方案 §5 加「设计意图≠实际落盘」差异说明、M5 行标 ✅。
 - **⚠️ M5 诚实盘点发现的重要事实（勿再当"已完成"）**：① **real 模式 LLM 仍是 `SimLlm`**，真 DeepSeek 未接（端到端口径B 只是本机侧下界）；② scripted 客户端未做（§4.5 承诺 live+scripted）；③ JSONL 事件流落盘未做（§4.5 #4）；④ `DualPriorityQueue` 有实现有单测但**未接进 WS 主链路**（用无界 outbox）；⑤ 无 Dockerfile/compose；⑥ barge-in 无回声抑制（仅 L1 能量）、尾音未量化；⑦ ASR 前置 energy gate 未做、WarmPool 未做；⑧ EOU L2/L3 为启发式。以上全部已列入 README 差距表。
@@ -28,6 +32,9 @@
 ## 已定事项（已拍板，勿回炉）
 - **LICENSE = MIT**（2026-09-20 拍板）。
 - **激进播放门控**：M2 接入语义判停前默认关（裸激进＝抢话），M2 之后应默认开 semantic 档。⚠️ 2026-09-21 复核推翻旧判据：它压的是**口径B**不是口径A，与「口径B 300ms」目标**一致且是必要前提**（等完整静音窗 ⇒ 口径B ≥500-700ms，300ms 不可达）。它与 EOU 语义判停是配套两端，不是二选一。配套指标 premature_eou_rate（过早判停率）文档缺失待补。**✅ 2026-09-22 已定档：默认切 `semantic`**（Session / factory.build_eou / FusedEou 三处默认同步改掉，test_protocol.py 有防回退断言）。⚠️ 换档依据是**机理不是中文实测**——D4 判错率曲线、D5 中文测试集仍未做，对外报告必须带这句。
+  ⚠️ **2026-09-22 WS 实测发现漏判信号**：`bench_ws.py` 跑 real 链路时 **2/4 轮服务端 EOU 在 2s 内未判停**
+  （脚本兜底 `session.end` 才收尾）。合成语音 + semantic 档的组合下判停不稳——这是「按机理定档」的
+  第一个反证，**换档后必须补中文实测再对外，不能就这么放着**。
 - **live 麦克风客户端 = 一期做**，依赖入耳式耳机物理隔离回声；软件 AEC 列差距表二期。
 - **EOU 语义判停 = M2 主线**（LiveKit turn-detector INT8），不是升级位。
 - 里程碑（编号不变，内容加重）：M2 = real 接入 + 本机校准 + EOU 判停；M3 = barge-in 三层 + live 客户端。

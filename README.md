@@ -29,7 +29,7 @@ ln -sf "$(pwd)/.venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntim
 - ✅ **M1 serial 全链**：serial 调度 + 句末切句 + TTS 分片 + waterfall 账单（`scripts/demo_serial.py`）
 - ✅ **M2a real 接入 + 本机校准**：真模型跑通 ASR → LLM → TTS，`real` 模式已进 WS
 - ✅ **M2b EOU 判停（四路融合 + 三档门控）**：`core/eou.py` 实现 L0 能量 + L1 静音 + L2 韵律终顿 + L3 语义完整融合，conservative/semantic/aggressive 三档；real 模式 WS 自动判停、不再依赖客户端 `session.end`；抢话 `premature_eou` 与漏判 `missed_eou` 进账单。L2/L3 默认用模型无关启发式，神经网络版（Smart Turn v3 / turn-detector INT8）留作同接口可插拔升级（D2）
-- ✅ **M4 pipelined 投机调度**：用户说完前把 LLM+TTS 算完，EOU 后即刻播音；命中时口径B **179ms**（melo + 250ms 静音），首音 ≤300ms 达标。作废（答错问题）与打断（不留悬挂任务）两条纪律单测覆盖（`tests/test_pipelined.py`）
+- ✅ **M4 pipelined 投机调度**：用户说完前把 LLM+TTS 算完，EOU 后即刻播音。作废（答错问题）与打断（不留悬挂任务）两条纪律单测覆盖（`tests/test_pipelined.py`）。⚠️ **2026-09-22 实测：投机是净负债不是优化** —— 真 LLM 下命中率 1/24 = 4%，p50 比串行慢 651ms。旧 README 写的「命中 179ms、300ms 达标」是 sim LLM + 挑最好一轮的产物，已撤下，完整账见 `docs/实验报告.md`
 - ✅ **M3 barge-in 三层 + 状态机 + live 客户端**（详见技术方案 §14）：
   - `core/turn_fsm.py`：IDLE / LISTENING / THINKING / SPEAKING / INTERRUPTED + 合法转换表，非法转换在 `strict` 下抛 `IllegalTransition`
   - `core/barge_in.py`：L1 检测（能量阈值 + 连续帧去抖），接口可插拔换成 AEC/VAD
@@ -59,8 +59,20 @@ ln -sf "$(pwd)/.venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntim
 （TTS 地板 156ms + EOU 判停 200~300ms + ASR 尾延迟 ~120ms 已超 500ms），
 只能靠**投机执行**把 TTS 藏进用户说话的尾段——这是 M4 的主线。
 
-| 端到端口径B（命中投机，melo + 250ms 静音窗）| **179ms** —— 首音 ≤300ms 达标（`scripts/bench_schedulers.py`）|
-| 端到端口径B（未命中投机，退化串行）| 713ms（melo 地板）|
+**A/B 的完整账在 [`docs/实验报告.md`](docs/实验报告.md)**（M4 的验收物，此前缺失）。一句话：
+
+> **300ms 不成立。** 投机执行（pipelined）在真 LLM 下命中率 **1/24 = 4%**，常态 p50 **2491ms**
+> —— 比串行 1840ms **慢 651ms**。它改善的是均值、恶化的是中位数：把分布拉成双峰。
+
+| 口径B（p50）| serial | pipelined | 命中率 | 投机净收益 |
+|---|---|---|---|---|
+| SimLlm（零延迟替身，不含 LLM）| 770ms | 842ms | 9/36 = 25% | **−72ms** |
+| **QwenLlm（qwen-flash 真网络）** | **1840ms** | **2491ms** | **1/24 = 4%** | **−651ms** |
+
+`179ms` 这个数字是 **sim LLM + 挑最好一轮** 的产物，已从对外表述中撤下。真 LLM 下唯一进 600ms
+的那一轮是 534ms，而它需要的窗口是「静音 600ms + grace 600ms」——真实对话里不存在。
+机制不难懂：投机要在「静音窗 + grace」内跑完 LLM 首完整句（522ms）+ TTS（~200ms），
+而窗口只有 250ms + grace；加大 grace 能买命中率，未命中时却是纯亏损，两头一挤期望值为负。
 
 ## 快速开始
 
@@ -95,7 +107,8 @@ WS 协议：`session.begin{mode, gating, grace_ms}` → 上行 PCM16 音频帧 �
 
 `gating` 三档 `conservative|semantic|aggressive`，**默认 `semantic`**——`conservative` 要等满
 500ms 静音窗，口径B 被托底在 500ms 以上，300ms 数学上不可达。`grace_ms` 是 pipelined 的
-投机等待窗（EOU 后最多再等多久让投机落地），本机实测 `grace=0` 时 6/6 全未命中、`grace=300` 才吃到那次 179ms。
+投机等待窗（EOU 后最多再等多久让投机落地）。它是赌注：真 LLM + 250ms 静音窗下
+`grace=0` 命中 0/9（永远不命中），`grace=300` 命中 0/6 且未命中时白等 300ms——两头一挤期望值为负。
 
 live 真机试跑（M3）：
 
@@ -153,7 +166,7 @@ uv run python scripts/live_client.py --url ws://localhost:8000/ws   # 需 pyaudi
 
 | 项 | 现状 | 影响 | 后续 |
 |---|---|---|---|
-| **真 LLM 选型已定，代价已入账** | real 模式接 **DashScope `qwen-flash`**（`providers/llm/qwen_llm.py`），本机实测首 token 367ms / 首完整句 522ms，是候选里最快的非思考型档 | 端到端口径B 因此从 713ms（sim 下界）涨到 **1109ms**；300ms 只剩投机命中一条路，而命中率实测 1/27 | 无 key 时 `auto` 退回 SimLlm **并告警**（静默退回会让账单少算一格，护栏就是那条日志）；DeepSeek 现役模型默认开思考链，见 `scripts/probe_llm.py` |
+| **真 LLM 选型已定，代价已入账** | real 模式接 **DashScope `qwen-flash`**（`providers/llm/qwen_llm.py`），本机实测首 token 367ms / 首完整句 522ms，是候选里最快的非思考型档 | 端到端口径B 因此从 713ms（sim 下界）涨到 **1109ms**；300ms 原先指望投机命中，但 2026-09-22 实测命中率 **4%（1/24）** 且 p50 比串行慢 651ms —— **这条路已被实测否定**，见 `docs/实验报告.md` | 无 key 时 `auto` 退回 SimLlm **并告警**（静默退回会让账单少算一格，护栏就是那条日志）；DeepSeek 现役模型默认开思考链，见 `scripts/probe_llm.py` |
 | **回声抑制未做** | barge-in 仅 L1 能量判定 | 外放会自激误触发；一期靠入耳式耳机**物理隔离** | 文本↔ASR 重合抑制 / 软件 AEC（二期） |
 | **打断尾音未量化** | `barge_in_latency_ms` 只记服务端检测时刻 | 不含客户端播放缓冲残留音频的实际停播耗时 | 需带播放队列的真机测量 |
 | **scripted 客户端未做** | 只有 live（`scripts/live_client.py`） | CI 里没有「回放固定音频走 WS」的确定性回归 | 补 `client/scripted_client.py` |

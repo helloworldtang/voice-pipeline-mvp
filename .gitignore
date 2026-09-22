@@ -14,4 +14,6 @@ models/
 runs/
 *.jsonl
 .DS_Store
-bench/
+# bench/ 是实验数据，不是构建产物——docs/实验报告.md 里的每个数字都要能翻到原始行，
+# 所以整体入仓（每份 4~8K）。仅冒烟用的临时产物忽略。
+bench/tmp-*.json

@@ -58,14 +58,15 @@ class Row:
     sentences: int
     wall_ms: float
     spec_reason: str = "n/a"
+    rep: int = 0  # --repeat 的第几轮。保留它才能算分位数，而不是只留最好的一轮
+    llm: str = "SimLlm"  # 零延迟替身 vs 真 LLM——两者命中率完全不同，必须标在每行上
 
 
-def build(mode: str, asr: object, tts: object, grace_ms: float) -> object:
+def build(mode: str, asr: object, tts: object, grace_ms: float, llm: object) -> object:
     """同一组依赖，只换调度器实现。"""
     metrics = TurnMetrics(clock=SessionClock())
     splitter = SentenceSplitter()
     chunker = Chunker()
-    llm = SimLlm()
     if mode == "pipelined":
         return PipelinedScheduler(
             asr=asr,
@@ -121,9 +122,13 @@ async def run_once(
     user_pcm: np.ndarray,
     silence_ms: int,
     grace_ms: float,
+    rep: int = 0,
+    llm: object = None,
 ) -> Row:
+    if llm is None:
+        llm = SimLlm()
     scheduler: PipelinedScheduler | SerialScheduler = build(  # type: ignore[assignment]
-        mode, asr_engine(), tts, grace_ms
+        mode, asr_engine(), tts, grace_ms, llm
     )
     metrics = scheduler._metrics  # type: ignore[union-attr]  # 同一份账单，两边都从这里取
 
@@ -155,6 +160,8 @@ async def run_once(
         sentences=int(bill.get("sentences", 0)),
         wall_ms=round(wall, 1),
         spec_reason=str(getattr(scheduler, "spec_last_reason", "n/a")),
+        rep=rep,
+        llm=type(llm).__name__,
     )
 
 
@@ -164,6 +171,12 @@ async def main() -> None:
     ap.add_argument("--asr", default="transducer", choices=["transducer", "paraformer"])
     ap.add_argument("--silence-ms", default="250,400,600")
     ap.add_argument("--grace-ms", default="0")
+    ap.add_argument(
+        "--llm",
+        default="sim",
+        choices=["sim", "qwen"],
+        help="sim=零延迟替身（不含 LLM 首 token）；qwen=真 LLM（含网络，命中率会更低）",
+    )
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--json-out", default=None)
     args = ap.parse_args()
@@ -180,12 +193,23 @@ async def main() -> None:
         "transducer": R.TransducerStreamingAsr,
         "paraformer": R.ParaformerStreamingAsr,
     }[args.asr]
+    # 真 LLM 必须显式点名才启用：它慢 500ms 上下，会让命中率塌掉，
+    # 所以「这组数含不含 LLM」必须由开关决定，而不是悄悄混在一起。
+    if args.llm == "qwen":
+        from voice_pipeline.providers.factory import build_llm
+
+        llm = build_llm("qwen")
+    else:
+        llm = SimLlm()
     load_ms = (time.perf_counter() - t0) * 1000
     print(
         f"机器: {platform.machine()} / macOS {platform.mac_ver()[0]}   "
         f"Python {platform.python_version()}"
     )
-    print(f"模型加载 {load_ms:.0f}ms   ASR={args.asr}   下行TTS={args.tts}   上行语音源=kokoro")
+    print(
+        f"模型加载 {load_ms:.0f}ms   ASR={args.asr}   下行TTS={args.tts}   "
+        f"上行语音源=kokoro   LLM={args.llm}"
+    )
 
     rows: list[Row] = []
     for utterance in USER_UTTERANCES:
@@ -195,23 +219,27 @@ async def main() -> None:
                 for mode in ("serial", "pipelined"):
                     if mode == "serial" and grace != graces[0]:
                         continue  # serial 不吃 grace，跑一次就够
-                    best: Row | None = None
-                    for _ in range(args.repeat):
-                        row = await run_once(
-                            mode,
-                            down_tts,
-                            asr_cls,
-                            args.tts,
-                            args.asr,
-                            utterance,
-                            user_pcm,
-                            silence,
-                            grace,
+                    # ⚠️ 这里原来是「跑 repeat 次，只留 caliber_b 最小的那一轮」。
+                    # 那是挑好轮次——与本项目「不裁剪、不挑轮次」的纪律直接冲突：
+                    # 谁用 --repeat 复跑，谁就拿到一个被挑选过的数字，而挑出来的
+                    # 最小值恰恰是 pipelined 唯一那次命中的形态。改为全轮保留，
+                    # 由 print_report 报 p50/min/max，命中率才有分母。
+                    for rep in range(args.repeat):
+                        rows.append(
+                            await run_once(
+                                mode,
+                                down_tts,
+                                asr_cls,
+                                args.tts,
+                                args.asr,
+                                utterance,
+                                user_pcm,
+                                silence,
+                                grace,
+                                rep,
+                                llm,
+                            )
                         )
-                        if best is None or row.caliber_b_ms < best.caliber_b_ms:
-                            best = row
-                    assert best is not None
-                    rows.append(best)
         print(f"  done: {utterance}")
 
     print_report(rows)
@@ -236,39 +264,57 @@ async def main() -> None:
     print(f"\n→ {out}")
 
 
+def _stats(vals: list[float]) -> str:
+    """p50 (min / max)。只报 min 等于挑好轮次，只报 p50 会藏住长尾——两个都要。"""
+    if not vals:
+        return "-"
+    return f"{statistics.median(vals):.0f} (min {min(vals):.0f} / max {max(vals):.0f})"
+
+
 def print_report(rows: list[Row]) -> None:
-    print("\n=== 口径B（用户说完 → AI 首音）===")
-    print(
-        f"{'句':<16}{'静音窗':>7}{'grace':>7}{'serial':>9}{'pipelined':>11}"
-        f"{'省':>8}{'降幅':>8}{'hit':>5}{'miss':>5}"
-    )
+    print("\n=== 口径B（用户说完 → AI 首音）: p50 (min / max) ===")
+    print(f"{'句':<16}{'静音窗':>7}{'grace':>7}{'serial':>24}{'pipelined':>24}{'命中':>8}")
+
+    groups: dict[tuple[str, int, float], list[Row]] = {}
     for r in rows:
-        if r.mode != "pipelined":
+        groups.setdefault((r.utterance, r.silence_ms, r.grace_ms), []).append(r)
+
+    for key in sorted(groups, key=lambda k: (k[0], k[1], k[2])):
+        grp = groups[key]
+        ser = [r.caliber_b_ms for r in grp if r.mode == "serial"]
+        pip = [r for r in grp if r.mode == "pipelined"]
+        if not pip:
             continue
-        key = (r.utterance, r.silence_ms, r.grace_ms)
-        serial = next(
-            (x for x in rows if x.mode == "serial" and (x.utterance, x.silence_ms) == key[:2]),
-            None,
-        )
-        if serial is None:
-            continue
-        saved = serial.caliber_b_ms - r.caliber_b_ms
-        pct = saved / serial.caliber_b_ms * 100 if serial.caliber_b_ms else 0.0
-        label = r.utterance if len(r.utterance) <= 14 else r.utterance[:13] + "…"
+        label = key[0] if len(key[0]) <= 14 else key[0][:13] + "…"
+        hits = sum(r.spec_hit for r in pip)
         print(
-            f"{label:<16}{r.silence_ms:>7}{r.grace_ms:>7.0f}"
-            f"{serial.caliber_b_ms:>9.0f}{r.caliber_b_ms:>11.0f}"
-            f"{saved:>8.0f}{pct:>7.0f}%{r.spec_hit:>5.0f}{r.spec_miss:>5.0f}"
-            f"   miss原因: {r.spec_reason}"
+            f"{label:<16}{key[1]:>7}{key[2]:>7.0f}{_stats(ser):>24}"
+            f"{_stats([r.caliber_b_ms for r in pip]):>24}"
+            f"{f'{hits:.0f}/{len(pip)}':>8}"
         )
 
     pipes = [r for r in rows if r.mode == "pipelined"]
     serials = [r for r in rows if r.mode == "serial"]
     if pipes and serials:
-        s_med = statistics.median([r.caliber_b_ms for r in serials])
-        p_med = statistics.median([r.caliber_b_ms for r in pipes])
-        print(f"\n中位数: serial {s_med:.0f}ms   pipelined {p_med:.0f}ms")
-        print(f"投机命中率: {sum(r.spec_hit for r in pipes):.0f}/{len(pipes)}")
+        hits = sum(r.spec_hit for r in pipes)
+        rate = hits / len(pipes) * 100
+        print(f"\nserial    p50 {statistics.median([r.caliber_b_ms for r in serials]):.0f}ms")
+        print(f"pipelined p50 {statistics.median([r.caliber_b_ms for r in pipes]):.0f}ms")
+        print(f"投机命中率: {hits:.0f}/{len(pipes)} = {rate:.0f}%")
+        print(
+            "\n⚠️ 报数字时说命中率，不要说最好那一轮：\n"
+            "   min 是分布的一端，不是这条链路的常态；p50 才是。\n"
+            f"   本轮 pipelined 最快的一次是 {min(r.caliber_b_ms for r in pipes):.0f}ms，"
+            f"但它只占 {1 / len(pipes) * 100:.0f}% 的轮次。"
+        )
+        misses: dict[str, int] = {}
+        for r in pipes:
+            if r.spec_hit != 1.0:
+                misses[r.spec_reason] = misses.get(r.spec_reason, 0) + 1
+        if misses:
+            print("\n未命中原因分布:")
+            for reason, n in sorted(misses.items(), key=lambda kv: -kv[1]):
+                print(f"  {n:>3}×  {reason}")
     print(
         "\n注：上行是 TTS 合成语音而非真人录音 —— 数字用于比较调度器之间的相对差值，"
         "\n不作为真人场景绝对值。命中的前提是「partial 已收敛且 EOU 前投机跑完」，"
