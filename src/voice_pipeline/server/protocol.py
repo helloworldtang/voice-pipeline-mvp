@@ -40,9 +40,11 @@ class SessionBegin(BaseModel):
     sample_rate: int = 16000
     client: str = "unknown"
     mode: MODE = "serial"
-    # 判停档位。默认 conservative（2026-09-22 抢话实测后从 semantic 退回）：
-    # 句内停顿 250~350ms 下 semantic 抢话率 20~40%，conservative 为 0%。
-    gating: GatingMode = GatingMode.CONSERVATIVE
+    # 判停档位。默认 neural（D2 实测后从 conservative 切过来，2026-09-22）：
+    #   官方测试集受控实验（中文 n=335）：静音 100ms + 神经判停 → 句末检出 70%、
+    #   句中抢话 4.6%；conservative 要等 500ms 才判停，而句中停顿一旦到 500ms 就 100% 抢。
+    # 缺权重时 build_eou 会退回 conservative 并告警，那时账单里的 eou_mode 是 conservative。
+    gating: GatingMode = GatingMode.NEURAL
     # pipelined 专用：EOU 后最多再等多少毫秒让投机落地（0 = 不等，没好就走串行）。
     # 本机实测 grace=0 时 6/6 全未命中，grace=300 才吃到那唯一一次 179ms。
     grace_ms: float = 0.0

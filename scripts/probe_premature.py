@@ -121,6 +121,12 @@ async def run_one(
 
     if min_silence_short_ms is not None:
         eou = FusedEou(gating=gating, sample_rate=SR, min_silence_short_ms=min_silence_short_ms)
+    elif gating is GatingMode.NEURAL:
+        # 神经档：权重缺了会退回 conservative 并告警 —— 那时数字不是神经档的，别误读
+        eou = build_eou(GatingMode.NEURAL)
+        if eou.gating is not GatingMode.NEURAL:
+            msg = "神经档不可用（缺权重），退回保守档：跑出来的不是神经档的数字"
+            raise RuntimeError(msg)
     else:
         eou = build_eou(gating)
     asr.reset()  # type: ignore[attr-defined]

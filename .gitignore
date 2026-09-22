@@ -12,6 +12,8 @@ build/
 *.egg-info/
 models/
 runs/
+# 判停评测集（439MB）+ parquet 缓存，用 scripts/fetch_eou_dataset.py 重建
+data/
 *.jsonl
 .DS_Store
 # bench/ 是实验数据，不是构建产物——docs/实验报告.md 里的每个数字都要能翻到原始行，

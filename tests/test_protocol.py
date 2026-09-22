@@ -63,17 +63,25 @@ def test_unknown_mode_is_rejected() -> None:
         parse_client_frame(json.dumps({"type": "session.begin", "mode": "turbo"}))
 
 
-def test_default_gating_is_conservative_not_semantic() -> None:
-    """默认档必须是 conservative——这是抢话实测的结论，不是口味。
+def test_default_gating_is_neural_not_semantic() -> None:
+    """默认档是 neural（D2 实测后的第三次定档），**不是** semantic。
 
-    `scripts/probe_premature.py` 实测（句内停顿 250~350ms，合成语音 + 真 ASR）：
-      conservative(500ms)  抢话 0%    判停延迟 515ms
-      semantic(250ms)      抢话 20~40% 判停延迟 330ms
-    把 semantic 的静音阈值扫到 500ms 能回到 0% 抢话，但延迟 520ms ≈ conservative，
-    即 semantic 在同等安全下没有收益。防回退：有人为了「300ms 可达」改回 semantic，
-    代价是每 3~5 句抢一次话。
+    semantic 已经被实测否掉两次：它的 L2「终顿」是黏性锁存（说话中任意一帧能量跌到
+    峰值 40% 以下就永久置真），句内停顿 250~350ms 下抢话 20~40%
+    （`scripts/probe_premature.py`）。neural 换掉的就是这个 L2。
+
+    防回退：有人为了「不引模型依赖」改回 conservative，代价是判停延迟 500ms；
+    有人为了「快」改回 semantic，代价是每 3~5 句抢一次话。
     """
-    assert SessionBegin().gating is GatingMode.CONSERVATIVE
+    assert SessionBegin().gating is GatingMode.NEURAL
+
+
+def test_neural_gating_travels_on_the_wire() -> None:
+    frame = parse_client_frame(
+        SessionBegin(mode="real-serial", gating=GatingMode.NEURAL).model_dump_json()
+    )
+    assert isinstance(frame, SessionBegin)
+    assert frame.gating is GatingMode.NEURAL
 
 
 def test_gating_and_grace_travel_on_the_wire() -> None:

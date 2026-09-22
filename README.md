@@ -28,7 +28,8 @@ ln -sf "$(pwd)/.venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntim
 - ✅ **M0 骨架**：质量门禁 + WS echo 服务 + sim 三替身
 - ✅ **M1 serial 全链**：serial 调度 + 句末切句 + TTS 分片 + waterfall 账单（`scripts/demo_serial.py`）
 - ✅ **M2a real 接入 + 本机校准**：真模型跑通 ASR → LLM → TTS，`real` 模式已进 WS
-- ✅ **M2b EOU 判停（四路融合 + 三档门控）**：`core/eou.py` 实现 L0 能量 + L1 静音 + L2 韵律终顿 + L3 语义完整融合，conservative/semantic/aggressive 三档；real 模式 WS 自动判停、不再依赖客户端 `session.end`；抢话 `premature_eou` 与漏判 `missed_eou` 进账单。L2/L3 默认用模型无关启发式，神经网络版（Smart Turn v3 / turn-detector INT8）留作同接口可插拔升级（D2）
+- ✅ **M2b EOU 判停（四路融合 + 四档门控）**：`core/eou.py` 实现 L0 能量 + L1 静音 + L2 终顿 + L3 语义完整融合，conservative/semantic/aggressive/**neural** 四档；real 模式 WS 自动判停、不再依赖客户端 `session.end`；抢话 `premature_eou` 与漏判 `missed_eou` 进账单
+- ✅ **D2 神经判停器（2026-09-22）**：L2 换成 Pipecat Smart Turn v3.2（8MB INT8，BSD-2），`providers/eou/smart_turn.py`；mel 特征自己用 numpy 写（`core/eou_mel.py`，零新增运行时依赖，与 transformers 逐值核对 ~6e-6）。官方测试集受控实验（中文 n=335）：**静音 100ms 判停 → 句末检出 70.4% / 句中抢话 4.6%**；真 WS 链路判停 **513ms → 100ms**。默认档已切 `neural`（缺权重的机器自动退回 conservative 并告警）。L3 文本路（turn-detector INT8）仍未接
 - ✅ **M4 pipelined 投机调度**：用户说完前把 LLM+TTS 算完，EOU 后即刻播音。作废（答错问题）与打断（不留悬挂任务）两条纪律单测覆盖（`tests/test_pipelined.py`）。⚠️ **2026-09-22 实测：投机是净负债不是优化** —— 真 LLM 下命中率 1/24 = 4%，p50 比串行慢 651ms。旧 README 写的「命中 179ms、300ms 达标」是 sim LLM + 挑最好一轮的产物，已撤下，完整账见 `docs/实验报告.md`
 - ✅ **M3 barge-in 三层 + 状态机 + live 客户端**（详见技术方案 §14）：
   - `core/turn_fsm.py`：IDLE / LISTENING / THINKING / SPEAKING / INTERRUPTED + 合法转换表，非法转换在 `strict` 下抛 `IllegalTransition`
@@ -85,6 +86,10 @@ uv run python scripts/calibrate.py --silence-ms 200,300   # 本机延迟校准 �
 uv run python scripts/demo_real.py --tts melo             # real 全链（真模型 + 真 LLM）端到端
 uv run python scripts/probe_llm.py                        # 单独量 LLM 那一格：首 token / 首完整句
 
+uv run python scripts/fetch_eou_model.py    # 神经判停器权重（8MB，不进仓）
+uv run python scripts/fetch_eou_dataset.py  # 判停评测集（439MB，不进仓；可只下 1 个分片）
+uv run python scripts/bench_eou_controlled.py --langs zho,eng   # 句末检出 vs 句中抢话
+
 uv run ruff check .           # lint（含 import 排序 / 死代码 / 简化）
 uv run ruff format --check .  # 格式门禁（与 CI 一致，漏跑会 push 后红）
 uv run mypy                   # 类型门禁（strict）
@@ -105,14 +110,20 @@ WS 协议：`session.begin{mode, gating, grace_ms}` → 上行 PCM16 音频帧 �
 | `pipelined` | **实验组**：用户说话期间投机跑 LLM+TTS（sim 三替身），唯一能逼近 300ms 的路径 |
 | `real` / `real-serial` / `real-pipelined` | 同上，换真模型真 LLM（缺模型会明确报错） |
 
-`gating` 三档 `conservative|semantic|aggressive`，**默认 `conservative`**——这是 2026-09-22 抢话
-实测的结论，不是口味（`scripts/probe_premature.py`，句内停顿 + 真 ASR partial）：
+`gating` 四档 `conservative|semantic|aggressive|neural`，**默认 `neural`**——这是 2026-09-22
+第三次定档的结论（前两次：semantic 抢话 20~40% → 退回 conservative）：
 
-| 档位 | 句内停顿 250ms | 350ms | 判停延迟 |
+| 档位 | 依据 | 判停延迟 | 抢话率 |
 |---|---|---|---|
-| **conservative（默认）** | 抢话 **0/5** | 抢话 **0/5** | 515ms |
-| semantic | 抢话 1/5 | 抢话 2/5 | 330ms |
-| aggressive | 抢话 5/5 | 抢话 5/5 | 220ms |
+| **neural（默认）** | 官方测试集受控实验，中文 n=335 | **~100ms**（70% 轮次） | **4.6%** |
+| conservative | 合成语音 + 真 ASR，句内停顿 250/350ms | 515ms | 0/5、0/5（同一场景、同一份合成数据） |
+| semantic | 同上 | 330ms | 1/5、2/5 |
+| aggressive | 同上 | 220ms | 5/5、5/5 |
+
+⚠️ 四档的数字**不是同一份数据测出来的**，不能横比：neural 用的是官方数据集（带真值标签），
+其余三档用的是自造合成语音（真值有缺陷，见 `docs/实验报告.md` §5.1）。neural 档需要
+8MB 权重（`scripts/fetch_eou_model.py`），**没有就自动退回 conservative 并告警**，
+账单 `eou_mode` 会如实写回。
 
 semantic 用 185ms 延迟换 20~40% 抢话率；把它的静音阈值调到同等安全的 500ms 后延迟 520ms
 ≈ conservative 的 515ms——**同安全下没有收益**。已知代价：conservative 的 500ms 静音窗把
@@ -183,7 +194,7 @@ uv run python scripts/live_client.py --url ws://localhost:8000/ws   # 需 pyaudi
 | **JSONL 事件流落盘未做** | 账单在内存 / 脚本打印 | 无可观测性落盘，事后无法回溯单轮时间线 | 每轮 waterfall 落 JSONL |
 | **有界队列未接线** | `DualPriorityQueue` 已实现且有单测，但 WS 主链路用的是**无界 outbox** | 背压/丢弃计数在真实链路未生效 | 接进 `server/app.py` |
 | **无 Docker / compose** | 本机 `uvicorn` 可跑 | 没有容器化部署形态 | 补 Dockerfile + compose + healthcheck |
-| **EOU L2/L3 是启发式** | 非神经网络版（省依赖、可离线） | 中文准确率未经神经模型实测 | D2：同接口换 turn-detector INT8 / Smart Turn v3 |
+| ~~EOU L2/L3 是启发式~~ → **L2 已换神经版** | L2 用 Smart Turn v3.2，L3 仍是启发式 | ① 中文样本全是 chirp3（TTS 合成），抢话率 4.6% 是乐观下界，D5 真人集未建；② L3 文本路（turn-detector INT8）未接；③ 短轮次（<2s）判停未测 | D5 中文真人集；必要时接 L3 |
 | **WarmPool「预合成静音帧」未做** | 仅模型常驻 | 首音前少一档可优化的常量延迟 | 见技术方案 §13.4 |
 | 并发压测 / 鉴权 TLS / 媒体面 / 音色克隆 | 未做 | 单会话参考实现，非集群 | **范围外**，见下 |
 

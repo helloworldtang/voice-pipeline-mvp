@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from voice_pipeline.core.eou import FusedEou, GatingMode
 from voice_pipeline.providers.asr.sim_asr import SimAsr
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
+from voice_pipeline.providers.eou.smart_turn import SmartTurnEou
 from voice_pipeline.providers.llm.qwen_llm import API_KEY_ENV, DEFAULT_MODEL, QwenLlm
 from voice_pipeline.providers.llm.sim_llm import SimLlm
 from voice_pipeline.providers.tts.sim_tts import SimTts
@@ -28,6 +29,9 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ASR_ENGINE = "transducer"  # 本机实测：出词粒度 300ms，优于 paraformer 的 600ms
 DEFAULT_LLM_MODEL = DEFAULT_MODEL  # qwen-flash：本机实测首完整句 522ms，快档里最快
+# 神经档的「确认静音窗」：模型说完就判，不等静音。扫参结论见 docs/实验报告.md §5
+DEFAULT_NEURAL_SILENCE_MS = 100.0  # 短确认窗：扫参见 docs/实验报告.md §5
+DEFAULT_NEURAL_FALLBACK_MS = 800.0  # 模型不吐 complete 时的兜底，防无限等
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,10 +87,36 @@ def build_providers(
     raise ValueError(msg)
 
 
-def build_eou(gating: GatingMode = GatingMode.CONSERVATIVE, sample_rate: int = 16000) -> FusedEou:
+def build_eou(
+    gating: GatingMode = GatingMode.NEURAL,
+    sample_rate: int = 16000,
+    *,
+    neural: bool | None = None,
+    min_silence_neural_ms: float = DEFAULT_NEURAL_SILENCE_MS,
+    neural_fallback_ms: float = DEFAULT_NEURAL_FALLBACK_MS,
+) -> FusedEou:
     """组装 EOU 判停器（M2b）。
 
-    默认用模型无关的启发式 L2(韵律)/L3(语义)；生产可把 `silence`/`prosody`/`semantic`
-    换成 Silero VAD 或神经网络版（Smart Turn v3 / turn-detector INT8），接口不变（D2）。
+    默认用模型无关的启发式 L2(韵律)/L3(语义)；`gating=NEURAL` 或 `neural=True` 时
+    把 L2 换成 Smart Turn v3 神经网络版（D2）。**缺权重必须告警并退回 conservative**——
+    静默退回会把启发式的数字当成神经版的数字报出去。
     """
-    return FusedEou(gating=gating, sample_rate=sample_rate)
+    detector: SmartTurnEou | None = None
+    want_neural = neural if neural is not None else (gating is GatingMode.NEURAL)
+    if want_neural:
+        try:
+            detector = SmartTurnEou(sample_rate=sample_rate)
+        except FileNotFoundError as exc:
+            logger.warning(
+                "神经判停器不可用（%s），退回到 conservative 档：账单里的 eou_mode 会写 "
+                "conservative，不要当成神经版的数字报",
+                exc,
+            )
+            return FusedEou(gating=GatingMode.CONSERVATIVE, sample_rate=sample_rate)
+    return FusedEou(
+        gating=gating,
+        sample_rate=sample_rate,
+        neural=detector,
+        min_silence_neural_ms=min_silence_neural_ms,
+        neural_fallback_ms=neural_fallback_ms,
+    )

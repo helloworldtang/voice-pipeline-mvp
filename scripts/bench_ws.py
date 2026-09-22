@@ -104,6 +104,7 @@ async def run_once(
     eou_wait_ms: float,
     utterance: str,
     rep: int,
+    gating: str = "neural",
 ) -> Row:
     t0 = time.perf_counter()
     async with websockets.connect(url, max_size=None, open_timeout=30) as ws:
@@ -111,7 +112,7 @@ async def run_once(
         await ws.send(
             SessionBegin(
                 mode=mode,  # type: ignore[arg-type]
-                gating="semantic",  # type: ignore[arg-type]
+                gating=gating,  # type: ignore[arg-type]
                 grace_ms=grace_ms,
             ).model_dump_json()
         )
@@ -241,6 +242,11 @@ async def main() -> None:
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--eou-wait-ms", type=float, default=2000.0)
     ap.add_argument("--json-out", default=None)
+    ap.add_argument(
+        "--gating",
+        default="neural",
+        help="判停档位（conservative/semantic/neural），可逗号分隔做 A/B",
+    )
     args = ap.parse_args()
 
     url = f"ws://{HOST}:{PORT}/ws"
@@ -273,29 +279,31 @@ async def main() -> None:
 
         rows: list[Row] = []
         for utterance, pcm in audios.items():
-            for grace in [float(g) for g in args.grace_ms.split(",") if g]:
-                for mode in args.modes.split(","):
-                    if mode.strip() == "":
-                        continue
-                    if "pipelined" not in mode and grace != float(args.grace_ms.split(",")[0]):
-                        continue
-                    for rep in range(args.repeat):
-                        row = await run_once(
-                            url,
-                            mode.strip(),
-                            pcm,
-                            grace,
-                            args.eou_wait_ms,
-                            utterance,
-                            rep,
-                        )
-                        print(
-                            f"  {utterance[:8]:<10} grace={grace:<5.0f} "
-                            f"{mode:<15} 口径B={row.caliber_b_ms:>7.0f}ms "
-                            f"判停={row.eou_latency_ms:>6.0f}ms "
-                            f"hit={row.spec_hit:.0f} eou漏判={row.eou_missed}"
-                        )
-                        rows.append(row)
+            for gating in [g.strip() for g in args.gating.split(",") if g.strip()]:
+                for grace in [float(g) for g in args.grace_ms.split(",") if g]:
+                    for mode in args.modes.split(","):
+                        if mode.strip() == "":
+                            continue
+                        if "pipelined" not in mode and grace != float(args.grace_ms.split(",")[0]):
+                            continue
+                        for rep in range(args.repeat):
+                            row = await run_once(
+                                url,
+                                mode.strip(),
+                                pcm,
+                                grace,
+                                args.eou_wait_ms,
+                                utterance,
+                                rep,
+                                gating=gating,
+                            )
+                            print(
+                                f"  {utterance[:8]:<10} {gating:<13} grace={grace:<5.0f} "
+                                f"{mode:<15} 口径B={row.caliber_b_ms:>7.0f}ms "
+                                f"判停={row.eou_latency_ms:>6.0f}ms "
+                                f"hit={row.spec_hit:.0f} eou漏判={row.eou_missed}"
+                            )
+                            rows.append(row)
         print_report(rows, args.eou_wait_ms)
 
         out = args.json_out or f"bench/ws-{datetime.now():%Y%m%d-%H%M%S}.json"

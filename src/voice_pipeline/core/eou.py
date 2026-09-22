@@ -13,6 +13,7 @@
     conservative —— 等完整静音窗（500ms），慢但 0% 抢话。**当前默认**
     semantic     —— 静音 + (韵律终顿 或 语义完整) 即判停，快
     aggressive   —— 极短静音即判停，实验开关
+    neural (D2)  —— 静音 + 神经判停器（Smart Turn v3）说「说完了」即判停
 
 ⚠️ 2026-09-22 实测（`scripts/probe_premature.py`）：「semantic 快且不抢话」是**错的**。
 句内停顿 250~350ms 下抢话率 **20~40%**，conservative 为 **0%**。原因是 L2 韵律终顿
@@ -43,6 +44,7 @@ class GatingMode(enum.Enum):
     CONSERVATIVE = "conservative"
     SEMANTIC = "semantic"
     AGGRESSIVE = "aggressive"
+    NEURAL = "neural"
 
 
 class EouDetector(Protocol):
@@ -54,6 +56,18 @@ class EouDetector(Protocol):
     def reset(self) -> None: ...
     def silence_ms(self) -> float: ...
     def speech_ms(self) -> float: ...
+
+
+class TerminalDetector(Protocol):
+    """「终顿」判据的子契约（L2 的角色）：启发式韵律版与神经版都实现它。
+
+    与 `EouDetector` 分开是因为 L1 静音窗不需要 is_terminal —— 协议按用得到的最小面切。
+    """
+
+    def push_audio(self, chunk: bytes) -> None: ...
+    def update_text(self, partial: str) -> None: ...
+    def reset(self) -> None: ...
+    def is_terminal(self) -> bool: ...
 
 
 def rms_of(chunk: bytes) -> float:
@@ -272,11 +286,17 @@ class FusedEou:
         silence: EouDetector | None = None,
         prosody: ProsodyEou | None = None,
         semantic: SemanticHeuristicEou | None = None,
+        neural: TerminalDetector | None = None,
         *,
         sample_rate: int = 16000,
         min_silence_ms: float = 500.0,
         min_silence_short_ms: float = 250.0,
         min_silence_aggressive_ms: float = 120.0,
+        min_silence_neural_ms: float = 100.0,
+        # 神经档的兜底：模型在句末有 ~30% 不吐 complete（实测），不能因此无限等。
+        # 800ms 是「句中停顿几乎不会这么长」的量级 —— 兜底触发时已经牺牲了延迟，
+        # 但换来的是不会卡死。扫参依据见 docs/实验报告.md §5。
+        neural_fallback_ms: float = 800.0,
         max_silence_ms: float = 2000.0,
         premature_window_ms: float = 300.0,
         max_wait_ms: float = 5000.0,
@@ -293,10 +313,13 @@ class FusedEou:
         )
         self._prosody = prosody or ProsodyEou(sample_rate=sample_rate)
         self._semantic = semantic or SemanticHeuristicEou(sample_rate=sample_rate)
+        self._neural = neural
         self.sample_rate = sample_rate
         self.min_silence_ms = min_silence_ms
         self.min_silence_short_ms = min_silence_short_ms
         self.min_silence_aggressive_ms = min_silence_aggressive_ms
+        self.min_silence_neural_ms = min_silence_neural_ms
+        self.neural_fallback_ms = neural_fallback_ms
         self.max_silence_ms = max_silence_ms
         self.premature_window_ms = premature_window_ms
         self.max_wait_ms = max_wait_ms
@@ -319,6 +342,8 @@ class FusedEou:
                 self._last_terminal_ms = self._elapsed
         if self._semantic is not None:
             self._semantic.push_audio(chunk)
+        if self._neural is not None:
+            self._neural.push_audio(chunk)
         # 抢话：判停决定之后、窗口内又出现人声 → 这次判停是错的
         if (
             self._decided
@@ -331,6 +356,8 @@ class FusedEou:
     def update_text(self, partial: str) -> None:
         if self._semantic is not None:
             self._semantic.update_text(partial)
+        if self._neural is not None:
+            self._neural.update_text(partial)
 
     def should_end(self) -> bool:
         if self._decided:
@@ -356,6 +383,20 @@ class FusedEou:
                 self._latch()
                 return True
             return False
+        if self.gating is GatingMode.NEURAL:
+            # D2：判停交给神经模型，静音窗退化成「给模型一个立足点」的短确认窗。
+            #   - 短窗（默认 100ms）后才问模型：输入末尾没有静音时模型在分布外，
+            #     概率是噪声（实测 0.01↔0.99 乱跳）——这是必须先等静音的原因。
+            #   - 模型不说 complete 也不许无限等，到 neural_fallback_ms 强制判停。
+            if self._neural is None:
+                return False
+            if sil >= self.min_silence_neural_ms and self._neural.is_terminal():
+                self._latch()
+                return True
+            if sil >= self.neural_fallback_ms:
+                self._latch()
+                return True
+            return False
         # SEMANTIC：静音 + (最近出现过韵律终顿 或 语义完整)。
         # 注意是「最近出现过」而不是「此刻成立」——此刻成立要求静音还没被 coda 清掉，
         # 与 sil>=250 互斥（见 terminal_window_ms 的注释）。
@@ -378,6 +419,8 @@ class FusedEou:
             self._prosody.reset()
         if self._semantic is not None:
             self._semantic.reset()
+        if self._neural is not None:
+            self._neural.reset()
         self._elapsed = 0.0
         self._last_terminal_ms = -math.inf
         self._decided = False
@@ -390,6 +433,11 @@ class FusedEou:
 
     def speech_ms(self) -> float:
         return self._silence.speech_ms()
+
+    @property
+    def neural(self) -> TerminalDetector | None:
+        """神经判停器（若挂载）——测试与调参要读它的概率。"""
+        return self._neural
 
     def eou_latency_ms(self) -> float:
         """判停时刻的静音时长 —— 口径B 残余间隙里判停占的那一段。"""

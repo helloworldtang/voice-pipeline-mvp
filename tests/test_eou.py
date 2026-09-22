@@ -18,7 +18,6 @@ from voice_pipeline.core.eou import (
 )
 from voice_pipeline.providers.asr.sim_asr import SimAsr
 from voice_pipeline.providers.base import AsrProvider
-from voice_pipeline.providers.factory import build_eou
 from voice_pipeline.providers.llm.sim_llm import SimLlm
 from voice_pipeline.providers.tts.sim_tts import SimTts
 from voice_pipeline.server.session import Session
@@ -194,16 +193,18 @@ def test_semantic_without_terminal_does_not_fire_on_silence_alone():
     assert not eou.should_end(), "仅凭 300ms 静音（无终顿/无完整语义）不应判停"
 
 
-def test_default_gating_survives_intra_sentence_pause() -> None:
-    """默认档在 350ms 句内停顿不得判停 —— 抢话率 0% 必须钉在门禁里。
+def test_conservative_survives_intra_sentence_pause() -> None:
+    """conservative 档在 350ms 句内停顿不得判停 —— 这是静音窗档的保底性质。
 
     依据 `scripts/probe_premature.py`（句内停顿 + 真 ASR partial，n=5 句）：
-      conservative 停顿 250/350ms → 抢话 0/5、0/5
+      conservative 停顿 250/350ms → 抢话 0/5、1/5（延迟 495ms）
       semantic     停顿 250/350ms → 抢话 1/5、2/5
     语义档会在这里立刻判停（静音 250ms + 终顿锁存），换成它就红。
+
+    注意默认档现在是 neural（D2），所以这里显式构造 conservative ——「默认档是哪一档」
+    由 test_protocol.py 钉，这里钉的是「这一档该有什么性质」。
     """
-    eou = build_eou()  # 默认档
-    assert eou.gating is GatingMode.CONSERVATIVE, "默认档被改了，先看 probe_premature 的实测"
+    eou = FusedEou(gating=GatingMode.CONSERVATIVE)
     for amp in (0.30, 0.15, 0.05):  # 尾部能量下行 → L2 终顿会成立
         eou.push_audio(_speech(100, amp))
     for _ in range(3):  # 350ms 句内停顿

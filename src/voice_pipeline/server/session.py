@@ -56,12 +56,12 @@ class Session:
         clock: SessionClock | None = None,
         grace_ms: float = 0.0,
         eou: EouDetector | None = None,
-        # 默认 conservative：2026-09-22 抢话实测（`scripts/probe_premature.py`）
-        # 句内停顿 250~350ms 下，semantic 抢话率 20~40%，conservative 为 0%，
-        # 而把 semantic 的静音阈值调到同等安全的 500ms 后延迟 520ms ≈ conservative
-        # 的 515ms —— semantic 在同等安全下没有收益，只多一个抢话风险。
-        # 已知代价：conservative 的 500ms 静音窗把口径B 托底在 500ms 以上。
-        gating: GatingMode = GatingMode.CONSERVATIVE,
+        # 默认 neural（D2 实测后从 conservative 切过来，2026-09-22）：
+        # 官方测试集受控实验（中文 n=335）静音 100ms + 神经判停 → 句末检出 70%、
+        # 句中抢话 4.6%；静音窗要 500ms 才敢判停，而句中停顿一到 500ms 就 100% 抢话。
+        # 神经档 70% 的轮次 ~100ms 就判停，剩下 30% 走 800ms 兜底（期望 ≈310ms）。
+        # 缺权重时 build_eou 退回 conservative 并告警 —— 账单 eou_mode 会如实写回。
+        gating: GatingMode = GatingMode.NEURAL,
     ) -> None:
         self.session_id = uuid4().hex[:12]
         self.trace_id = uuid4().hex[:16]

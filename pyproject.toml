@@ -21,6 +21,9 @@ dev = [
     "pytest-asyncio>=0.24",
     "ruff>=0.7",
     "pytest-timeout>=2.4.0",
+    # 评测数据准备专用（scripts/fetch_eou_dataset.py 解 parquet + flac），运行时不依赖
+    "pyarrow>=17",
+    "soundfile>=0.12",
 ]
 
 [build-system]
@@ -45,7 +48,7 @@ warn_unreachable = true
 files = ["src", "tests"]
 # sherpa-onnx 未随 wheel 提供 py.typed / stubs —— 与其假装，不如显式忽略
 [[tool.mypy.overrides]]
-module = ["sherpa_onnx.*", "soxr.*"]
+module = ["sherpa_onnx.*", "soxr.*", "onnxruntime.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
