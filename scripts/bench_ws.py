@@ -28,6 +28,7 @@ import argparse
 import asyncio
 import contextlib
 import json
+import os
 import platform
 import statistics
 import subprocess
@@ -67,6 +68,7 @@ class Row:
     audio_bytes: int
     wall_ms: float
     rep: int = 0
+    tts_engine: str = ""
     note: str = ""
     extra: dict[str, float] = field(default_factory=dict)
 
@@ -105,6 +107,7 @@ async def run_once(
     utterance: str,
     rep: int,
     gating: str = "neural",
+    tts_engine: str = "",
 ) -> Row:
     t0 = time.perf_counter()
     async with websockets.connect(url, max_size=None, open_timeout=30) as ws:
@@ -186,6 +189,7 @@ async def run_once(
         audio_bytes=audio_bytes,
         wall_ms=round(wall, 1),
         rep=rep,
+        tts_engine=tts_engine,
         extra={k: float(v) for k, v in bill.items() if isinstance(v, (int, float))},
     )
 
@@ -247,85 +251,116 @@ async def main() -> None:
         default="neural",
         help="判停档位（conservative/semantic/neural），可逗号分隔做 A/B",
     )
+    ap.add_argument(
+        "--tts",
+        default=os.environ.get("VOICE_PIPELINE_TTS_ENGINE", "melo"),
+        help="服务端 TTS 引擎，逗号分隔做 A/B（每个引擎各起一个独立服务端进程）",
+    )
     args = ap.parse_args()
 
     url = f"ws://{HOST}:{PORT}/ws"
-    proc = subprocess.Popen(  # noqa: S603
-        [
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "voice_pipeline.server.app:app",
-            "--host",
-            HOST,
-            "--port",
-            str(PORT),
-            "--log-level",
-            "warning",
-        ],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
-    try:
-        await wait_ready(url)
-        print(
-            f"机器: {platform.machine()} / macOS {platform.mac_ver()[0]}   "
-            f"Python {platform.python_version()}"
+    tts_engines = [e.strip() for e in args.tts.split(",") if e.strip()]
+    all_rows: list[Row] = []
+    for tts_engine in tts_engines:
+        # 引擎只能经 env 传给服务端子进程（部署配置不进 WS 协议，见 factory.resolve_tts_engine）
+        env = {**os.environ, "VOICE_PIPELINE_TTS_ENGINE": tts_engine}
+        proc = subprocess.Popen(  # noqa: S603
+            [
+                sys.executable,
+                "-m",
+                "uvicorn",
+                "voice_pipeline.server.app:app",
+                "--host",
+                HOST,
+                "--port",
+                str(PORT),
+                "--log-level",
+                "warning",
+            ],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            env=env,
         )
-        print(f"服务端已就绪 {url}   modes={args.modes}")
+        try:
+            await wait_ready(url)
+            print(
+                f"机器: {platform.machine()} / macOS {platform.mac_ver()[0]}   "
+                f"Python {platform.python_version()}"
+            )
+            print(f"服务端已就绪 {url}   modes={args.modes}   tts={tts_engine}")
 
-        up_tts = R.build_tts_engine("kokoro", num_threads=2)
-        audios = {u: await synthesize(u, up_tts) for u in USER_UTTERANCES}
+            # 上行语音用固定引擎合成：它只是「用户说的话」，必须两组完全一致，
+            # 否则 A/B 比的是两段的语音，不是服务端 TTS。
+            up_tts = R.build_tts_engine("kokoro", num_threads=2)
+            audios = {u: await synthesize(u, up_tts) for u in USER_UTTERANCES}
 
-        rows: list[Row] = []
-        for utterance, pcm in audios.items():
-            for gating in [g.strip() for g in args.gating.split(",") if g.strip()]:
-                for grace in [float(g) for g in args.grace_ms.split(",") if g]:
-                    for mode in args.modes.split(","):
-                        if mode.strip() == "":
-                            continue
-                        if "pipelined" not in mode and grace != float(args.grace_ms.split(",")[0]):
-                            continue
-                        for rep in range(args.repeat):
-                            row = await run_once(
-                                url,
-                                mode.strip(),
-                                pcm,
-                                grace,
-                                args.eou_wait_ms,
-                                utterance,
-                                rep,
-                                gating=gating,
-                            )
-                            print(
-                                f"  {utterance[:8]:<10} {gating:<13} grace={grace:<5.0f} "
-                                f"{mode:<15} 口径B={row.caliber_b_ms:>7.0f}ms "
-                                f"判停={row.eou_latency_ms:>6.0f}ms "
-                                f"hit={row.spec_hit:.0f} eou漏判={row.eou_missed}"
-                            )
-                            rows.append(row)
-        print_report(rows, args.eou_wait_ms)
+            rows: list[Row] = []
+            for utterance, pcm in audios.items():
+                for gating in [g.strip() for g in args.gating.split(",") if g.strip()]:
+                    for grace in [float(g) for g in args.grace_ms.split(",") if g]:
+                        for mode in args.modes.split(","):
+                            if mode.strip() == "":
+                                continue
+                            if "pipelined" not in mode and grace != float(
+                                args.grace_ms.split(",")[0]
+                            ):
+                                continue
+                            for rep in range(args.repeat):
+                                row = await run_once(
+                                    url,
+                                    mode.strip(),
+                                    pcm,
+                                    grace,
+                                    args.eou_wait_ms,
+                                    utterance,
+                                    rep,
+                                    gating=gating,
+                                    tts_engine=tts_engine,
+                                )
+                                print(
+                                    f"  {utterance[:8]:<10} {gating:<13} grace={grace:<5.0f} "
+                                    f"{mode:<15} 口径B={row.caliber_b_ms:>7.0f}ms "
+                                    f"判停={row.eou_latency_ms:>6.0f}ms "
+                                    f"hit={row.spec_hit:.0f} eou漏判={row.eou_missed}"
+                                )
+                                rows.append(row)
+            print_report(rows, args.eou_wait_ms)
+            all_rows.extend(rows)
 
-        out = args.json_out or f"bench/ws-{datetime.now():%Y%m%d-%H%M%S}.json"
-        Path("bench").mkdir(parents=True, exist_ok=True)
-        Path(out).write_text(
-            json.dumps(
-                {
-                    "machine": f"{platform.machine()} macOS {platform.mac_ver()[0]}",
-                    "link": "uvicorn + websockets（真 TCP + JSON 编解码）",
-                    "eou": "服务端 FusedEou 自动判停（超时才兜底 session.end）",
-                    "rows": [
-                        {**{k: v for k, v in r.__dict__.items() if k != "extra"}, **r.extra}
-                        for r in rows
-                    ],
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
-        )
-        print(f"\n→ {out}")
-    finally:
+            out = args.json_out or f"bench/ws-{tts_engine}-{datetime.now():%Y%m%d-%H%M%S}.json"
+            Path("bench").mkdir(parents=True, exist_ok=True)
+            Path(out).write_text(
+                json.dumps(
+                    {
+                        "machine": f"{platform.machine()} macOS {platform.mac_ver()[0]}",
+                        "link": "uvicorn + websockets（真 TCP + JSON 编解码）",
+                        "eou": "服务端 FusedEou 自动判停（超时才兜底 session.end）",
+                        "tts_engine": tts_engine,
+                        "rows": [
+                            {**{k: v for k, v in r.__dict__.items() if k != "extra"}, **r.extra}
+                            for r in rows
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            print(f"\n→ {out}")
+        finally:
+            proc.terminate()
+            with contextlib.suppress(Exception):
+                proc.wait(timeout=10)
+
+    if len(tts_engines) > 1:
+        print("\n=== 引擎 A/B 汇总（同一句话、同一判停档）===")
+        print(f"{'句':<16}{'引擎':>8}{'口径B p50':>12}{'判停':>9}")
+        groups: dict[tuple[str, str], list[float]] = {}
+        for r in all_rows:
+            groups.setdefault((r.utterance, r.tts_engine), []).append(r.caliber_b_ms)
+        for (utt, eng), vals in sorted(groups.items()):
+            print(f"{utt[:14]:<16}{eng:>8}{statistics.median(vals):>11.0f}ms")
+
         proc.terminate()
         with contextlib.suppress(Exception):
             proc.wait(timeout=10)

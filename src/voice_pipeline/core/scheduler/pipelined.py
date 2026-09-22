@@ -164,6 +164,8 @@ class PipelinedScheduler:
 
     async def _synth_into(self, run: SpecRun, sentence: str, chunker: Chunker) -> None:
         run.sentences += 1
+        if run.sentences == 1:
+            self._metrics.tts_first_chars = len(sentence)
         pcm = await asyncio.to_thread(self._tts.synth_blocking, sentence)
         if run.sentences == 1:
             self._metrics.mark("tts_first_chunk")

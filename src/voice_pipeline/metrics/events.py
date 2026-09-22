@@ -44,6 +44,10 @@ class TurnMetrics:
     marks: dict[str, float] = field(default_factory=dict)
     sentences: int = 0
     audio_bytes: int = 0
+    # 送进 TTS 的第一句有多少字。TTS 是端到端最大的一格，而它的耗时几乎线性于
+    # 字数（本机实测 melo +37ms/字、kokoro +47ms/字）—— 不知道字数就无法解释
+    # 这一格的波动，也无法验证「让 LLM 说短一点」到底值多少 ms。
+    tts_first_chars: int = -1
     # EOU 判停指标（§3 / §12.4）：抢话与漏判是一等验收指标
     premature_eou: bool = False  # FP：判停后窗口内用户又开口 = 抢话
     missed_eou: bool = False  # FN：该判未判，用户闭嘴后仍在干等
@@ -71,6 +75,7 @@ class TurnMetrics:
             if first_audio is not None and utterance_end is not None
             else -1.0,
             "sentences": float(self.sentences),
+            "tts_first_chars": float(self.tts_first_chars),
             "audio_bytes": float(self.audio_bytes),
         }
         # EOU 判停指标（§3 / §12.4）：抢话/漏判是一等验收指标

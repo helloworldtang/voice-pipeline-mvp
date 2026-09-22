@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_ASR_ENGINE = "transducer"  # 本机实测：出词粒度 300ms，优于 paraformer 的 600ms
 DEFAULT_LLM_MODEL = DEFAULT_MODEL  # qwen-flash：本机实测首完整句 522ms，快档里最快
+# TTS 引擎：2026-09-22 实测（`scripts/probe_tts.py`，n=5 取 p50）——
+#   melo    单字（固定开销）255ms，边际 +37ms/字；12 字句 1297ms
+#   kokoro  单字（固定开销）812ms，边际 +47ms/字；12 字句 1689ms
+# 同一句换引擎省 390~630ms，而 TTS 是端到端口径B 里最大的一格（旧默认 kokoro 实测 1302ms，
+# 比判停 100ms + LLM 首句 379ms 加起来还大）。melo 的代价写在它的 docstring 里：
+# 采样率非原生（需重采样）、单音色、音量偏低（RMS 峰值 0.031 vs kokoro 0.080）。
+DEFAULT_TTS_ENGINE = "melo"
 # 神经档的「确认静音窗」：模型说完就判，不等静音。扫参结论见 docs/实验报告.md §5
 DEFAULT_NEURAL_SILENCE_MS = 100.0  # 短确认窗：扫参见 docs/实验报告.md §5
 DEFAULT_NEURAL_FALLBACK_MS = 800.0  # 模型不吐 complete 时的兜底，防无限等
@@ -60,11 +67,25 @@ def build_llm(engine: str = "auto", model: str = DEFAULT_LLM_MODEL) -> LlmProvid
     raise ValueError(msg)
 
 
+def resolve_tts_engine(explicit: str | None = None) -> str:
+    """定 TTS 引擎：显式参数 > 环境变量 > 默认。
+
+    环境变量 `VOICE_PIPELINE_TTS_ENGINE` 存在的唯一理由是 A/B：端到端 bench 的
+    服务端跑在独立进程里（`bench_ws.py` 起 uvicorn 子进程），要把引擎当旋钮拧
+    只能走 env。**部署配置不该进 WS 协议** —— gating/grace_ms 是每次会话都可能
+    不同的实验旋钮，引擎不是。
+    """
+    if explicit:
+        return explicit
+    return os.environ.get("VOICE_PIPELINE_TTS_ENGINE", DEFAULT_TTS_ENGINE)
+
+
 def build_providers(
     mode: str = "sim",
     asr_engine: str = DEFAULT_ASR_ENGINE,
     llm_engine: str = "auto",
     llm_model: str = DEFAULT_LLM_MODEL,
+    tts_engine: str | None = None,
 ) -> ProviderSet:
     if mode == "sim":
         return ProviderSet(asr=SimAsr(), llm=SimLlm(), tts=SimTts())
@@ -76,11 +97,16 @@ def build_providers(
             "paraformer": real.ParaformerStreamingAsr,
             "transducer": real.TransducerStreamingAsr,
         }[asr_engine]
+        tts_name = resolve_tts_engine(tts_engine)
+        tts_cls = real.TTS_ENGINES.get(tts_name)
+        if tts_cls is None:
+            msg = f"unknown tts engine: {tts_name} (可选 {list(real.TTS_ENGINES)})"
+            raise ValueError(msg)
         # TTS 4 线程是本机实测最优点（2 线程 665ms → 4 线程 624ms，8 线程反而退步）
         return ProviderSet(
             asr=engine(),
             llm=build_llm(llm_engine, llm_model),
-            tts=real.KokoroTts(num_threads=4),
+            tts=tts_cls(num_threads=4),
         )
 
     msg = f"unknown provider mode: {mode}"

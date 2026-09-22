@@ -79,6 +79,8 @@ class SerialScheduler:
 
     async def _synthesize(self, sentence: str, seq: int) -> AsyncIterator[TurnItem]:
         self._metrics.sentences += 1
+        if seq == 1:
+            self._metrics.tts_first_chars = len(sentence)
         yield TtsSentence(seq=seq, text=sentence)
         pcm = await asyncio.to_thread(self._tts.synth_blocking, sentence)
         self._metrics.mark("tts_first_chunk")

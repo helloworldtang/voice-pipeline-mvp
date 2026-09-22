@@ -335,7 +335,10 @@ class MeloTts(BaseTts):
         return sherpa_onnx.OfflineTts(cfg)
 
 
-TTS_ENGINES: dict[str, type[BaseTts]] = {"kokoro": KokoroTts, "melo": MeloTts}
+# 标注成两个具体类的联合，而不是基类 `type[BaseTts]`：基类签名里没有
+# `num_threads`（各引擎自己声明），写成基类会让工厂里的 `cls(num_threads=4)` 过不了
+# mypy strict，逼着人用 cast 绕——那等于把类型检查关掉。
+TTS_ENGINES: dict[str, type[KokoroTts] | type[MeloTts]] = {"kokoro": KokoroTts, "melo": MeloTts}
 
 
 def build_asr(model_root: Path | str | None = None) -> AsrProvider:

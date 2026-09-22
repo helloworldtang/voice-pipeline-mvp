@@ -48,17 +48,25 @@ ln -sf "$(pwd)/.venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntim
 |---|---|
 | ASR 出词粒度 | paraformer **600ms** / zipformer transducer **300ms**（模型固有，改喂帧节奏无效）|
 | ASR CPU 开销 | RTF 0.008（transducer）/ 0.026（paraformer）|
-| TTS 首音地板 | kokoro 660ms、melo 156ms（**无增量流**：首片到手 = 整句合成完成）|
-| TTS 单点收益 | 只换引擎，端到端口径B 从 1120ms → **713ms** |
+| TTS 首音地板 | kokoro 812ms、melo 255ms（**单字**；无增量流：首片到手 = 整句合成完成）|
+| TTS 边际成本 | kokoro +47ms/字、melo +37ms/字（12 字句：1689ms / 1297ms）|
+| TTS 端到端收益 | 只换引擎（kokoro→melo），真 LLM 端到端口径B 1922→**1758ms**、1731→**1322ms** |
 | 端到端口径B（LLM 为 sim，即本机侧下界）| kokoro 964~1120ms / melo **713ms** |
-| 端到端口径B（**真 LLM = qwen-flash**，melo）| **1109ms**（账单：llm_first_token 380ms / first_sentence_done 409ms）|
+| 端到端口径B（**真 LLM = qwen-flash**，melo）| **1260ms**（20 字句）/ 1758ms（12 字句，p50）|
 
 **接上真 LLM 之后，端到端口径B 从 713ms 涨到 1109ms。** 713ms 是"本机侧下界"，
 不是可对外报的延迟；含真 LLM 的数字才是。`scripts/probe_llm.py` 单独量 LLM 那一格。
 
-**TTS 是最大的单项开销。** 300ms 在「EOU 之后才开始动」的前提下数学上不可达
-（TTS 地板 156ms + EOU 判停 200~300ms + ASR 尾延迟 ~120ms 已超 500ms），
-只能靠**投机执行**把 TTS 藏进用户说话的尾段——这是 M4 的主线。
+**TTS 是最大的单项开销——实测占端到端口径B 约七成。** 真 WS 账单按格拆开：
+判停 100ms、LLM 首 token ~350ms、首句完成 ~36ms、**TTS 首片 964~1376ms**。
+所以 300ms 不止是"差一点"，是差 4 倍：本机最好 1260ms。
+
+TTS 引擎默认 **melo**（2026-09-22 实测定档，见 `docs/实验报告.md` 第六节）；
+代价是音量偏低（RMS 峰值 0.031 vs kokoro 0.080）、44.1k 需重采样、单音色。
+切回只需 `VOICE_PIPELINE_TTS_ENGINE=kokoro`。**换引擎不能救 300ms**，它只省 194~379ms。
+
+> 历史判断更正：这里原先写「瓶颈是 LLM」，那是推断不是实测，已按格拆账推翻。
+> 详见报告第六节开头。
 
 **A/B 的完整账在 [`docs/实验报告.md`](docs/实验报告.md)**（M4 的验收物，此前缺失）。一句话：
 
