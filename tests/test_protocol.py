@@ -6,6 +6,7 @@ import json
 
 import pytest
 
+from voice_pipeline.core.eou import GatingMode
 from voice_pipeline.server.protocol import (
     ErrorEvent,
     Interrupt,
@@ -46,6 +47,39 @@ def test_bad_frame_raises_protocol_error() -> None:
 def test_unknown_type_is_rejected() -> None:
     with pytest.raises(ProtocolError):
         parse_client_frame(json.dumps({"type": "session.nope"}))
+
+
+def test_all_scheduler_modes_are_selectable_on_the_wire() -> None:
+    """实验组必须能在 WS 上被点名——选不到就等于 300ms 那条路只存在于脚本里。"""
+    for mode in ("echo", "serial", "pipelined", "real", "real-serial", "real-pipelined"):
+        raw = json.dumps({"type": "session.begin", "mode": mode})
+        frame = parse_client_frame(raw)
+        assert isinstance(frame, SessionBegin)
+        assert frame.mode == mode
+
+
+def test_unknown_mode_is_rejected() -> None:
+    with pytest.raises(ProtocolError):
+        parse_client_frame(json.dumps({"type": "session.begin", "mode": "turbo"}))
+
+
+def test_default_gating_is_semantic_not_conservative() -> None:
+    """conservative 要等满 500ms 静音窗，口径B 被托底在 500ms 以上——300ms 就不可达了。
+
+    这条断言防的是「有人把它改回保守档，300ms 悄悄变成数学上不可能」。
+    """
+    assert SessionBegin().gating is GatingMode.SEMANTIC
+
+
+def test_gating_and_grace_travel_on_the_wire() -> None:
+    frame = parse_client_frame(
+        SessionBegin(
+            mode="pipelined", gating=GatingMode.AGGRESSIVE, grace_ms=300.0
+        ).model_dump_json()
+    )
+    assert isinstance(frame, SessionBegin)
+    assert frame.gating is GatingMode.AGGRESSIVE
+    assert frame.grace_ms == 300.0
 
 
 def test_server_events_wire_fields() -> None:

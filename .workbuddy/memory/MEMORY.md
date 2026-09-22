@@ -27,11 +27,15 @@
 
 ## 已定事项（已拍板，勿回炉）
 - **LICENSE = MIT**（2026-09-20 拍板）。
-- **激进播放门控**：M2 接入语义判停前默认关（裸激进＝抢话），M2 之后应默认开 semantic 档。⚠️ 2026-09-21 复核推翻旧判据：它压的是**口径B**不是口径A，与「口径B 300ms」目标**一致且是必要前提**（等完整静音窗 ⇒ 口径B ≥500-700ms，300ms 不可达）。它与 EOU 语义判停是配套两端，不是二选一。配套指标 premature_eou_rate（过早判停率）文档缺失待补。
+- **激进播放门控**：M2 接入语义判停前默认关（裸激进＝抢话），M2 之后应默认开 semantic 档。⚠️ 2026-09-21 复核推翻旧判据：它压的是**口径B**不是口径A，与「口径B 300ms」目标**一致且是必要前提**（等完整静音窗 ⇒ 口径B ≥500-700ms，300ms 不可达）。它与 EOU 语义判停是配套两端，不是二选一。配套指标 premature_eou_rate（过早判停率）文档缺失待补。**✅ 2026-09-22 已定档：默认切 `semantic`**（Session / factory.build_eou / FusedEou 三处默认同步改掉，test_protocol.py 有防回退断言）。⚠️ 换档依据是**机理不是中文实测**——D4 判错率曲线、D5 中文测试集仍未做，对外报告必须带这句。
 - **live 麦克风客户端 = 一期做**，依赖入耳式耳机物理隔离回声；软件 AEC 列差距表二期。
 - **EOU 语义判停 = M2 主线**（LiveKit turn-detector INT8），不是升级位。
 - 里程碑（编号不变，内容加重）：M2 = real 接入 + 本机校准 + EOU 判停；M3 = barge-in 三层 + live 客户端。
 - **WS 并发不变量（M3 起，勿退化回串行）**：接收循环 / `run_turn` / `pump` 三路并发，中间用 outbox 队列解耦。串行模型下播音期间收不到上行帧，barge-in 永远触发不了。**关连接前必须 `await outbox.join()` 等 pump 排空**（pump 每发一项调 `task_done()`）——否则 `finally` 的 `pump_task.cancel()` 会吞掉 `turn.end`，客户端表现为**无报错挂死**。pytest 已加 `timeout=30` 把挂起变成明确失败。
+- **pipelined 必须在 wire 枚举里（2026-09-22 补齐）**：`SessionBegin.mode` 原先只有 `echo|serial|real`，
+  `pipelined` 只存在于 Session，导致唯一能逼近 300ms 的实验组只能跑 bench 脚本，与「A/B 打在真实服务链路上」相违。
+  现枚举 = echo/serial/pipelined/real/real-serial/real-pipelined，`gating`/`grace_ms` 一并上 wire 并由 app.py 透传给 Session。
+  **判据：账单里出现 `spec_hit` 键 = 走的确实是 PipelinedScheduler**（serial 的 TurnEnd 不带它），test_ws.py 据此断言。
 
 ## 文档里的坑
 - 「M5 本机校准」的 M5 指 **Apple M5 芯片**，不是里程碑 M5 —— 同字冲突，已全文消歧为「本机（Apple M5）校准」。

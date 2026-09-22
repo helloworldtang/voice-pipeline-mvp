@@ -82,9 +82,20 @@ uv run uvicorn voice_pipeline.server.app:app --port 8000
 curl localhost:8000/healthz
 ```
 
-WS 协议：`session.begin{mode: echo|serial|real}` → 上行 PCM16 音频帧 → `session.end` 触发一轮
+WS 协议：`session.begin{mode, gating, grace_ms}` → 上行 PCM16 音频帧 → `session.end` 触发一轮
 （real 模式由 EOU 自动判停，不必显式 `session.end`）；`interrupt` 触发打断，下行 `audio.stop`
-通知播放端停播。echo 量 WS 链路本身的开销；serial 用 sim 三替身跑同构链路；real 用真模型（缺模型会明确报错）。
+通知播放端停播。
+
+| `mode` | 含义 |
+|---|---|
+| `echo` | 原样回发音频，量 WS 链路本身的开销 |
+| `serial` | 对照组：EOU 之后才启动 LLM（sim 三替身） |
+| `pipelined` | **实验组**：用户说话期间投机跑 LLM+TTS（sim 三替身），唯一能逼近 300ms 的路径 |
+| `real` / `real-serial` / `real-pipelined` | 同上，换真模型真 LLM（缺模型会明确报错） |
+
+`gating` 三档 `conservative|semantic|aggressive`，**默认 `semantic`**——`conservative` 要等满
+500ms 静音窗，口径B 被托底在 500ms 以上，300ms 数学上不可达。`grace_ms` 是 pipelined 的
+投机等待窗（EOU 后最多再等多久让投机落地），本机实测 `grace=0` 时 6/6 全未命中、`grace=300` 才吃到那次 179ms。
 
 live 真机试跑（M3）：
 

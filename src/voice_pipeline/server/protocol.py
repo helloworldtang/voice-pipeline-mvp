@@ -12,6 +12,19 @@ from typing import Annotated, Literal
 
 from pydantic import BaseModel, Field, TypeAdapter, ValidationError
 
+from voice_pipeline.core.eou import GatingMode
+
+# wire 上可点名的模式。pipelined 必须在这里——它是唯一能逼近 300ms 的调度器，
+# 选不到就等于「实验组只能脚本跑、WS 服务里没有」，与 §4.5「A/B 打在真实服务链路上」相违。
+MODE = Literal[
+    "echo",
+    "serial",
+    "pipelined",
+    "real",
+    "real-serial",
+    "real-pipelined",
+]
+
 
 class ProtocolError(Exception):
     """帧解析失败。code 会原样下发为 error 事件。"""
@@ -26,7 +39,13 @@ class SessionBegin(BaseModel):
     type: Literal["session.begin"] = "session.begin"
     sample_rate: int = 16000
     client: str = "unknown"
-    mode: Literal["echo", "serial", "real"] = "serial"
+    mode: MODE = "serial"
+    # 判停档位。默认 semantic（不是 conservative）：conservative 要等满 500ms 静音窗，
+    # 口径B 被托底在 500ms 以上，300ms 数学上不可达。
+    gating: GatingMode = GatingMode.SEMANTIC
+    # pipelined 专用：EOU 后最多再等多少毫秒让投机落地（0 = 不等，没好就走串行）。
+    # 本机实测 grace=0 时 6/6 全未命中，grace=300 才吃到那唯一一次 179ms。
+    grace_ms: float = 0.0
 
 
 class Interrupt(BaseModel):

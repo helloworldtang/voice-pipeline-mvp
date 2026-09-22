@@ -110,8 +110,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     continue
 
                 if isinstance(frame, SessionBegin):
-                    # 换模式即重建会话（含新的 outbox 与 pump）
-                    session = Session(mode=frame.mode)
+                    # 换模式即重建会话（含新的 outbox 与 pump）。
+                    # gating / grace_ms 必须透传：它们是 300ms 实验的两个旋钮，
+                    # 协议里有、构造时丢掉，就等于旋钮是画上去的。
+                    session = Session(
+                        mode=frame.mode,
+                        gating=frame.gating,
+                        grace_ms=frame.grace_ms,
+                    )
                     pump_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await pump_task

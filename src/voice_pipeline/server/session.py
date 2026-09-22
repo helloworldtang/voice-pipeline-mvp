@@ -56,7 +56,11 @@ class Session:
         clock: SessionClock | None = None,
         grace_ms: float = 0.0,
         eou: EouDetector | None = None,
-        gating: GatingMode = GatingMode.CONSERVATIVE,
+        # 默认 semantic（原为 conservative）：conservative 要求静音 ≥500ms 才判停，
+        # 口径B 被托底在 500ms 以上，300ms 目标数学上不可达。semantic 只需静音 ≥250ms
+        # 且「韵律终顿或语义完整」二选一成立，是「快」与「不抢话」的交点。
+        # 代价：判错率上升，由 premature_eou 指标盯着（判错曲线见 D4）。
+        gating: GatingMode = GatingMode.SEMANTIC,
     ) -> None:
         self.session_id = uuid4().hex[:12]
         self.trace_id = uuid4().hex[:16]

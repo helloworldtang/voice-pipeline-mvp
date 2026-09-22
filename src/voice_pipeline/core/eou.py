@@ -255,7 +255,10 @@ class FusedEou:
 
     def __init__(
         self,
-        gating: GatingMode = GatingMode.CONSERVATIVE,
+        # 默认档位经实测后定为 semantic：conservative 的 500ms 静音窗把口径B 托底在
+        # 500ms 以上（300ms 不可达），aggressive 只作实验开关。semantic 的安全来源
+        # 是韵律/语义置信度而不是时间冗余，代价是判错率——由 premature_eou 盯着。
+        gating: GatingMode = GatingMode.SEMANTIC,
         silence: EouDetector | None = None,
         prosody: ProsodyEou | None = None,
         semantic: SemanticHeuristicEou | None = None,

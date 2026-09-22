@@ -113,6 +113,37 @@ def test_serial_mode_runs_full_chain_over_ws() -> None:
         assert bill["sentences"] >= 1
 
 
+def test_pipelined_mode_runs_full_chain_over_ws() -> None:
+    """实验组必须能在 WS 上跑通，而不只是在 bench 脚本里。
+
+    判据用账单里的 `spec_hit` 键：只有 PipelinedScheduler 会打这个字段，
+    serial 的 TurnEnd 不带它。所以这个键出现在 wire 上 = 走的确实是投机调度。
+    """
+    with TestClient(create_app()).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        ws.send_text(SessionBegin(mode="pipelined", grace_ms=100.0).model_dump_json())
+        assert ws.receive_json()["type"] == "session.ready"
+
+        ws.send_bytes(PCM_FRAME)
+        ws.send_text(SessionEnd().model_dump_json())
+
+        bill: dict[str, float] = {}
+        audio_sizes: list[int] = []
+        while True:
+            payload = ws.receive_json()
+            if payload["type"] == "audio.chunk":
+                audio_sizes.append(payload["bytes_len"])
+                ws.receive_bytes()
+            if payload["type"] == "turn.end":
+                bill = payload["metrics"]
+                break
+
+        assert "spec_hit" in bill, "账单里没有 spec_hit → 走的还是 serial，pipelined 没接进 wire"
+        assert "spec_miss" in bill
+        assert audio_sizes, "pipelined 也必须真的出音频"
+        assert bill["caliber_b_ms"] >= 0
+
+
 def test_intermediate_event_shapes_are_stable() -> None:
     """事件的 wire 形状就是对外承诺，改动必须显式。"""
     assert AsrFinal(text="上海今天多少度").model_dump() == {
