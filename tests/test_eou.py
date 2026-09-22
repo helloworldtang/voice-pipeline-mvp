@@ -154,3 +154,40 @@ def test_session_auto_end_with_eou():
     bill = asyncio.run(_drain())
     assert bill.get("eou_mode") == 1.0, bill  # 1 = semantic
     assert bill.get("premature_eou") == 0.0, bill
+
+
+def test_semantic_latches_terminal_instead_of_falling_back_to_watchdog():
+    """回归：SEMANTIC 档曾因两个 250ms 互斥而**永远不成立**。
+
+    `ProsodyEou.coda_ms=250` 会在静音超过 250ms 后主动清掉终顿，
+    而 SEMANTIC 档要求静音 ≥250ms 才去读终顿 —— 帧粒度 100ms 下这两个条件
+    永远采不到交集，于是退化成「等满 2000ms 看门狗」（实测判停延迟 1804ms）。
+
+    终顿是**事件**不是状态，必须锁存。这条断言防的是有人把锁存改回瞬时读取。
+    """
+    eou = FusedEou(gating=GatingMode.SEMANTIC)
+    for _ in range(4):  # 稳态语音，建立能量峰值
+        eou.push_audio(_speech(100, 0.30))
+    for amp in (0.15, 0.10, 0.05):  # 尾部能量下行 → L2 终顿
+        eou.push_audio(_speech(100, amp))
+    for _ in range(3):  # 静音 300ms
+        eou.push_audio(_silence(100))
+
+    assert eou.should_end(), "终顿后静音 300ms 应判停"
+    assert eou.eou_latency_ms() < 500, (
+        f"判停延迟 {eou.eou_latency_ms()}ms —— 退化到 2000ms 看门狗了"
+    )
+
+
+def test_semantic_without_terminal_does_not_fire_on_silence_alone():
+    """锁存不能退化成「只要静音够久就判停」——那样 SEMANTIC 就失去了安全来源。
+
+    没有终顿、也没有语义完整时，300ms 静音不该判停。
+    """
+    eou = FusedEou(gating=GatingMode.SEMANTIC)
+    for _ in range(6):
+        eou.push_audio(_speech(100, 0.30))  # 恒定能量，无下行 → 不产生终顿
+    for _ in range(3):
+        eou.push_audio(_silence(100))
+
+    assert not eou.should_end(), "仅凭 300ms 静音（无终顿/无完整语义）不应判停"

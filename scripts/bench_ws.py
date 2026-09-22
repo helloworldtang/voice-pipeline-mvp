@@ -14,7 +14,7 @@
 
 跑法：
     uv run python scripts/bench_ws.py
-    uv run python scripts/bench_ws.py --repeat 3 --silence-ms 250,600 --grace-ms 0,300
+    uv run python scripts/bench_ws.py --repeat 3 --grace-ms 0,300
     uv run python scripts/bench_ws.py --modes serial,pipelined   # 零延迟替身，只验结构
 
 诚实声明：上行语音是 TTS 合成的（方案 §13.1），不是真人录音 —— 数字用于比较
@@ -59,7 +59,7 @@ USER_UTTERANCES = [
 class Row:
     mode: str
     utterance: str
-    silence_ms: int
+    eou_latency_ms: float
     grace_ms: float
     caliber_b_ms: float
     spec_hit: float
@@ -100,7 +100,6 @@ async def run_once(
     url: str,
     mode: str,
     pcm: np.ndarray,
-    silence_ms: int,
     grace_ms: float,
     eou_wait_ms: float,
     utterance: str,
@@ -119,25 +118,37 @@ async def run_once(
         ready = json.loads(await ws.recv())
         assert ready["type"] == "session.ready", ready
 
-        # 上行：语音 + 静音窗，按真实速度（100ms/帧）
-        buf = np.concatenate([pcm, np.zeros(int(16000 * silence_ms / 1000), dtype=np.float32)])
-        for i in range(0, len(buf), BLOCK):
-            await ws.send(pcm16_bytes(buf[i : i + BLOCK]))
+        # 上行语音，按真实速度（100ms/帧）
+        for i in range(0, len(pcm), BLOCK):
+            await ws.send(pcm16_bytes(pcm[i : i + BLOCK]))
             await asyncio.sleep(BLOCK / 16000)
 
-        # 等服务端自己判停。EOU 若没判，超时后兜底 session.end —— 并记下来，
-        # 因为「判不了停」和「判得很慢」是两种完全不同的失败。
-        deadline = time.monotonic() + eou_wait_ms / 1000.0
+        # ⚠️ 用户闭嘴后**麦克风仍在送静音帧** —— 真实系统里静音累计会持续增长，
+        # 判停由服务端的 FusedEou 决定。旧版这里发完 silence_ms 静音就停喂，
+        # 静音累计被冻结在 250ms（刚好卡在 semantic 阈值的边界上），于是
+        # 「判不了停」——那是测量方式造成的人为漏判，不是产品行为。
+        # 已改为持续喂静音直到服务端判停或超时。
+        stop = asyncio.Event()
+
+        async def feed_silence() -> None:
+            zeros = np.zeros(BLOCK, dtype=np.float32)
+            while not stop.is_set():
+                try:
+                    await ws.send(pcm16_bytes(zeros))
+                except Exception:  # noqa: BLE001  连接已关就退出
+                    return
+                await asyncio.sleep(BLOCK / 16000)
+
+        feeder = asyncio.create_task(feed_silence())
         bill: dict[str, float] = {}
         audio_bytes = 0
         eou_missed = 0
 
-        async def drain() -> dict[str, float] | None:
+        async def drain(timeout_s: float) -> dict[str, float] | None:
             nonlocal audio_bytes
+            end = time.monotonic() + timeout_s
             while True:
-                msg = await asyncio.wait_for(
-                    ws.recv(), timeout=max(deadline - time.monotonic(), 0.1)
-                )
+                msg = await asyncio.wait_for(ws.recv(), timeout=max(end - time.monotonic(), 0.1))
                 if isinstance(msg, bytes):
                     audio_bytes += len(msg)
                     continue
@@ -148,20 +159,25 @@ async def run_once(
                     return None
 
         try:
-            bill = await drain() or {}
+            bill = await drain(eou_wait_ms / 1000.0) or {}
         except (TimeoutError, asyncio.TimeoutError):
             eou_missed = 1
             await ws.send(SessionEnd().model_dump_json())
             try:
-                bill = await drain() or {}
+                bill = await drain(eou_wait_ms / 1000.0) or {}
             except (TimeoutError, asyncio.TimeoutError):
                 bill = {}
+        finally:
+            stop.set()
+            feeder.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await feeder
 
     wall = (time.perf_counter() - t0) * 1000
     return Row(
         mode=mode,
         utterance=utterance,
-        silence_ms=silence_ms,
+        eou_latency_ms=float(bill.get("eou_latency_ms", -1.0)),
         grace_ms=grace_ms if "pipelined" in mode else 0.0,
         caliber_b_ms=float(bill.get("caliber_b_ms", -1.0)),
         spec_hit=float(bill.get("spec_hit", 0.0)),
@@ -181,17 +197,20 @@ def _stats(vals: list[float]) -> str:
 
 def print_report(rows: list[Row], eou_wait_ms: float) -> None:
     print("\n=== WS 链路 口径B（用户说完 → AI 首音）: p50 (min / max) ===")
-    print(f"{'句':<16}{'静音':>6}{'grace':>7}{'mode':>16}{'口径B':>26}{'命中':>7}{'EOU漏判':>9}")
-    groups: dict[tuple[str, int, float, str], list[Row]] = {}
+    print(
+        f"{'句':<16}{'判停延迟':>9}{'grace':>7}{'mode':>16}{'口径B':>26}{'命中':>7}{'EOU漏判':>9}"
+    )
+    groups: dict[tuple[str, float, str], list[Row]] = {}
     for r in rows:
-        groups.setdefault((r.utterance, r.silence_ms, r.grace_ms, r.mode), []).append(r)
+        groups.setdefault((r.utterance, r.grace_ms, r.mode), []).append(r)
     for key in sorted(groups):
         grp = groups[key]
         label = key[0] if len(key[0]) <= 14 else key[0][:13] + "…"
         hits = sum(r.spec_hit for r in grp)
         missed = sum(r.eou_missed for r in grp)
+        eou = _stats([r.eou_latency_ms for r in grp if r.eou_latency_ms >= 0])
         print(
-            f"{label:<16}{key[1]:>6}{key[2]:>7.0f}{key[3]:>16}"
+            f"{label:<16}{eou:>9}{key[1]:>7.0f}{key[2]:>16}"
             f"{_stats([r.caliber_b_ms for r in grp]):>26}"
             f"{f'{hits:.0f}/{len(grp)}':>7}{f'{missed}/{len(grp)}':>9}"
         )
@@ -218,7 +237,6 @@ def print_report(rows: list[Row], eou_wait_ms: float) -> None:
 async def main() -> None:
     ap = argparse.ArgumentParser(description="serial vs pipelined 的 WS 链路 A/B")
     ap.add_argument("--modes", default="real-serial,real-pipelined")
-    ap.add_argument("--silence-ms", default="250,600")
     ap.add_argument("--grace-ms", default="0,300")
     ap.add_argument("--repeat", type=int, default=2)
     ap.add_argument("--eou-wait-ms", type=float, default=2000.0)
@@ -255,30 +273,29 @@ async def main() -> None:
 
         rows: list[Row] = []
         for utterance, pcm in audios.items():
-            for silence in [int(s) for s in args.silence_ms.split(",") if s]:
-                for grace in [float(g) for g in args.grace_ms.split(",") if g]:
-                    for mode in args.modes.split(","):
-                        if mode.strip() == "":
-                            continue
-                        if "pipelined" not in mode and grace != float(args.grace_ms.split(",")[0]):
-                            continue
-                        for rep in range(args.repeat):
-                            row = await run_once(
-                                url,
-                                mode.strip(),
-                                pcm,
-                                silence,
-                                grace,
-                                args.eou_wait_ms,
-                                utterance,
-                                rep,
-                            )
-                            print(
-                                f"  {utterance[:8]:<10} sil={silence:<4} grace={grace:<5.0f} "
-                                f"{mode:<15} 口径B={row.caliber_b_ms:>7.0f}ms "
-                                f"hit={row.spec_hit:.0f} eou漏判={row.eou_missed}"
-                            )
-                            rows.append(row)
+            for grace in [float(g) for g in args.grace_ms.split(",") if g]:
+                for mode in args.modes.split(","):
+                    if mode.strip() == "":
+                        continue
+                    if "pipelined" not in mode and grace != float(args.grace_ms.split(",")[0]):
+                        continue
+                    for rep in range(args.repeat):
+                        row = await run_once(
+                            url,
+                            mode.strip(),
+                            pcm,
+                            grace,
+                            args.eou_wait_ms,
+                            utterance,
+                            rep,
+                        )
+                        print(
+                            f"  {utterance[:8]:<10} grace={grace:<5.0f} "
+                            f"{mode:<15} 口径B={row.caliber_b_ms:>7.0f}ms "
+                            f"判停={row.eou_latency_ms:>6.0f}ms "
+                            f"hit={row.spec_hit:.0f} eou漏判={row.eou_missed}"
+                        )
+                        rows.append(row)
         print_report(rows, args.eou_wait_ms)
 
         out = args.json_out or f"bench/ws-{datetime.now():%Y%m%d-%H%M%S}.json"

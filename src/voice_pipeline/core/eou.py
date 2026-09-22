@@ -23,6 +23,7 @@ from __future__ import annotations
 import array
 import collections
 import enum
+import math
 from collections.abc import Callable
 from typing import Protocol
 
@@ -270,6 +271,12 @@ class FusedEou:
         max_silence_ms: float = 2000.0,
         premature_window_ms: float = 300.0,
         max_wait_ms: float = 5000.0,
+        # 终顿的锁存窗。为什么必须有：ProsodyEou 在静音超过 coda_ms(250) 后会主动
+        # 把终顿清零（纯静音不提供信息），而 semantic 档要求静音 ≥250ms 才去读终顿——
+        # 两个条件用的是同一个 250，帧粒度 100ms 下永远采不到交集，semantic 档因此
+        # 退化成「等满 2000ms 看门狗」（实测判停延迟 1804ms）。
+        # 终顿是**事件**不是状态，所以这里锁存它最近的成立时刻，按窗口判。
+        terminal_window_ms: float = 400.0,
     ) -> None:
         self.gating = gating
         self._silence = silence or VadSilenceEou(
@@ -284,8 +291,10 @@ class FusedEou:
         self.max_silence_ms = max_silence_ms
         self.premature_window_ms = premature_window_ms
         self.max_wait_ms = max_wait_ms
+        self.terminal_window_ms = terminal_window_ms
 
         self._elapsed = 0.0
+        self._last_terminal_ms = -math.inf  # 韵律终顿最近一次成立的时刻（锁存）
         self._decided = False
         self._decided_at_ms = 0.0
         self.premature_eou = False
@@ -296,6 +305,9 @@ class FusedEou:
         self._silence.push_audio(chunk)
         if self._prosody is not None:
             self._prosody.push_audio(chunk)
+            # 锁存终顿时刻：它一闪即逝（静音一累积就被 coda 清掉），不记下来就读不到
+            if self._prosody.is_terminal():
+                self._last_terminal_ms = self._elapsed
         if self._semantic is not None:
             self._semantic.push_audio(chunk)
         # 抢话：判停决定之后、窗口内又出现人声 → 这次判停是错的
@@ -335,11 +347,12 @@ class FusedEou:
                 self._latch()
                 return True
             return False
-        # SEMANTIC：静音 + (韵律终顿 或 语义完整)
+        # SEMANTIC：静音 + (最近出现过韵律终顿 或 语义完整)。
+        # 注意是「最近出现过」而不是「此刻成立」——此刻成立要求静音还没被 coda 清掉，
+        # 与 sil>=250 互斥（见 terminal_window_ms 的注释）。
         if sil >= self.min_silence_short_ms:
-            ok = (self._prosody is not None and self._prosody.is_terminal()) or (
-                self._semantic is not None and self._semantic.is_complete()
-            )
+            terminal_recent = self._elapsed - self._last_terminal_ms <= self.terminal_window_ms
+            ok = terminal_recent or (self._semantic is not None and self._semantic.is_complete())
             if ok:
                 self._latch()
                 return True
@@ -357,6 +370,7 @@ class FusedEou:
         if self._semantic is not None:
             self._semantic.reset()
         self._elapsed = 0.0
+        self._last_terminal_ms = -math.inf
         self._decided = False
         self._decided_at_ms = 0.0
         self.premature_eou = False

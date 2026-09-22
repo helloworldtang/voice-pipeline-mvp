@@ -77,6 +77,8 @@ class Session:
         self._barge = BargeInDetector()
         self.outbox: asyncio.Queue[TurnItem | AudioStop] = asyncio.Queue()
         self._turn_running = False
+        # 本轮判停指标是否已抓进账单（防止被 reset 后的 0 覆盖）
+        self._eou_collected = False
 
         real = mode.startswith("real-") or mode == "real"
         spec_mode = mode.removeprefix("real-")
@@ -163,6 +165,19 @@ class Session:
         """兼容旧调用方：等价于客户端主动打断。"""
         return self.barge_in(source="client")
 
+    def _collect_eou_metrics(self) -> None:
+        """把 FusedEou 的验收指标抓进账单。**必须在本轮 reset 之前调用**。
+
+        reset 会清掉静音计时与抢话/漏判标志，采晚了 eou_latency_ms 就是 0 ——
+        而 0 看起来像个正常数字，不像缺失，所以这个失效能潜伏一整个里程碑。
+        """
+        if isinstance(self._eou, FusedEou):
+            self.metrics.premature_eou = self._eou.premature_eou
+            self.metrics.missed_eou = self._eou.missed_eou
+            self.metrics.eou_latency_ms = self._eou.eou_latency_ms()
+            self.metrics.eou_mode = self._gating.value
+        self._eou_collected = True
+
     async def finish(self) -> AsyncIterator[TurnItem]:
         """跑完一轮，产出事件与音频分片（被 run_turn 包装成后台任务）。
 
@@ -171,11 +186,12 @@ class Session:
         """
         if self._scheduler is None:
             return
-        # 把 EOU 判停器的验收指标落进账单（仅 FusedEou 携带抢话/漏判/静音时长）
+        # 把 EOU 判停器的验收指标落进账单（仅 FusedEou 携带抢话/漏判/静音时长）。
+        # ⚠️ 只在还没填过时填：run_turn 会在 reset 之前先采一次真值，这里若无条件
+        # 覆盖，就会用 reset 之后的 0 把真值抹掉（eou_latency_ms 曾因此恒为 0）。
         if isinstance(self._eou, FusedEou):
-            self.metrics.premature_eou = self._eou.premature_eou
-            self.metrics.missed_eou = self._eou.missed_eou
-            self.metrics.eou_latency_ms = self._eou.eou_latency_ms()
+            if not self._eou_collected:
+                self._collect_eou_metrics()
             self.metrics.eou_mode = self._gating.value
         # 进入一轮：先到 LISTENING（已在此状态则无害跳过），再 THINKING
         self._fsm.move(TurnState.LISTENING)
@@ -206,6 +222,10 @@ class Session:
             return
         self._turn_running = True
         self.interrupted = False
+        self._eou_collected = False
+        # 必须在 reset 之前采：reset 会清掉静音计时与抢话/漏判标志，
+        # 采晚了 eou_latency_ms 就恒为 0（这个指标曾因此整整失效一整个里程碑）。
+        self._collect_eou_metrics()
         if isinstance(self._eou, FusedEou):
             self._eou.reset()
         try:
