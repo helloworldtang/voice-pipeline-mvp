@@ -105,8 +105,18 @@ WS 协议：`session.begin{mode, gating, grace_ms}` → 上行 PCM16 音频帧 �
 | `pipelined` | **实验组**：用户说话期间投机跑 LLM+TTS（sim 三替身），唯一能逼近 300ms 的路径 |
 | `real` / `real-serial` / `real-pipelined` | 同上，换真模型真 LLM（缺模型会明确报错） |
 
-`gating` 三档 `conservative|semantic|aggressive`，**默认 `semantic`**——`conservative` 要等满
-500ms 静音窗，口径B 被托底在 500ms 以上，300ms 数学上不可达。`grace_ms` 是 pipelined 的
+`gating` 三档 `conservative|semantic|aggressive`，**默认 `conservative`**——这是 2026-09-22 抢话
+实测的结论，不是口味（`scripts/probe_premature.py`，句内停顿 + 真 ASR partial）：
+
+| 档位 | 句内停顿 250ms | 350ms | 判停延迟 |
+|---|---|---|---|
+| **conservative（默认）** | 抢话 **0/5** | 抢话 **0/5** | 515ms |
+| semantic | 抢话 1/5 | 抢话 2/5 | 330ms |
+| aggressive | 抢话 5/5 | 抢话 5/5 | 220ms |
+
+semantic 用 185ms 延迟换 20~40% 抢话率；把它的静音阈值调到同等安全的 500ms 后延迟 520ms
+≈ conservative 的 515ms——**同安全下没有收益**。已知代价：conservative 的 500ms 静音窗把
+口径B 托底在 500ms 以上，300ms 在本判据下与「不抢话」不可兼得。`grace_ms` 是 pipelined 的
 投机等待窗（EOU 后最多再等多久让投机落地）。它是赌注：真 LLM + 250ms 静音窗下
 `grace=0` 命中 0/9（永远不命中），`grace=300` 命中 0/6 且未命中时白等 300ms——两头一挤期望值为负。
 

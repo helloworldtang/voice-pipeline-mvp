@@ -40,9 +40,9 @@ class SessionBegin(BaseModel):
     sample_rate: int = 16000
     client: str = "unknown"
     mode: MODE = "serial"
-    # 判停档位。默认 semantic（不是 conservative）：conservative 要等满 500ms 静音窗，
-    # 口径B 被托底在 500ms 以上，300ms 数学上不可达。
-    gating: GatingMode = GatingMode.SEMANTIC
+    # 判停档位。默认 conservative（2026-09-22 抢话实测后从 semantic 退回）：
+    # 句内停顿 250~350ms 下 semantic 抢话率 20~40%，conservative 为 0%。
+    gating: GatingMode = GatingMode.CONSERVATIVE
     # pipelined 专用：EOU 后最多再等多少毫秒让投机落地（0 = 不等，没好就走串行）。
     # 本机实测 grace=0 时 6/6 全未命中，grace=300 才吃到那唯一一次 179ms。
     grace_ms: float = 0.0

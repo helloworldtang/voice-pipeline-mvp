@@ -10,9 +10,16 @@
     判停 = f(L2, L3)，静音窗退化为兜底上限
 
 三档门控（§11 D3）：
-    conservative —— 等完整静音窗（兜底上限），慢但最稳，M2 接入前的默认
-    semantic     —— 静音 + (韵律终顿 或 语义完整) 即判停，快且不抢话的达标档
-    aggressive   —— 极短静音即判停，实验开关，用于证明「不是做不到更快，是选了不抢话」
+    conservative —— 等完整静音窗（500ms），慢但 0% 抢话。**当前默认**
+    semantic     —— 静音 + (韵律终顿 或 语义完整) 即判停，快
+    aggressive   —— 极短静音即判停，实验开关
+
+⚠️ 2026-09-22 实测（`scripts/probe_premature.py`）：「semantic 快且不抢话」是**错的**。
+句内停顿 250~350ms 下抢话率 **20~40%**，conservative 为 **0%**。原因是 L2 韵律终顿
+是个黏性锁存（说话中任意一帧能量跌到峰值 40% 以下就永久置真），几乎恒为真，
+semantic 因此退化成「静音 ≥250ms」。代价换不来：把静音阈值扫到 500ms 能回到 0% 抢话，
+但延迟 520ms ≈ conservative 的 515ms —— semantic 在同等安全下**没有收益**。
+语义档要可用，前提是换掉 L2 启发式（D2 神经判停器）或拿到真人测试集定标（D5）。
 
 神经版（Smart Turn v3 / turn-detector INT8）是生产可插拔升级（D2）：它们实现同一个
 `EouDetector` 接口，FusedEou 直接换上即可，不阻塞 M2b 的门禁与验收。
@@ -256,10 +263,12 @@ class FusedEou:
 
     def __init__(
         self,
-        # 默认档位经实测后定为 semantic：conservative 的 500ms 静音窗把口径B 托底在
-        # 500ms 以上（300ms 不可达），aggressive 只作实验开关。semantic 的安全来源
-        # 是韵律/语义置信度而不是时间冗余，代价是判错率——由 premature_eou 盯着。
-        gating: GatingMode = GatingMode.SEMANTIC,
+        # 默认档经 2026-09-22 抢话实测后定为 conservative：
+        #   conservative(500ms)  句内停顿 250/350ms → 抢话 0%，判停延迟 515ms
+        #   semantic(250ms)      同条件 → 抢话 20~40%，判停延迟 330ms
+        # 用 185ms 的延迟换 20~40% 的抢话率不划算（真人只会更糟）。
+        # 300ms 目标因此在本判据下与「不抢话」不可兼得——要兼得得先换掉 L2 启发式（D2）。
+        gating: GatingMode = GatingMode.CONSERVATIVE,
         silence: EouDetector | None = None,
         prosody: ProsodyEou | None = None,
         semantic: SemanticHeuristicEou | None = None,

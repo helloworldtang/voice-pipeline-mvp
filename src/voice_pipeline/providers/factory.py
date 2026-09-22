@@ -83,7 +83,7 @@ def build_providers(
     raise ValueError(msg)
 
 
-def build_eou(gating: GatingMode = GatingMode.SEMANTIC, sample_rate: int = 16000) -> FusedEou:
+def build_eou(gating: GatingMode = GatingMode.CONSERVATIVE, sample_rate: int = 16000) -> FusedEou:
     """组装 EOU 判停器（M2b）。
 
     默认用模型无关的启发式 L2(韵律)/L3(语义)；生产可把 `silence`/`prosody`/`semantic`

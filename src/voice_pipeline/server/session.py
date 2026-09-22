@@ -56,11 +56,12 @@ class Session:
         clock: SessionClock | None = None,
         grace_ms: float = 0.0,
         eou: EouDetector | None = None,
-        # 默认 semantic（原为 conservative）：conservative 要求静音 ≥500ms 才判停，
-        # 口径B 被托底在 500ms 以上，300ms 目标数学上不可达。semantic 只需静音 ≥250ms
-        # 且「韵律终顿或语义完整」二选一成立，是「快」与「不抢话」的交点。
-        # 代价：判错率上升，由 premature_eou 指标盯着（判错曲线见 D4）。
-        gating: GatingMode = GatingMode.SEMANTIC,
+        # 默认 conservative：2026-09-22 抢话实测（`scripts/probe_premature.py`）
+        # 句内停顿 250~350ms 下，semantic 抢话率 20~40%，conservative 为 0%，
+        # 而把 semantic 的静音阈值调到同等安全的 500ms 后延迟 520ms ≈ conservative
+        # 的 515ms —— semantic 在同等安全下没有收益，只多一个抢话风险。
+        # 已知代价：conservative 的 500ms 静音窗把口径B 托底在 500ms 以上。
+        gating: GatingMode = GatingMode.CONSERVATIVE,
     ) -> None:
         self.session_id = uuid4().hex[:12]
         self.trace_id = uuid4().hex[:16]

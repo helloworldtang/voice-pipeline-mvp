@@ -63,12 +63,17 @@ def test_unknown_mode_is_rejected() -> None:
         parse_client_frame(json.dumps({"type": "session.begin", "mode": "turbo"}))
 
 
-def test_default_gating_is_semantic_not_conservative() -> None:
-    """conservative 要等满 500ms 静音窗，口径B 被托底在 500ms 以上——300ms 就不可达了。
+def test_default_gating_is_conservative_not_semantic() -> None:
+    """默认档必须是 conservative——这是抢话实测的结论，不是口味。
 
-    这条断言防的是「有人把它改回保守档，300ms 悄悄变成数学上不可能」。
+    `scripts/probe_premature.py` 实测（句内停顿 250~350ms，合成语音 + 真 ASR）：
+      conservative(500ms)  抢话 0%    判停延迟 515ms
+      semantic(250ms)      抢话 20~40% 判停延迟 330ms
+    把 semantic 的静音阈值扫到 500ms 能回到 0% 抢话，但延迟 520ms ≈ conservative，
+    即 semantic 在同等安全下没有收益。防回退：有人为了「300ms 可达」改回 semantic，
+    代价是每 3~5 句抢一次话。
     """
-    assert SessionBegin().gating is GatingMode.SEMANTIC
+    assert SessionBegin().gating is GatingMode.CONSERVATIVE
 
 
 def test_gating_and_grace_travel_on_the_wire() -> None:
