@@ -51,6 +51,16 @@ class Chunker:
         self._seq += 1
         return self._seq
 
+    def feed_and_flush(self, data: bytes) -> list[bytes]:
+        """喂入一段**语义完整**的音频（一句 TTS 的结果）并立刻补齐尾部残余。
+
+        为什么不能只 feed：句中不足一片的残余会滞留到下一句才凑齐，于是
+        ① 若首句音频 < 200ms，`first_audio_out` 永远打不上，口径B 记成 -1；
+        ② 最后一句的残余在下一句到来前不会下发，句尾被静默截断。
+        补齐后每句的音频在该句合成完的瞬间就全部外发，barge-in 也能在句末干净截断。
+        """
+        return self.feed(data) + self.flush()
+
     def flush(self) -> list[bytes]:
         if not self._buffer:
             return []

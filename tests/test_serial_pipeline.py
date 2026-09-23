@@ -87,6 +87,31 @@ async def test_bill_carries_caliber_b_and_waterfall() -> None:
     assert bill["first_audio_out"] >= bill["utterance_end"]
 
 
+async def test_short_sentence_tail_is_not_dropped() -> None:
+    """回归：句长不足一片时，残余音频曾永久滞留 buffer——首音打不上，口径B 记 -1。
+
+    用 8k/200ms 的 TTS 造出 3200B/句（< 9600B）的音频：修之前这一轮一个音频片都不会出。
+    """
+    session = Session(
+        mode="serial",
+        asr=SimAsr(transcript=TRANSCRIPT),
+        llm=SimLlm(reply=REPLY),
+        tts=SimTts(sample_rate=8000, chunk_ms=200, chunk_per_sentence=1),
+    )
+    await session.on_audio(b"\x00" * 3200)
+
+    sizes: list[int] = []
+    bill: dict[str, float] = {}
+    async for item in session.finish():
+        if isinstance(item, AudioFragment):
+            sizes.append(len(item.data))
+        elif isinstance(item, TurnEnd):
+            bill = item.metrics
+    assert sizes == [3200, 3200]  # 每句音频在合成完的当拍就全部外发
+    assert bill["first_audio_out"] >= bill["utterance_end"]
+    assert bill["caliber_b_ms"] >= 0
+
+
 async def test_echo_mode_still_echoes() -> None:
     """echo 是 M0 的回归基线：立即回发，不走链路。"""
     session = Session(mode="echo")

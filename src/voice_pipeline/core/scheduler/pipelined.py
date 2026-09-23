@@ -171,7 +171,10 @@ class PipelinedScheduler:
             self._metrics.mark("tts_first_chunk")
             run.ready_ms = self._metrics.clock.elapsed_ms()
         items: list[TurnItem] = [TtsSentence(seq=run.sentences, text=sentence)]
-        items += [AudioFragment(seq=chunker.next_seq(), data=block) for block in chunker.feed(pcm)]
+        items += [
+            AudioFragment(seq=chunker.next_seq(), data=block)
+            for block in chunker.feed_and_flush(pcm)
+        ]
         if run.sentences == 1:
             run.head = items
         else:
@@ -287,7 +290,7 @@ class PipelinedScheduler:
         yield TtsSentence(seq=seq, text=sentence)
         pcm = await asyncio.to_thread(self._tts.synth_blocking, sentence)
         self._metrics.mark("tts_first_chunk")
-        for block in self._chunker.feed(pcm):
+        for block in self._chunker.feed_and_flush(pcm):
             self._metrics.mark("first_audio_out")
             self._metrics.audio_bytes += len(block)
             yield AudioFragment(seq=self._chunker.next_seq(), data=block)

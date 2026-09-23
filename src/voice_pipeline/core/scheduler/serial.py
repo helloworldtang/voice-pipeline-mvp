@@ -84,7 +84,8 @@ class SerialScheduler:
         yield TtsSentence(seq=seq, text=sentence)
         pcm = await asyncio.to_thread(self._tts.synth_blocking, sentence)
         self._metrics.mark("tts_first_chunk")
-        for chunk in self._chunker.feed(pcm):
+        # feed_and_flush 而非 feed：句尾不足一片的残余不留到下一句（详见 Chunker 文档）
+        for chunk in self._chunker.feed_and_flush(pcm):
             self._metrics.mark("first_audio_out")
             self._metrics.audio_bytes += len(chunk)
             yield AudioFragment(seq=self._chunker.next_seq(), data=chunk)

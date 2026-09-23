@@ -35,6 +35,14 @@ def test_flush_returns_partial_tail() -> None:
     assert c.flush() == []
 
 
+def test_feed_and_flush_keeps_partial_tail() -> None:
+    """回归：只 feed 会把句尾不足一片的音频永久留在 buffer（实测 20000B → 滞留 800B）。"""
+    c = Chunker()
+    blocks = c.feed_and_flush(b"\x03" * 20000)
+    assert [len(x) for x in blocks] == [9600, 9600, 800]
+    assert c.flush() == []
+
+
 def test_seq_increments_monotonically() -> None:
     c = Chunker()
     assert [c.next_seq() for _ in range(3)] == [1, 2, 3]
