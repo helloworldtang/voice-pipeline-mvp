@@ -3,15 +3,17 @@ name = "voice-pipeline"
 version = "0.1.0"
 description = "准生产级实时语音对话链路参考实现：ASR+TTS 流水线的延迟账与可靠性工程"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
     "uvicorn[standard]>=0.30",
     "pydantic-settings>=2.5",
     "sherpa-onnx>=1.13.8",
-    "onnxruntime>=1.24.3",
     "soxr>=1.1.0",
     "httpx>=0.27",  # real LLM provider 的流式调用（不是测试专用）
+    # 上界钉死：sherpa-onnx 的 Linux wheel 链接 onnxruntime VERS_1.28.2 符号版本，
+    # 1.29+ 会在 import 时报 version `VERS_1.28.2' not found（macOS 不受影响，同钉为一致）
+    "onnxruntime>=1.28.0,<1.29",
 ]
 
 [dependency-groups]
