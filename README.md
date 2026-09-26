@@ -39,6 +39,13 @@ ln -sf "$(pwd)/.venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntim
   - 账单新增 `barge_in_count` / `barge_in_latency_ms`
   - live 麦克风客户端 `scripts/live_client.py`（pyaudio 16k 上行 / 24k 下行播放 + 本地打断检测）
 - ⬜ M5 收尾发版
+- ✅ **B 路线：可用语音试点（2026-09-27，分支 feature/route-b-pilot）**：
+  - **多轮对话**：history 贯穿 Session→调度器→LLM（最近 10 轮整对裁）；连带修掉两个单轮测试看不见的真 bug——ASR 死流（finalize 后不 reset，第 2 轮音频进死流）与账单复读（TurnMetrics 只记首达，跨轮不清账）。`tests/test_multi_turn.py` + `scripts/probe_multi_turn.py`（真模型两轮探针）钉住
+  - **静态 token 鉴权**：`VOICE_WS_TOKEN` 设了才启用，错/缺回 `error(unauthorized)`+1008；QwenLlm 共享 httpx 连接（每轮省一次 TLS 握手）
+  - **浏览器客户端 `web/`**：vanilla JS + AudioWorklet，浏览器 AEC 免耳机；FastAPI 挂静态（显式路由之后，防 mount 吞 /healthz）
+  - **混合部署**（`docs/ecs-baseline.md`，2C/2G 腾讯 ECS 实测定档）：本地 ASR（RTF 0.044）+ 本地 EOU（SmartTurn）+ 云 LLM + **云 TTS（DashScope CosyVoice 流式，首片 0.6s——本地 melo 同句 11.9s 判死）**；调度器按 `tts_streams` 能力分流，流式 provider 边合成边出片；provider 缓存消掉 session.begin 的秒级模型重载
+  - **ECS 实测端到端口径B = 1553.9ms**（判停+ASR 本地，LLM+TTS 云端），达成 <2s 试点验收线
+  - 部署：systemd + caddy（`deploy/`，含 release.sh 与首次部署手册；libonnxruntime 1.28.2 需 GitHub release 中转，onnxruntime 钉上界 <1.29）
 
 代码按 `技术方案.md` §9 的里程碑推进。每个数字都必须能被一条命令复现。
 
