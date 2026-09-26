@@ -28,6 +28,9 @@ class Settings(BaseSettings):
     # ⚠️ 开发机 .env 别设它，否则 bench_ws / pytest 全都要 token。
     ws_token: str | None = None
 
+    # 浏览器客户端静态目录（默认仓根 web/；不存在的部署可指到别处或留空不挂载）
+    web_dir: str = ""
+
 
 def get_settings() -> Settings:
     return Settings()

@@ -179,6 +179,20 @@ def test_session_begin_token_field_survives_wire_parsing() -> None:
     assert SessionBegin(mode="echo").model_dump()["token"] is None
 
 
+def test_web_client_is_served_and_healthz_still_json() -> None:
+    """静态挂载：GET / 出 HTML 页面；显式路由（/healthz）不被 mount("/") 吞掉。
+
+    Starlette 按注册顺序匹配——mount 若先于显式路由注册，/healthz 会被
+    StaticFiles 接走返回 404，bench 的就绪探测就废了。
+    """
+    client = TestClient(create_app())
+    page = client.get("/")
+    assert page.status_code == 200
+    assert "voice-pilot" in page.text
+    assert client.get("/healthz").json() == {"status": "ok"}
+    assert client.get("/app.js").status_code == 200
+
+
 def test_intermediate_event_shapes_are_stable() -> None:
     """事件的 wire 形状就是对外承诺，改动必须显式。"""
     assert AsrFinal(text="上海今天多少度").model_dump() == {

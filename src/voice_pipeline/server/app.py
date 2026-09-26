@@ -19,9 +19,11 @@ import contextlib
 import secrets
 from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
+from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.staticfiles import StaticFiles
 
 from voice_pipeline.config import Settings
 from voice_pipeline.core.scheduler.base import AudioFragment, TurnItem
@@ -40,6 +42,9 @@ from .protocol import (
     parse_client_frame,
 )
 from .session import Session
+
+# 浏览器客户端默认位置：仓根 web/（src 布局运行时可达；Settings.web_dir 可覆盖）
+DEFAULT_WEB_DIR = Path(__file__).resolve().parents[3] / "web"
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -179,6 +184,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             pump_task.cancel()
             if turn_task is not None:
                 turn_task.cancel()
+
+    # 浏览器客户端（web/），必须挂在所有显式路由之后：Starlette 按注册顺序匹配，
+    # mount("/") 先注册会吞掉 /healthz 与 /ws。目录不存在不挂载——纯 WS 部署
+    # （bench / 只跑 API）不因缺前端文件而起不来。
+    web_dir = Path(cfg.web_dir) if cfg.web_dir else DEFAULT_WEB_DIR
+    if web_dir.is_dir():
+        app.mount("/", StaticFiles(directory=web_dir, html=True), name="web")
 
     return app
 
