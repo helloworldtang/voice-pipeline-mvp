@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import secrets
 from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
 from typing import Any
@@ -110,6 +111,19 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     continue
 
                 if isinstance(frame, SessionBegin):
+                    # 静态 token 鉴权：cfg.ws_token 设了才启用（不设=完全开放，
+                    # 本机开发/bench/测试零配置）。挂在 session.begin 而不是连接层，
+                    # 因为首个 session.ready 先于任何客户端帧发出，鉴权早于此就得重设计握手。
+                    if cfg.ws_token is not None and not secrets.compare_digest(
+                        frame.token or "", cfg.ws_token
+                    ):
+                        await websocket.send_text(
+                            dump_event(
+                                ErrorEvent(code="unauthorized", message="bad or missing token")
+                            )
+                        )
+                        await websocket.close(code=1008)
+                        return
                     # 换模式即重建会话（含新的 outbox 与 pump）。
                     # gating / grace_ms 必须透传：它们是 300ms 实验的两个旋钮，
                     # 协议里有、构造时丢掉，就等于旋钮是画上去的。

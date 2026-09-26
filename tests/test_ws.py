@@ -144,6 +144,41 @@ def test_pipelined_mode_runs_full_chain_over_ws() -> None:
         assert bill["caliber_b_ms"] >= 0
 
 
+def test_ws_token_gate() -> None:
+    """静态 token 三态：不设=开放（旧测试全在此态）；设了=begin 必须带对 token。"""
+    from voice_pipeline.config import Settings
+
+    app = create_app(Settings(ws_token="s3cret"))
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()  # 首帧 ready 先于任何客户端帧，不受 token 影响
+
+        # 缺 token → error + 1008
+        ws.send_text(SessionBegin(mode="echo").model_dump_json())
+        err = ws.receive_json()
+        assert err["type"] == "error"
+        assert err["code"] == "unauthorized"
+
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        # 错 token → 同样拒绝
+        ws.send_text(SessionBegin(mode="echo", token="wrong").model_dump_json())
+        assert ws.receive_json()["code"] == "unauthorized"
+
+    with TestClient(app).websocket_connect("/ws") as ws:
+        ws.receive_json()
+        # 对 token → 正常重建会话
+        ws.send_text(SessionBegin(mode="echo", token="s3cret").model_dump_json())
+        ready = ws.receive_json()
+        assert ready["type"] == "session.ready"
+
+
+def test_session_begin_token_field_survives_wire_parsing() -> None:
+    """pydantic 对多余字段是忽略——字段名拼错会被静默吞掉、鉴权莫名失败。
+    这条 round-trip 把 token 字段钉在 wire 契约上。"""
+    assert SessionBegin.model_validate({"type": "session.begin", "token": "x"}).token == "x"
+    assert SessionBegin(mode="echo").model_dump()["token"] is None
+
+
 def test_intermediate_event_shapes_are_stable() -> None:
     """事件的 wire 形状就是对外承诺，改动必须显式。"""
     assert AsrFinal(text="上海今天多少度").model_dump() == {

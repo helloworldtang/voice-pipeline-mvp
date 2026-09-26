@@ -233,6 +233,10 @@ class Session:
         self._turn_running = True
         self.interrupted = False
         self._eou_collected = False
+        # 每轮一本新账：TurnMetrics 的 mark 只记首次到达，跨轮复用不清账的话，
+        # 第 2 轮起的账单会复读第 1 轮。必须在 _collect_eou_metrics 之前清——
+        # 它要把上一轮的判停指标写进本轮账里。
+        self.metrics.reset_turn()
         # 必须在 reset 之前采：reset 会清掉静音计时与抢话/漏判标志，
         # 采晚了 eou_latency_ms 就恒为 0（这个指标曾因此整整失效一整个里程碑）。
         self._collect_eou_metrics()

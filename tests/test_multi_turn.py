@@ -17,6 +17,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 
 from voice_pipeline.providers.tts.sim_tts import SimTts
+from voice_pipeline.server.protocol import TurnEnd
 from voice_pipeline.server.session import MAX_HISTORY_MESSAGES, Session
 
 
@@ -108,3 +109,28 @@ async def test_history_is_capped_to_last_ten_turns() -> None:
     # 最近 20 条，头部是第 2 轮的 user——整对裁，从 user 开头。
     assert history[0] == {"role": "user", "content": "第1句问话"}
     assert history[-1] == {"role": "assistant", "content": "这是回答。"}
+
+
+async def test_each_turn_gets_a_fresh_bill() -> None:
+    """每轮一本新账：mark 只记首次到达，跨轮不清账的话第 2 轮复读第 1 轮。
+
+    真链路两轮实测抓到 caliber_b_ms 一字不差（probe_multi_turn 可复现）。
+    判据：会话钟单调，第 2 轮的 utterance_end 打点必须严格晚于第 1 轮。
+    """
+    asr = DeadWithoutResetAsr(["第一句问话", "第二句问话"])
+    llm = SpyLlm()
+    session = _session(asr, llm)
+
+    bills: list[dict[str, float]] = []
+    for _ in range(2):
+        await session.on_audio(b"\x00" * 320)
+        await session.run_turn()
+        while not session.outbox.empty():
+            item = session.outbox.get_nowait()
+            if isinstance(item, TurnEnd):
+                bills.append(dict(item.metrics))
+
+    assert len(bills) == 2
+    assert bills[0]["caliber_b_ms"] >= 0
+    assert bills[1]["caliber_b_ms"] >= 0
+    assert bills[1]["utterance_end"] > bills[0]["utterance_end"]

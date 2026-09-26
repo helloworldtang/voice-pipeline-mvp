@@ -86,6 +86,18 @@ def build_messages(
 class QwenLlm:
     """DashScope 的 OpenAI 兼容流式接口。契约见 `providers/base.py` 的 `LlmProvider`。"""
 
+    # 模块级共享连接：每次 astream 新开 AsyncClient 意味着每轮对话都白付一次
+    # TLS 握手（~100ms+，直接落在口径B 的 LLM 格里）。共享单例把这笔开销摊到
+    # 进程生命周期。注意 AsyncClient 绑定创建它的事件循环——生产是单 uvicorn
+    # loop，安全；测试零网络从不真正走 astream，不受影响。试点期不 aclose。
+    _shared_client: httpx.AsyncClient | None = None
+
+    @classmethod
+    def _client(cls, timeout_s: float) -> httpx.AsyncClient:
+        if cls._shared_client is None:
+            cls._shared_client = httpx.AsyncClient(timeout=timeout_s)
+        return cls._shared_client
+
     def __init__(
         self,
         model: str = DEFAULT_MODEL,
@@ -122,15 +134,13 @@ class QwenLlm:
             "Authorization": f"Bearer {self._api_key}",
             "Content-Type": "application/json",
         }
-        async with (
-            httpx.AsyncClient(timeout=self._timeout_s) as client,
-            client.stream(
-                "POST",
-                f"{self._base_url}/chat/completions",
-                headers=headers,
-                json=payload,
-            ) as resp,
-        ):
+        client = self._client(self._timeout_s)
+        async with client.stream(
+            "POST",
+            f"{self._base_url}/chat/completions",
+            headers=headers,
+            json=payload,
+        ) as resp:
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 # 走 iter_content 而不是另写一份解析：运行时与测试共用同一条路径，
