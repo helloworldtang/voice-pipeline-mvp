@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 from collections.abc import AsyncIterator, Callable
 from typing import Protocol
 
@@ -25,7 +26,7 @@ logger = logging.getLogger(__name__)
 
 API_KEY_ENV = "DASHSCOPE_API_KEY"
 DEFAULT_MODEL = "cosyvoice-v2"
-DEFAULT_VOICE = "longxiaochun"
+DEFAULT_VOICE = "longxiaochun_v2"  # cosyvoice-v2 的音色带 _v2 后缀，不带会 task-failed
 
 
 class _Callback(Protocol):
@@ -59,22 +60,47 @@ class _AsyncQueueCallback:
         logger.error("DashScope TTS on_error: %s", message)
         self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
 
+    # SDK 生命周期回调：桥不关心，但接口得齐（缺了会 AttributeError）
+    def on_open(self) -> None:
+        pass
+
+    def on_close(self) -> None:
+        pass
+
+    def on_event(self, message: str) -> None:
+        pass
+
 
 class _ListCallback:
-    """同步路径（synth_blocking）用的收集器。"""
+    """同步路径（synth_blocking）用的收集器。
+
+    ⚠️ SDK 的 call() 是**异步提交**——立即返回 None，音频与 complete 事件
+    事后从 SDK 内部线程回调。所以这里带一个 Event，synth_blocking 等它。
+    """
 
     def __init__(self) -> None:
         self.chunks: list[bytes] = []
         self.error: str | None = None
+        self.done = threading.Event()
 
     def on_data(self, data: bytes) -> None:
         self.chunks.append(data)
 
     def on_complete(self) -> None:
-        pass
+        self.done.set()
 
     def on_error(self, message: str) -> None:
         self.error = str(message)
+        self.done.set()
+
+    def on_open(self) -> None:
+        pass
+
+    def on_close(self) -> None:
+        pass
+
+    def on_event(self, message: str) -> None:
+        pass
 
 
 class DashScopeTts:
@@ -88,6 +114,7 @@ class DashScopeTts:
         voice: str = DEFAULT_VOICE,
         *,
         api_key: str | None = None,
+        timeout_s: float = 30.0,
         synth_factory: Callable[[_Callback], _Synthesizer] | None = None,
     ) -> None:
         """synth_factory：收到回调对象、返回合成器（.call(text) 阻塞直到合成完）。
@@ -95,6 +122,7 @@ class DashScopeTts:
         否则 2C 机器会假装自己在跑流式。"""
         self.model = model
         self.voice = voice
+        self.timeout_s = timeout_s
         self._synth_factory = synth_factory or self._make_default_factory(api_key)
 
     def _make_default_factory(
@@ -137,10 +165,16 @@ class DashScopeTts:
             raise RuntimeError(msg)
 
     def synth_blocking(self, sentence: str) -> bytes:
-        """整句合成（协议兼容）：同一 SDK 路径，同步收集。"""
+        """整句合成（协议兼容）：同一 SDK 路径，同步收集。
+
+        call() 是异步提交（见 _ListCallback 的警告），必须等 done 事件。
+        """
         callback = _ListCallback()
         synthesizer = self._synth_factory(callback)
         synthesizer.call(sentence)
+        if not callback.done.wait(timeout=self.timeout_s):
+            msg = f"DashScope TTS {self.timeout_s}s 内未完成（无 complete 也无 error）"
+            raise RuntimeError(msg)
         if callback.error is not None:
             msg = f"DashScope TTS 合成失败: {callback.error}"
             raise RuntimeError(msg)
