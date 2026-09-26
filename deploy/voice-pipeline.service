@@ -1,0 +1,26 @@
+[Unit]
+Description=voice-pilot 语音对话试点（ASR/EOU 本地 + LLM/TTS 云端）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/voice-pipeline-mvp
+# 密钥与 token 走 EnvironmentFile（600 权限，不进仓）：/etc/voice-pilot.env
+#   DASHSCOPE_API_KEY=sk-...
+#   VOICE_WS_TOKEN=...
+EnvironmentFile=/etc/voice-pilot.env
+# 模型路径（rsync 到仓内 models/）；espeak 数据用 Ubuntu 包路径
+Environment=VOICE_MODEL_ROOT=/home/ubuntu/voice-pipeline-mvp/models
+Environment=VOICE_ESPEAK_DATA=/usr/lib/x86_64-linux-gnu/espeak-ng-data
+Environment=VOICE_PIPELINE_TTS_ENGINE=dashscope
+# 绑 127.0.0.1：唯一公网出口是 caddy 反代（deploy/Caddyfile）
+ExecStart=/home/ubuntu/.local/bin/uv run uvicorn voice_pipeline.server.app:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+# 2G 内存保护：真泄漏时快速重启而不是 OOM 拖死整机
+MemoryMax=1200M
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+# voice-pilot 反代：caddy 自动处理 WS 升级。
+# 现阶段 :80 只做 HTTP/WS 通道；浏览器 getUserMedia 需要安全上下文——
+# 首周用 SSH 隧道（ssh -L 8888:localhost:8000 ubuntu@…）走 localhost，
+# 域名到位后把站点地址换成域名，caddy 自动上 TLS，届时才能公网开麦。
+:80 {
+	reverse_proxy 127.0.0.1:8000
+}
