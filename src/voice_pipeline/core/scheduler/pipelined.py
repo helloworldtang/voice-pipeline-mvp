@@ -28,7 +28,7 @@ from voice_pipeline.metrics.events import TurnMetrics
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.server.protocol import AsrFinal, TtsSentence, TurnEnd, TurnStart
 
-from .base import AudioFragment, TurnItem
+from .base import AudioFragment, TurnItem, synth_to_fragments
 
 
 @dataclass(slots=True)
@@ -178,15 +178,14 @@ class PipelinedScheduler:
         run.sentences += 1
         if run.sentences == 1:
             self._metrics.tts_first_chars = len(sentence)
-        pcm = await asyncio.to_thread(self._tts.synth_blocking, sentence)
-        if run.sentences == 1:
-            self._metrics.mark("tts_first_chunk")
-            run.ready_ms = self._metrics.clock.elapsed_ms()
+        first_chunk = True
         items: list[TurnItem] = [TtsSentence(seq=run.sentences, text=sentence)]
-        items += [
-            AudioFragment(seq=chunker.next_seq(), data=block)
-            for block in chunker.feed_and_flush(pcm)
-        ]
+        async for block in synth_to_fragments(self._tts, sentence, chunker):
+            if first_chunk and run.sentences == 1:
+                first_chunk = False
+                self._metrics.mark("tts_first_chunk")
+                run.ready_ms = self._metrics.clock.elapsed_ms()
+            items.append(AudioFragment(seq=chunker.next_seq(), data=block))
         if run.sentences == 1:
             run.head = items
         else:
@@ -309,9 +308,11 @@ class PipelinedScheduler:
     async def _emit(self, sentence: str, seq: int) -> AsyncIterator[TurnItem]:
         self._metrics.sentences += 1
         yield TtsSentence(seq=seq, text=sentence)
-        pcm = await asyncio.to_thread(self._tts.synth_blocking, sentence)
-        self._metrics.mark("tts_first_chunk")
-        for block in self._chunker.feed_and_flush(pcm):
+        first_chunk = True
+        async for block in synth_to_fragments(self._tts, sentence, self._chunker):
+            if first_chunk:
+                first_chunk = False
+                self._metrics.mark("tts_first_chunk")
             self._metrics.mark("first_audio_out")
             self._metrics.audio_bytes += len(block)
             yield AudioFragment(seq=self._chunker.next_seq(), data=block)

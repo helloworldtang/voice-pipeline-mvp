@@ -72,3 +72,37 @@ def test_tts_engine_env_overrides_default_for_ab() -> None:
         assert resolve_tts_engine("melo") == "melo"
     finally:
         monkeypatch.undo()
+
+
+def test_dashscope_engine_routes_to_cloud_tts(monkeypatch: pytest.MonkeyPatch) -> None:
+    """tts=dashscope → 云端流式 provider（session.begin 不再加载本地 TTS 模型）。"""
+    from voice_pipeline.providers.tts.dashscope_tts import DashScopeTts
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test-not-used")
+    providers = build_providers("real", tts_engine="dashscope")
+    assert isinstance(providers.tts, DashScopeTts)
+    assert providers.tts.tts_streams is True
+
+
+def test_unknown_tts_engine_lists_dashscope() -> None:
+    with pytest.raises(ValueError, match="dashscope"):
+        build_providers("real", tts_engine="nope")
+
+
+@pytest.mark.skipif(
+    not __import__("pathlib").Path("models/asr-zipformer/joiner.int8.onnx").is_file(),
+    reason="real models not downloaded",
+)
+def test_real_providers_are_cached_across_builds() -> None:
+    """provider 缓存：TTS 引擎与 ASR recognizer 跨 build 共享，ASR wrapper 各自独立。
+
+    不缓存的话每次 session.begin 重付 1-3s 模型加载，浏览器每次刷新都卡
+    （ECS 实测 begin 迟到 2.4-2.9s，docs/ecs-baseline.md）。
+    """
+    import voice_pipeline.providers.factory as F
+
+    a = F.build_providers("real")
+    b = F.build_providers("real")
+    assert a.tts is b.tts
+    assert a.asr is not b.asr  # 会话状态不可共享
+    assert a.asr._recognizer is b.asr._recognizer  # type: ignore[attr-defined]

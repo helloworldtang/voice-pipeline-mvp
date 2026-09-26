@@ -48,6 +48,12 @@ class LlmProvider(Protocol):
 
 @runtime_checkable
 class TtsProvider(Protocol):
+    """流式能力约定（非协议成员，避免破坏既有实现的结构化兼容）：
+    支持句内增量合成的 provider 在类上置 `tts_streams = True`，调度器经
+    `synth_to_fragments` 探测后走 synth() 异步迭代器路径（边合成边出片）；
+    未声明则走整句 synth_blocking 路径。参见 core/scheduler/base.py。
+    """
+
     def synth(self, sentence: str) -> AsyncIterator[bytes]: ...
 
     def synth_blocking(self, sentence: str) -> bytes:

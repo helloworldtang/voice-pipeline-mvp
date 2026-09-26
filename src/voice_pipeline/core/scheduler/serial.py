@@ -9,7 +9,6 @@
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import AsyncIterator
 
 from voice_pipeline.audio.chunker import Chunker
@@ -18,7 +17,7 @@ from voice_pipeline.metrics.events import TurnMetrics
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.server.protocol import AsrFinal, TtsSentence, TurnEnd, TurnStart
 
-from .base import AudioFragment, TurnItem
+from .base import AudioFragment, TurnItem, synth_to_fragments
 
 
 class SerialScheduler:
@@ -91,10 +90,13 @@ class SerialScheduler:
         if seq == 1:
             self._metrics.tts_first_chars = len(sentence)
         yield TtsSentence(seq=seq, text=sentence)
-        pcm = await asyncio.to_thread(self._tts.synth_blocking, sentence)
-        self._metrics.mark("tts_first_chunk")
-        # feed_and_flush 而非 feed：句尾不足一片的残余不留到下一句（详见 Chunker 文档）
-        for chunk in self._chunker.feed_and_flush(pcm):
+        first_chunk = True
+        # 流式 provider（tts_streams）在整句合成完之前就开始出片；整句 provider
+        # 合成完再切——分流逻辑与指标语义见 synth_to_fragments。
+        async for chunk in synth_to_fragments(self._tts, sentence, self._chunker):
+            if first_chunk:
+                first_chunk = False
+                self._metrics.mark("tts_first_chunk")
             self._metrics.mark("first_audio_out")
             self._metrics.audio_bytes += len(chunk)
             yield AudioFragment(seq=self._chunker.next_seq(), data=chunk)
