@@ -24,10 +24,26 @@ class AsrProvider(Protocol):
         """当前 partial 结果（未 finalize）。投机调度靠它判断何时能提前开跑。"""
         ...
 
+    def reset(self) -> None:
+        """开一条新识别流，供下一轮使用。
+
+        finalize() 会终结当前流（sherpa 的 input_finished），之后到达的音频若不
+        reset 就进了死流——EOU 后用户马上再开口的那几个字会整个丢掉。调度器
+        必须在 finalize 之后调用本方法。
+        """
+        ...
+
 
 @runtime_checkable
 class LlmProvider(Protocol):
-    def astream(self, prompt: str) -> AsyncIterator[str]: ...
+    def astream(
+        self, prompt: str, history: list[dict[str, str]] | None = None
+    ) -> AsyncIterator[str]:
+        """history 是**之前轮次**的 [user/assistant] 消息，由 Session 持有并传入。
+
+        None 或空表示首轮。实现可以忽略它（SimLlm），但不许改写调用方传入的列表。
+        """
+        ...
 
 
 @runtime_checkable

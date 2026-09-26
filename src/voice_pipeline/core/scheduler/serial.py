@@ -30,13 +30,17 @@ class SerialScheduler:
         metrics: TurnMetrics,
         splitter: SentenceSplitter | None = None,
         chunker: Chunker | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> None:
+        """history：Session 持有的多轮上下文（可变引用）。调用 LLM 时取快照传入，
+        传引用的列表本身绝不在这里被改写。"""
         self._asr = asr
         self._llm = llm
         self._tts = tts
         self._metrics = metrics
         self._splitter = splitter or SentenceSplitter()
         self._chunker = chunker or Chunker()
+        self._history = history
 
     async def on_audio(self, chunk: bytes) -> None:
         await self._asr.push_audio(chunk)
@@ -53,11 +57,16 @@ class SerialScheduler:
         yield TurnStart()
 
         transcript = await self._asr.finalize()
+        # finalize 已终结识别流；立即开新流，EOU 之后到达的音频（用户抢在 AI
+        # 开口前继续说、或 barge-in 窗口里的语音）才不会落进死流被丢掉。
+        self._asr.reset()
         yield AsrFinal(text=transcript)
 
         sentence_seq = 0
         saw_token = False
-        async for piece in self._llm.astream(transcript):
+        async for piece in self._llm.astream(
+            transcript, history=list(self._history) if self._history else None
+        ):
             if not saw_token:
                 self._metrics.mark("llm_first_token")
                 saw_token = True

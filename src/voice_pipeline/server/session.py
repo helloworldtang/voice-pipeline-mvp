@@ -33,7 +33,11 @@ from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.providers.factory import build_eou, build_providers
 from voice_pipeline.providers.llm.sim_llm import SimLlm
 from voice_pipeline.providers.tts.sim_tts import SimTts
-from voice_pipeline.server.protocol import AudioStop
+from voice_pipeline.server.protocol import AsrFinal, AudioStop, TtsSentence
+
+# 多轮上下文上限：最近 10 轮（20 条 user/assistant 消息）。语音对话的时效性强，
+# 更早的轮次对当前问题几乎没有贡献，却每轮都要整包发给 LLM 付费。
+MAX_HISTORY_MESSAGES = 20
 
 
 class Session:
@@ -72,6 +76,10 @@ class Session:
         self.metrics = TurnMetrics(clock=self._clock)
         self._gating = gating
         self._eou = eou
+        # 多轮上下文：Session 持有，调度器每次调用 LLM 时取快照。只记**实际播出去的**
+        # 内容——被打断的轮次里，用户听到多少就记多少，这是有意为之（听到的才是真的），
+        # 不要"修复"成整句入史。
+        self._history: list[dict[str, str]] = []
 
         # M3：状态机 + 打断检测器 + 下行队列
         self._fsm = TurnFsm()
@@ -97,6 +105,7 @@ class Session:
             "metrics": self.metrics,
             "splitter": SentenceSplitter(),
             "chunker": Chunker(),
+            "history": self._history,
         }
         if spec_mode == "pipelined":
             self._scheduler = PipelinedScheduler(**deps, grace_ms=grace_ms)  # type: ignore[arg-type]
@@ -229,8 +238,29 @@ class Session:
         self._collect_eou_metrics()
         if isinstance(self._eou, FusedEou):
             self._eou.reset()
+        user_text: str | None = None
+        assistant_parts: list[str] = []
         try:
             async for item in self.finish():
                 self.outbox.put_nowait(item)
+                # 边播边攒多轮上下文：AsrFinal→user，TtsSentence→assistant（拼句）。
+                # 只记流经 outbox 的内容，被 interrupted 截断的部分自然不入史。
+                if isinstance(item, AsrFinal):
+                    user_text = item.text
+                elif isinstance(item, TtsSentence):
+                    assistant_parts.append(item.text)
         finally:
             self._turn_running = False
+            if user_text is not None:
+                self._history.append({"role": "user", "content": user_text})
+                if assistant_parts:
+                    self._history.append({"role": "assistant", "content": "".join(assistant_parts)})
+                self._trim_history()
+
+    def _trim_history(self) -> None:
+        """裁到最近 10 轮（20 条消息），从头部整对裁——保住 user 开头的轮次边界。"""
+        if len(self._history) <= MAX_HISTORY_MESSAGES:
+            return
+        self._history[:] = self._history[-MAX_HISTORY_MESSAGES:]
+        if self._history and self._history[0]["role"] != "user":
+            del self._history[0]

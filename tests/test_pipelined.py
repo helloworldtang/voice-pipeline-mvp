@@ -31,7 +31,9 @@ class EchoLlm:
     def __init__(self) -> None:
         self.prompts: list[str] = []
 
-    def astream(self, prompt: str) -> AsyncIterator[str]:
+    def astream(
+        self, prompt: str, history: list[dict[str, str]] | None = None
+    ) -> AsyncIterator[str]:
         self.prompts.append(prompt)
 
         async def producer() -> AsyncIterator[str]:

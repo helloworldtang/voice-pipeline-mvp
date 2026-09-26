@@ -13,7 +13,10 @@ class SimLlm:
     def __init__(self, reply: str = "今天晴，气温 22 度。适合出门。") -> None:
         self._reply = reply
 
-    async def astream(self, prompt: str) -> AsyncIterator[str]:
+    async def astream(
+        self, prompt: str, history: list[dict[str, str]] | None = None
+    ) -> AsyncIterator[str]:
+        """替身不看电视历史——确定性优先，多轮语义留给真 LLM 测。"""
         buffer = ""
         for char in self._reply:
             buffer += char

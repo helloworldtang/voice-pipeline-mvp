@@ -68,6 +68,21 @@ def iter_content(lines: Iterable[str]) -> Iterator[str]:
                 yield content
 
 
+def build_messages(
+    system: str, history: list[dict[str, str]] | None, prompt: str
+) -> list[dict[str, str]]:
+    """组装 messages：system + 历史轮次 + 本轮 user。
+
+    抽成同步纯函数是为了在不联网的情况下测「历史插在 system 与 user 之间、原样透传」
+    这条契约——history 的内容属于调用方（Session），这里不许增删改。
+    """
+    return [
+        {"role": "system", "content": system},
+        *(history or []),
+        {"role": "user", "content": prompt},
+    ]
+
+
 class QwenLlm:
     """DashScope 的 OpenAI 兼容流式接口。契约见 `providers/base.py` 的 `LlmProvider`。"""
 
@@ -94,15 +109,14 @@ class QwenLlm:
         self._max_tokens = max_tokens
         self._timeout_s = timeout_s
 
-    async def astream(self, prompt: str) -> AsyncIterator[str]:
+    async def astream(
+        self, prompt: str, history: list[dict[str, str]] | None = None
+    ) -> AsyncIterator[str]:
         payload = {
             "model": self.model,
             "stream": True,
             "max_tokens": self._max_tokens,
-            "messages": [
-                {"role": "system", "content": self._system},
-                {"role": "user", "content": prompt},
-            ],
+            "messages": build_messages(self._system, history, prompt),
         }
         headers = {
             "Authorization": f"Bearer {self._api_key}",
