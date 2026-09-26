@@ -5,7 +5,8 @@
 set -euo pipefail
 
 HOST="${VOICE_PILOT_HOST:-ubuntu@YOUR_SERVER_IP}"
-REMOTE_DIR=~/voice-pipeline-mvp
+# rsync 目标里 ~ 不展开，用相对 home 的路径
+REMOTE_DIR=voice-pipeline-mvp
 
 echo "==> rsync 代码（不含模型/.venv/bench）"
 rsync -az --delete \
@@ -14,10 +15,10 @@ rsync -az --delete \
   ./ "$HOST:$REMOTE_DIR/"
 
 echo "==> 远端 uv sync"
-ssh "$HOST" "cd $REMOTE_DIR && ~/.local/bin/uv sync 2>&1 | tail -1"
+ssh "$HOST" "cd ~/voice-pipeline-mvp && ~/.local/bin/uv sync 2>&1 | tail -1"
 
 echo "==> 修补 sherpa-onnx wheel 缺的 libonnxruntime（uv sync 可能重装包，每次都做）"
-ssh "$HOST" "cd $REMOTE_DIR && SITE=.venv/lib/python3.12/site-packages && \
+ssh "$HOST" "cd ~/voice-pipeline-mvp && SITE=\$PWD/.venv/lib/python3.12/site-packages && \
   if [ ! -f \$SITE/sherpa_onnx/lib/libonnxruntime.so.1.28.2 ]; then \
     echo '缺 libonnxruntime.so.1.28.2：从 /tmp 补（首次部署见 SETUP.md）' >&2; exit 1; \
   fi && ln -sf \$SITE/sherpa_onnx/lib/libonnxruntime.so.1.28.2 \$SITE/sherpa_onnx/lib/libonnxruntime.so"
