@@ -28,12 +28,13 @@ from voice_pipeline.core.scheduler.serial import SerialScheduler
 from voice_pipeline.core.sentence_splitter import SentenceSplitter
 from voice_pipeline.core.turn_fsm import TurnFsm, TurnState
 from voice_pipeline.metrics.events import SessionClock, TurnMetrics
+from voice_pipeline.metrics.jsonl import TurnRecorder
 from voice_pipeline.providers.asr.sim_asr import SimAsr
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.providers.factory import build_eou, build_providers
 from voice_pipeline.providers.llm.sim_llm import SimLlm
 from voice_pipeline.providers.tts.sim_tts import SimTts
-from voice_pipeline.server.protocol import AsrFinal, AudioStop, TtsSentence
+from voice_pipeline.server.protocol import AsrFinal, AudioStop, TtsSentence, TurnEnd
 
 # 多轮上下文上限：最近 10 轮（20 条 user/assistant 消息）。语音对话的时效性强，
 # 更早的轮次对当前问题几乎没有贡献，却每轮都要整包发给 LLM 付费。
@@ -66,6 +67,7 @@ class Session:
         # 神经档 70% 的轮次 ~100ms 就判停，剩下 30% 走 800ms 兜底（期望 ≈310ms）。
         # 缺权重时 build_eou 退回 conservative 并告警 —— 账单 eou_mode 会如实写回。
         gating: GatingMode = GatingMode.NEURAL,
+        recorder: TurnRecorder | None = None,
     ) -> None:
         self.session_id = uuid4().hex[:12]
         self.trace_id = uuid4().hex[:16]
@@ -76,6 +78,9 @@ class Session:
         self.metrics = TurnMetrics(clock=self._clock)
         self._gating = gating
         self._eou = eou
+        # 账单落盘（VOICE_EVENTS_JSONL）：默认关闭，见 metrics/jsonl.py。
+        self._recorder = recorder or TurnRecorder.from_env()
+        self._turn_index = 0  # 会话内轮次编号，从 1 起——落盘账单靠它排序
         # 多轮上下文：Session 持有，调度器每次调用 LLM 时取快照。只记**实际播出去的**
         # 内容——被打断的轮次里，用户听到多少就记多少，这是有意为之（听到的才是真的），
         # 不要"修复"成整句入史。
@@ -253,6 +258,23 @@ class Session:
                     user_text = item.text
                 elif isinstance(item, TtsSentence):
                     assistant_parts.append(item.text)
+                elif isinstance(item, TurnEnd):
+                    # 账单在这一刻定型。被打断的轮次本就产不出 TurnEnd（finish() 在
+                    # interrupted 时 break），所以“只落已完成轮次”是天然成立的，
+                    # 不需额外判断——但被打断后的半截文本也不入账，这是有意的。
+                    self._turn_index += 1
+                    self._recorder.record(
+                        session_id=self.session_id,
+                        trace_id=self.trace_id,
+                        mode=self.mode,
+                        turn=self._turn_index,
+                        bill=item.metrics,
+                        extra={
+                            "interrupted": self.interrupted,
+                            "user_text": user_text or "",
+                            "assistant_text": "".join(assistant_parts),
+                        },
+                    )
         finally:
             self._turn_running = False
             if user_text is not None:

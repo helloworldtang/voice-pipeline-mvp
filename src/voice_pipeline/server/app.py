@@ -136,6 +136,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         mode=frame.mode,
                         gating=frame.gating,
                         grace_ms=frame.grace_ms,
+                        # 账单落盘走环境变量 VOICE_EVENTS_JSONL（Session 默认
+                        # 从 env 读，见 metrics/jsonl.py）：这是运维开关，
+                        # 不是每次会话的实验旋钮，所以不上 wire 协议。
                     )
                     pump_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):

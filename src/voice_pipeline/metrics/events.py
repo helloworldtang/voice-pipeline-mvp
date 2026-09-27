@@ -98,10 +98,18 @@ class TurnMetrics:
             "audio_bytes": float(self.audio_bytes),
         }
         # EOU 判停指标（§3 / §12.4）：抢话/漏判是一等验收指标
-        # eou_mode 编码：0=conservative, 1=semantic, 2=aggressive, -1=未用判停器
-        _mode_code = {"conservative": 0.0, "semantic": 1.0, "aggressive": 2.0}.get(
-            self.eou_mode, -1.0
-        )
+        # eou_mode 编码：0=conservative, 1=semantic, 2=aggressive, 3=neural,
+        # -1=未用判停器（缺失）。
+        # ⚠️ 新增档位必须同步补这张表：`neural` 是**默认档**，漏掉它会让默认
+        # 配置下的每一轮账单都写 -1.0（“未用判停器”）——而这一轮明明用了判停
+        # （eou_latency_ms 有值），两个字段自相矛盾。与“缺失值别写 0”同一类错：
+        # 探测不到的档位码看起来像个合法值，所以能潜伏。
+        _mode_code = {
+            "conservative": 0.0,
+            "semantic": 1.0,
+            "aggressive": 2.0,
+            "neural": 3.0,
+        }.get(self.eou_mode, -1.0)
         bill["eou_mode"] = _mode_code
         bill["premature_eou"] = 1.0 if self.premature_eou else 0.0
         bill["missed_eou"] = 1.0 if self.missed_eou else 0.0
