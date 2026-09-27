@@ -86,9 +86,9 @@ async def run_probe() -> None:
     providers = build_providers("real", tts_engine="kokoro")
     pcms = [await synthesize(u, providers.tts) for u in UTTERANCES]
 
-    async with (
-        websockets.connect(f"ws://127.0.0.1:{PORT}/ws", max_size=None, open_timeout=30) as ws
-    ):
+    async with websockets.connect(
+        f"ws://127.0.0.1:{PORT}/ws", max_size=None, open_timeout=30
+    ) as ws:
         await ws.recv()  # 首个默认 session.ready
         await ws.send(SessionBegin(mode="real-serial", gating="neural").model_dump_json())
         ready = json.loads(await ws.recv())

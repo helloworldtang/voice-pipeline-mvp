@@ -125,9 +125,7 @@ class DashScopeTts:
         self.timeout_s = timeout_s
         self._synth_factory = synth_factory or self._make_default_factory(api_key)
 
-    def _make_default_factory(
-        self, api_key: str | None
-    ) -> Callable[[_Callback], _Synthesizer]:
+    def _make_default_factory(self, api_key: str | None) -> Callable[[_Callback], _Synthesizer]:
         resolved = api_key or os.environ.get(API_KEY_ENV, "")
         if not resolved:
             msg = f"缺少 {API_KEY_ENV}：DashScopeTts 需要 it，否则 2C 机器没有可用的 TTS"

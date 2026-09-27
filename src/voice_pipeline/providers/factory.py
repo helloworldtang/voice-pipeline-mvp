@@ -134,7 +134,7 @@ _CLOUD_TTS: TtsProvider | None = None
 _ASR_RECOGNIZER_CACHE: dict[str, object] = {}
 
 
-def _cached_tts_local(tts_cls: Callable[...,object]) -> TtsProvider:
+def _cached_tts_local(tts_cls: Callable[..., object]) -> TtsProvider:
     key = tts_cls.__name__
     if key not in _LOCAL_TTS_CACHE:
         tts: TtsProvider = tts_cls(num_threads=4)  # type: ignore[assignment]
