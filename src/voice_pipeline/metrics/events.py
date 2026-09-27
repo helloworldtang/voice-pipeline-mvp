@@ -61,6 +61,25 @@ class TurnMetrics:
         if name not in self.marks:
             self.marks[name] = self.clock.elapsed_ms()
 
+    def reset_turn(self) -> None:
+        """开新轮：清空上一轮的打点与计数。
+
+        mark() 只写第一次到达——这是单轮 waterfall 的语义；Session 跨轮复用同一
+        实例，不清的话第 2 轮起的账单会永远复读第 1 轮（真链路两轮实测抓到：
+        caliber_b_ms 一字不差，probe_multi_turn 可复现）。调用方须在采完上一轮
+        EOU 指标之后、本轮任何 mark 之前调用。
+        """
+        self.marks.clear()
+        self.sentences = 0
+        self.audio_bytes = 0
+        self.tts_first_chars = -1
+        self.premature_eou = False
+        self.missed_eou = False
+        self.eou_latency_ms = -1.0
+        self.eou_mode = ""
+        self.barge_in_count = 0
+        self.barge_in_latency_ms = -1.0
+
     def elapsed(self, name: str) -> float | None:
         return self.marks.get(name)
 

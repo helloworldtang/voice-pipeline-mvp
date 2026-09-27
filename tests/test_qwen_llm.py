@@ -15,6 +15,7 @@ from voice_pipeline.providers.llm.qwen_llm import (
     API_KEY_ENV,
     DEFAULT_MODEL,
     QwenLlm,
+    build_messages,
     iter_content,
 )
 from voice_pipeline.providers.llm.sim_llm import SimLlm
@@ -85,3 +86,35 @@ def test_explicit_sim_engine_never_touches_network(monkeypatch: pytest.MonkeyPat
 def test_unknown_llm_engine_rejects_loudly() -> None:
     with pytest.raises(ValueError, match="unknown llm engine"):
         build_llm("nope")
+
+
+def test_build_messages_inserts_history_between_system_and_user() -> None:
+    history = [
+        {"role": "user", "content": "第一句问话"},
+        {"role": "assistant", "content": "第一轮的回答。"},
+    ]
+    messages = build_messages("系统提示", history, "第二句问话")
+    assert messages == [
+        {"role": "system", "content": "系统提示"},
+        {"role": "user", "content": "第一句问话"},
+        {"role": "assistant", "content": "第一轮的回答。"},
+        {"role": "user", "content": "第二句问话"},
+    ]
+
+
+def test_build_messages_without_history_is_first_turn() -> None:
+    assert build_messages("系统提示", None, "问话") == [
+        {"role": "system", "content": "系统提示"},
+        {"role": "user", "content": "问话"},
+    ]
+    assert build_messages("系统提示", [], "问话") == [
+        {"role": "system", "content": "系统提示"},
+        {"role": "user", "content": "问话"},
+    ]
+
+
+def test_build_messages_passes_history_verbatim() -> None:
+    """history 属于调用方（Session），装配不许增删改——原样透传。"""
+    history = [{"role": "user", "content": "问话"}]
+    build_messages("系统提示", history, "下一句")
+    assert history == [{"role": "user", "content": "问话"}]

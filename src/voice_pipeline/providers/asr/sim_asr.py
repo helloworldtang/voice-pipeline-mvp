@@ -34,6 +34,10 @@ class SimAsr:
     async def finalize(self) -> str:
         return self._transcript
 
+    def reset(self) -> None:
+        """开新轮：partial 回放从头开始（frames 清零），transcript 保持不变。"""
+        self.frames = 0
+
 
 def build(transcript: str = "今天天气怎么样") -> AsrProvider:
     return SimAsr(transcript)

@@ -28,7 +28,7 @@ from voice_pipeline.metrics.events import TurnMetrics
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.server.protocol import AsrFinal, TtsSentence, TurnEnd, TurnStart
 
-from .base import AudioFragment, TurnItem
+from .base import AudioFragment, TurnItem, synth_to_fragments
 
 
 @dataclass(slots=True)
@@ -65,6 +65,7 @@ class PipelinedScheduler:
         grace_ms: float = 0.0,
         tail_timeout_ms: float = 5000.0,
         debounce_ms: float = 0.0,
+        history: list[dict[str, str]] | None = None,
     ) -> None:
         """grace_ms：EOU 后最多再等多少毫秒让投机落地（0 = 不等，没好就走串行）。
 
@@ -92,6 +93,9 @@ class PipelinedScheduler:
         self._run: SpecRun | None = None
         self._timer: asyncio.TimerHandle | None = None
         self._last_partial = ""
+        self._history = history
+        # EOU 已经触发后，partial 前缀校验失效（final 才是权威）——见 _invalidate_if_stale。
+        self._eou_done = False
         self.spec_hits = 0
         self.spec_misses = 0
         self.spec_aborts = 0
@@ -139,7 +143,9 @@ class PipelinedScheduler:
         splitter = SentenceSplitter()
         chunker = Chunker()
 
-        async for piece in self._llm.astream(run.text):
+        async for piece in self._llm.astream(
+            run.text, history=list(self._history) if self._history else None
+        ):
             for sentence in splitter.feed(piece):
                 await self._synth_into(run, sentence, chunker)
                 if run.sentences == 1:
@@ -158,7 +164,13 @@ class PipelinedScheduler:
         判据是**前缀**而不是相等：用户在继续说话时 partial 只会变长，
         那是追加不是推翻，此时作废等于把每一次投机都砍掉（本机实测命中率会掉到 0）。
         真正该作废的是「已经说出去的字被 ASR 改写」——那才是前提塌了。
+
+        EOU 之后本校验失效：finalize→reset 会让 text() 归零重来，拿新流的
+        partial 去比对旧流的投机前提必然误判作废。EOU 后的权威判据是
+        `_settle` 里的 `run.text != transcript` 比对。
         """
+        if self._eou_done:
+            return
         if not self._asr.text().startswith(run.text):
             run.valid = False
 
@@ -166,15 +178,14 @@ class PipelinedScheduler:
         run.sentences += 1
         if run.sentences == 1:
             self._metrics.tts_first_chars = len(sentence)
-        pcm = await asyncio.to_thread(self._tts.synth_blocking, sentence)
-        if run.sentences == 1:
-            self._metrics.mark("tts_first_chunk")
-            run.ready_ms = self._metrics.clock.elapsed_ms()
+        first_chunk = True
         items: list[TurnItem] = [TtsSentence(seq=run.sentences, text=sentence)]
-        items += [
-            AudioFragment(seq=chunker.next_seq(), data=block)
-            for block in chunker.feed_and_flush(pcm)
-        ]
+        async for block in synth_to_fragments(self._tts, sentence, chunker):
+            if first_chunk and run.sentences == 1:
+                first_chunk = False
+                self._metrics.mark("tts_first_chunk")
+                run.ready_ms = self._metrics.clock.elapsed_ms()
+            items.append(AudioFragment(seq=chunker.next_seq(), data=block))
         if run.sentences == 1:
             run.head = items
         else:
@@ -187,6 +198,11 @@ class PipelinedScheduler:
         yield TurnStart()
 
         transcript = await self._asr.finalize()
+        # finalize 已终结识别流，立即开新流收 EOU 之后到达的音频（同 serial）。
+        # reset 会让 text() 归零，所以必须先立 _eou_done 旗标，否则仍在算尾巴的
+        # 投机任务拿新流的空 partial 做前缀校验，会把本已命中的投机误判作废。
+        self._asr.reset()
+        self._eou_done = True
         yield AsrFinal(text=transcript)
 
         run = await self._settle(transcript)
@@ -200,6 +216,8 @@ class PipelinedScheduler:
                 yield item
 
         self._metrics.mark("turn_end")
+        # 本轮收尾：放行下一轮说话期间的 partial 前缀校验。
+        self._eou_done = False
         yield TurnEnd(
             metrics={
                 **self._metrics.bill(),
@@ -272,7 +290,9 @@ class PipelinedScheduler:
         self._metrics.mark("llm_first_token")
         splitter = SentenceSplitter()
         seq = 0
-        async for piece in self._llm.astream(transcript):
+        async for piece in self._llm.astream(
+            transcript, history=list(self._history) if self._history else None
+        ):
             for sentence in splitter.feed(piece):
                 seq += 1
                 if seq == 1:
@@ -288,9 +308,11 @@ class PipelinedScheduler:
     async def _emit(self, sentence: str, seq: int) -> AsyncIterator[TurnItem]:
         self._metrics.sentences += 1
         yield TtsSentence(seq=seq, text=sentence)
-        pcm = await asyncio.to_thread(self._tts.synth_blocking, sentence)
-        self._metrics.mark("tts_first_chunk")
-        for block in self._chunker.feed_and_flush(pcm):
+        first_chunk = True
+        async for block in synth_to_fragments(self._tts, sentence, self._chunker):
+            if first_chunk:
+                first_chunk = False
+                self._metrics.mark("tts_first_chunk")
             self._metrics.mark("first_audio_out")
             self._metrics.audio_bytes += len(block)
             yield AudioFragment(seq=self._chunker.next_seq(), data=block)
@@ -307,4 +329,7 @@ class PipelinedScheduler:
         self._task = None
         self._run = None
         self._last_partial = ""
+        # 打断可能发生在 EOU 之后（replay 途中），旗标必须一并复位，
+        # 否则下一轮说话期间的投机永远不做前缀校验。
+        self._eou_done = False
         self._splitter = SentenceSplitter()

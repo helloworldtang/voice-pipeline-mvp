@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import hashlib
 import json
 import os
 import platform
@@ -96,6 +97,42 @@ async def synthesize(text: str, tts: object) -> np.ndarray:
     if sr != 16000:
         samples = soxr.resample(samples, sr, 16000)
     return np.asarray(samples, dtype=np.float32)
+
+
+def _wav_name(utterance: str) -> str:
+    """上行语音的落盘名：文本哈希，跨机器稳定——Mac 上存、ECS 上读，名字对得上。"""
+    return hashlib.sha1(utterance.encode()).hexdigest()[:12] + ".wav"
+
+
+def save_wavs(directory: str, audios: dict[str, np.ndarray]) -> None:
+    """把上行语音存成 16k PCM16 WAV（在 Mac 上跑一次，内存受限的机器就免加载 kokoro）。"""
+    import soundfile as sf
+
+    target = Path(directory)
+    target.mkdir(parents=True, exist_ok=True)
+    for utterance, pcm in audios.items():
+        sf.write(target / _wav_name(utterance), pcm, 16000, subtype="PCM_16")
+    print(f"上行语音已存 {target}（{len(audios)} 段，拷到目标机用 --wavs-dir 消费）")
+
+
+def load_wavs(directory: str) -> dict[str, np.ndarray]:
+    """读取预合成的上行语音。2G 内存的 ECS 上 bench 进程若再加载 kokoro（~500M）
+    会把服务端模型挤出内存——上行语音在 Mac 上合成好带过来，数字仍然可比。"""
+    import soundfile as sf
+
+    target = Path(directory)
+    audios: dict[str, np.ndarray] = {}
+    for utterance in USER_UTTERANCES:
+        path = target / _wav_name(utterance)
+        if not path.exists():
+            msg = f"缺 {path}——先在有模型的机器上跑 --save-wavs 生成并拷过来"
+            raise FileNotFoundError(msg)
+        data, sr = sf.read(path, dtype="float32")
+        if sr != 16000:
+            msg = f"{path} 采样率 {sr} ≠ 16000，重存"
+            raise ValueError(msg)
+        audios[utterance] = data
+    return audios
 
 
 async def run_once(
@@ -247,6 +284,16 @@ async def main() -> None:
     ap.add_argument("--eou-wait-ms", type=float, default=2000.0)
     ap.add_argument("--json-out", default=None)
     ap.add_argument(
+        "--wavs-dir",
+        default=None,
+        help="从预合成 WAV 加载上行语音（文本哈希命名），不在本机加载 kokoro",
+    )
+    ap.add_argument(
+        "--save-wavs",
+        default=None,
+        help="合成后把上行语音存成 WAV（在有模型的机器上生成，供 --wavs-dir 消费）",
+    )
+    ap.add_argument(
         "--gating",
         default="neural",
         help="判停档位（conservative/semantic/neural），可逗号分隔做 A/B",
@@ -291,8 +338,14 @@ async def main() -> None:
 
             # 上行语音用固定引擎合成：它只是「用户说的话」，必须两组完全一致，
             # 否则 A/B 比的是两段的语音，不是服务端 TTS。
-            up_tts = R.build_tts_engine("kokoro", num_threads=2)
-            audios = {u: await synthesize(u, up_tts) for u in USER_UTTERANCES}
+            # --wavs-dir 时直接读盘——内存受限机器不加载 kokoro（见 load_wavs）。
+            if args.wavs_dir:
+                audios = load_wavs(args.wavs_dir)
+            else:
+                up_tts = R.build_tts_engine("kokoro", num_threads=2)
+                audios = {u: await synthesize(u, up_tts) for u in USER_UTTERANCES}
+                if args.save_wavs:
+                    save_wavs(args.save_wavs, audios)
 
             rows: list[Row] = []
             for utterance, pcm in audios.items():

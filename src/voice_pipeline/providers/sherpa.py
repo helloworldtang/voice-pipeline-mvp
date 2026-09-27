@@ -10,6 +10,7 @@ scripts/calibrate.py 实测，不能引用厂商宣传值。
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
@@ -24,9 +25,27 @@ from voice_pipeline.providers.base import AsrProvider, TtsProvider
 DEFAULT_MODEL_ROOT = Path(__file__).resolve().parents[3] / "models"
 DEFAULT_ESPEAK_DATA = "/opt/homebrew/share/espeak-ng-data"
 
+# 部署覆盖（Linux/ECS 无 Homebrew 路径；模型可挂载到任意目录）：
+#   VOICE_MODEL_ROOT=/path/to/models  VOICE_ESPEAK_DATA=/usr/lib/x86_64-linux-gnu/espeak-ng-data
+MODEL_ROOT_ENV = "VOICE_MODEL_ROOT"
+ESPEAK_DATA_ENV = "VOICE_ESPEAK_DATA"
+
+
+def _model_root(root: Path | str | None = None) -> Path:
+    if root is not None:
+        return Path(root)
+    env = os.environ.get(MODEL_ROOT_ENV)
+    return Path(env) if env else DEFAULT_MODEL_ROOT
+
+
+def _espeak_data(data_dir: str | None = None) -> str:
+    if data_dir is not None:
+        return data_dir
+    return os.environ.get(ESPEAK_DATA_ENV, DEFAULT_ESPEAK_DATA)
+
 
 def _models(root: Path | str | None = None) -> Path:
-    path = Path(root) if root else DEFAULT_MODEL_ROOT
+    path = _model_root(root)
     if not path.is_dir():
         msg = f"model dir missing: {path} -- run scripts/download_models.sh first"
         raise FileNotFoundError(msg)
@@ -47,10 +66,18 @@ class StreamingAsr(ABC):
     fed_samples / wall_ms 是校准脚本要读的量：喂了多少音频、烧了多少 CPU。
     """
 
-    def __init__(self, sample_rate: int = 16000, window_ms: int = 100) -> None:
+    def __init__(
+        self,
+        sample_rate: int = 16000,
+        window_ms: int = 100,
+        *,
+        recognizer: sherpa_onnx.OnlineRecognizer | None = None,
+    ) -> None:
         self._sr = sample_rate
         self._window = int(sample_rate * window_ms / 1000)
-        self._recognizer = self._make_recognizer()
+        # recognizer 携带模型权重（重，进程内共享）；stream 是纯会话状态（轻，每连接新建）。
+        # 跨连接共享 recognizer 意味着并发推理在同一 ORT session 上串行——单用户试点无碍。
+        self._recognizer = recognizer or self._make_recognizer()
         self._stream = self._recognizer.create_stream()
         self._buf = np.empty(0, dtype=np.float32)
         self.frames = 0
@@ -119,10 +146,11 @@ class ParaformerStreamingAsr(StreamingAsr):
         num_threads: int = 2,
         sample_rate: int = 16000,
         window_ms: int = 100,
+        recognizer: sherpa_onnx.OnlineRecognizer | None = None,
     ) -> None:
         self._root = _models(model_root) / "asr"
         self._threads = num_threads
-        super().__init__(sample_rate=sample_rate, window_ms=window_ms)
+        super().__init__(sample_rate=sample_rate, window_ms=window_ms, recognizer=recognizer)
 
     def _make_recognizer(self) -> sherpa_onnx.OnlineRecognizer:
         return sherpa_onnx.OnlineRecognizer.from_paraformer(
@@ -150,10 +178,11 @@ class TransducerStreamingAsr(StreamingAsr):
         num_threads: int = 2,
         sample_rate: int = 16000,
         window_ms: int = 100,
+        recognizer: sherpa_onnx.OnlineRecognizer | None = None,
     ) -> None:
         self._root = _models(model_root) / subdir
         self._threads = num_threads
-        super().__init__(sample_rate=sample_rate, window_ms=window_ms)
+        super().__init__(sample_rate=sample_rate, window_ms=window_ms, recognizer=recognizer)
 
     def _make_recognizer(self) -> sherpa_onnx.OnlineRecognizer:
         return sherpa_onnx.OnlineRecognizer.from_transducer(
@@ -265,7 +294,7 @@ class KokoroTts(BaseTts):
     def __init__(
         self,
         model_root: Path | str | None = None,
-        data_dir: str = DEFAULT_ESPEAK_DATA,
+        data_dir: str | None = None,
         lang: str = "zh",
         speaker_id: int = 0,
         speed: float = 1.0,
@@ -273,7 +302,7 @@ class KokoroTts(BaseTts):
         chunk_ms: int = 200,
     ) -> None:
         self._root = _models(model_root)
-        self._data_dir = data_dir
+        self._data_dir = _espeak_data(data_dir)
         self._lang = lang
         self._threads = num_threads
         super().__init__(chunk_ms=chunk_ms, speaker_id=speaker_id, speed=speed)
@@ -308,14 +337,14 @@ class MeloTts(BaseTts):
         self,
         model_root: Path | str | None = None,
         subdir: str = "tts-melo",
-        data_dir: str = DEFAULT_ESPEAK_DATA,
+        data_dir: str | None = None,
         speaker_id: int = 0,
         speed: float = 1.0,
         num_threads: int = 4,
         chunk_ms: int = 200,
     ) -> None:
         self._root = _models(model_root) / subdir
-        self._data_dir = data_dir
+        self._data_dir = _espeak_data(data_dir)
         self._threads = num_threads
         super().__init__(chunk_ms=chunk_ms, speaker_id=speaker_id, speed=speed)
 

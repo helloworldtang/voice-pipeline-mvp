@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>voice-pilot</title>
+<style>
+  :root { color-scheme: light dark; }
+  body {
+    font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    max-width: 720px; margin: 0 auto; padding: 16px;
+    background: #111318; color: #e6e8ee;
+  }
+  header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+  header h1 { font-size: 18px; margin: 0; flex: 1; }
+  #status { font-size: 12px; opacity: .7; }
+  #controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
+  #controls input, #controls select, #controls button {
+    background: #1c2028; color: inherit; border: 1px solid #333a46;
+    border-radius: 6px; padding: 6px 10px; font-size: 13px;
+  }
+  #mic { min-width: 88px; }
+  #mic.on { background: #b3261e; border-color: #b3261e; }
+  #chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; min-height: 22px; }
+  .chip { font-size: 11px; background: #232936; border-radius: 10px; padding: 2px 8px; }
+  .chip b { color: #8ab4f8; }
+  #log { list-style: none; margin: 0; padding: 0; font-size: 15px; line-height: 1.7; }
+  #log li { padding: 1px 0; word-break: break-all; }
+  #log .partial { color: #8a919e; }
+  #log .user { color: #e6e8ee; }
+  #log .assistant { color: #8ab4f8; }
+  #log .err { color: #f28b82; font-size: 13px; }
+  footer { margin-top: 16px; font-size: 11px; opacity: .5; }
+</style>
+</head>
+<body>
+<header>
+  <h1>voice-pilot</h1>
+  <span id="status">未连接</span>
+</header>
+
+<div id="controls">
+  <input id="token" type="password" placeholder="token（可空）" style="width:130px">
+  <select id="mode">
+    <option value="real-serial" selected>real-serial</option>
+    <option value="real-pipelined">real-pipelined</option>
+    <option value="serial">serial（sim）</option>
+  </select>
+  <select id="gating">
+    <option value="neural" selected>neural 判停</option>
+    <option value="conservative">conservative</option>
+  </select>
+  <button id="mic" disabled>开麦</button>
+</div>
+
+<div id="chips"></div>
+<ul id="log"></ul>
+
+<footer>Chrome only · 浏览器 AEC 免耳机 · 说话后停顿即判停，AI 播放中可插话打断</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

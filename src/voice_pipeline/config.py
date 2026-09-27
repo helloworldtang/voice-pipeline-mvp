@@ -23,6 +23,14 @@ class Settings(BaseSettings):
     # 背压：有界队列，音频积压超限时按策略丢弃并计数
     max_audio_frames: int = 200
 
+    # WS 鉴权：设了则 session.begin 必须带匹配的 token，否则 1008 关闭；
+    # 不设（默认）完全开放——本机开发 / bench / 测试零配置。
+    # ⚠️ 开发机 .env 别设它，否则 bench_ws / pytest 全都要 token。
+    ws_token: str | None = None
+
+    # 浏览器客户端静态目录（默认仓根 web/；不存在的部署可指到别处或留空不挂载）
+    web_dir: str = ""
+
 
 def get_settings() -> Settings:
     return Settings()

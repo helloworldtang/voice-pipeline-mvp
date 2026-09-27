@@ -48,6 +48,9 @@ class SessionBegin(BaseModel):
     # pipelined 专用：EOU 后最多再等多少毫秒让投机落地（0 = 不等，没好就走串行）。
     # 本机实测 grace=0 时 6/6 全未命中，grace=300 才吃到那唯一一次 179ms。
     grace_ms: float = 0.0
+    # WS 鉴权（可选）：服务端设了 VOICE_WS_TOKEN 才校验，compare_digest 防时序侧信道。
+    # 注意 pydantic 对多余字段是忽略——字段名拼错会被静默吞掉，wire 契约测试钉住它。
+    token: str | None = None
 
 
 class Interrupt(BaseModel):

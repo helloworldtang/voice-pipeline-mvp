@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from voice_pipeline.core.eou import FusedEou, GatingMode
@@ -98,19 +99,67 @@ def build_providers(
             "transducer": real.TransducerStreamingAsr,
         }[asr_engine]
         tts_name = resolve_tts_engine(tts_engine)
-        tts_cls = real.TTS_ENGINES.get(tts_name)
-        if tts_cls is None:
-            msg = f"unknown tts engine: {tts_name} (可选 {list(real.TTS_ENGINES)})"
-            raise ValueError(msg)
-        # TTS 4 线程是本机实测最优点（2 线程 665ms → 4 线程 624ms，8 线程反而退步）
+        # TTS 分流：dashscope 走云端流式（2C x86 上本地 melo RTF≈14.5 判死，
+        # 见 docs/ecs-baseline.md）；其余走本地 sherpa OfflineTts。
+        tts: TtsProvider
+        if tts_name == "dashscope":
+            tts = _cached_tts_cloud()
+        else:
+            tts_cls = real.TTS_ENGINES.get(tts_name)
+            if tts_cls is None:
+                msg = f"unknown tts engine: {tts_name} (可选 {list(real.TTS_ENGINES)}、dashscope)"
+                raise ValueError(msg)
+            # TTS 4 线程是本机实测最优点（2 线程 665ms → 4 线程 624ms，8 线程反而退步）
+            tts = _cached_tts_local(tts_cls)
         return ProviderSet(
-            asr=engine(),
+            asr=_build_asr_shared(engine),
             llm=build_llm(llm_engine, llm_model),
-            tts=tts_cls(num_threads=4),
+            tts=tts,
         )
 
     msg = f"unknown provider mode: {mode}"
     raise ValueError(msg)
+
+
+# ---- provider 缓存 ----------------------------------------------------------
+# Provider 每 session.begin 重建（Session.__init__），而模型加载是秒级的：
+# 不缓存的话浏览器每次刷新都重付 1-3s，还把「begin 阻塞接收循环」放大成体感卡顿
+# （ECS 实测 begin 迟到 2.4-2.9s，docs/ecs-baseline.md）。
+# 缓存粒度按「重资产」拆：TTS 引擎实例 / LLM / ASR recognizer 跨连接共享，
+# ASR wrapper 与 stream 每连接新建（携带会话状态，不可共享）。
+# 并发代价：共享的 ORT session 上推理串行——单用户试点无碍，多用户再议。
+
+_LOCAL_TTS_CACHE: dict[str, TtsProvider] = {}
+_CLOUD_TTS: TtsProvider | None = None
+_ASR_RECOGNIZER_CACHE: dict[str, object] = {}
+
+
+def _cached_tts_local(tts_cls: Callable[..., object]) -> TtsProvider:
+    key = tts_cls.__name__
+    if key not in _LOCAL_TTS_CACHE:
+        tts: TtsProvider = tts_cls(num_threads=4)  # type: ignore[assignment]
+        _LOCAL_TTS_CACHE[key] = tts
+    return _LOCAL_TTS_CACHE[key]
+
+
+def _cached_tts_cloud() -> TtsProvider:
+    global _CLOUD_TTS
+    if _CLOUD_TTS is None:
+        from voice_pipeline.providers.tts.dashscope_tts import DashScopeTts
+
+        _CLOUD_TTS = DashScopeTts()
+    return _CLOUD_TTS
+
+
+def _build_asr_shared(engine: Callable[..., AsrProvider]) -> AsrProvider:
+    """ASR：recognizer（模型权重）按引擎名缓存共享，stream 每次新建。"""
+    key = engine.__name__
+    recognizer = _ASR_RECOGNIZER_CACHE.get(key)
+    if recognizer is None:
+        asr = engine()  # 首次：正常构造（内含 recognizer 创建）
+        _ASR_RECOGNIZER_CACHE[key] = asr._recognizer  # type: ignore[attr-defined]
+        return asr
+    return engine(recognizer=recognizer)
 
 
 def build_eou(
