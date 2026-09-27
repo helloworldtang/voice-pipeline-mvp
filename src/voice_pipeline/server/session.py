@@ -81,6 +81,7 @@ class Session:
         # 账单落盘（VOICE_EVENTS_JSONL）：默认关闭，见 metrics/jsonl.py。
         self._recorder = recorder or TurnRecorder.from_env()
         self._turn_index = 0  # 会话内轮次编号，从 1 起——落盘账单靠它排序
+        self._recorded_this_turn = False  # 防重复记账：TurnEnd 与 finally 两条路径
         # 多轮上下文：Session 持有，调度器每次调用 LLM 时取快照。只记**实际播出去的**
         # 内容——被打断的轮次里，用户听到多少就记多少，这是有意为之（听到的才是真的），
         # 不要"修复"成整句入史。
@@ -238,6 +239,7 @@ class Session:
         self._turn_running = True
         self.interrupted = False
         self._eou_collected = False
+        self._recorded_this_turn = False
         # 每轮一本新账：TurnMetrics 的 mark 只记首次到达，跨轮复用不清账的话，
         # 第 2 轮起的账单会复读第 1 轮。必须在 _collect_eou_metrics 之前清——
         # 它要把上一轮的判停指标写进本轮账里。
@@ -259,29 +261,49 @@ class Session:
                 elif isinstance(item, TtsSentence):
                     assistant_parts.append(item.text)
                 elif isinstance(item, TurnEnd):
-                    # 账单在这一刻定型。被打断的轮次本就产不出 TurnEnd（finish() 在
-                    # interrupted 时 break），所以“只落已完成轮次”是天然成立的，
-                    # 不需额外判断——但被打断后的半截文本也不入账，这是有意的。
-                    self._turn_index += 1
-                    self._recorder.record(
-                        session_id=self.session_id,
-                        trace_id=self.trace_id,
-                        mode=self.mode,
-                        turn=self._turn_index,
-                        bill=item.metrics,
-                        extra={
-                            "interrupted": self.interrupted,
-                            "user_text": user_text or "",
-                            "assistant_text": "".join(assistant_parts),
-                        },
-                    )
+                    # 账单在这一刻定型。
+                    self._record_turn(item.metrics, user_text, assistant_parts)
         finally:
             self._turn_running = False
+            # 被打断的轮次产不出 TurnEnd（finish() 在 interrupted 时 break），
+            # 必须在 finally 里补记——否则「打断」这个一等验收指标永远没有证据，
+            # `interrupted` 会是个永远为假的死字段。（初版曾把「不落盘」当成
+            # 「天然只落完整轮次」，实际上是漏掉了最需要记录的那一类。）
+            if self.interrupted and not self._recorded_this_turn:
+                self._record_turn(self.metrics.bill(), user_text, assistant_parts)
             if user_text is not None:
                 self._history.append({"role": "user", "content": user_text})
                 if assistant_parts:
                     self._history.append({"role": "assistant", "content": "".join(assistant_parts)})
                 self._trim_history()
+
+    def _record_turn(
+        self,
+        bill: dict[str, float],
+        user_text: str | None,
+        assistant_parts: list[str],
+    ) -> None:
+        """落盘一轮账单。**唯一入口**——保证一轮只落一行、不重不漏。
+
+        两条调用路径（`TurnEnd` 正常完成 / `finally` 打断补记）共用它：
+        分散写两遍就会出现「正常轮重复记」或「打断轮漏记」，两种都难查。
+        被打断的轮次 `first_audio_out` 可能未打点（AI 还没出声就被掐了），
+        那时口径B 如实为 -1（缺失），不做推测填补。
+        """
+        self._recorded_this_turn = True
+        self._turn_index += 1
+        self._recorder.record(
+            session_id=self.session_id,
+            trace_id=self.trace_id,
+            mode=self.mode,
+            turn=self._turn_index,
+            bill=bill,
+            extra={
+                "interrupted": self.interrupted,
+                "user_text": user_text or "",
+                "assistant_text": "".join(assistant_parts),
+            },
+        )
 
     def _trim_history(self) -> None:
         """裁到最近 10 轮（20 条消息），从头部整对裁——保住 user 开头的轮次边界。"""

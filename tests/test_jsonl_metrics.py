@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 
@@ -99,6 +100,57 @@ def test_no_record_before_any_turn(tmp_path: Path) -> None:
     _session(TurnRecorder(str(out)))
     assert SessionEnd().type == "session.end"
     assert out.exists() is False
+
+
+async def test_interrupted_turn_is_recorded(tmp_path: Path) -> None:
+    """打断的轮次必须落盘——否则「打断」这个一等验收指标永远没证据。
+
+    真因：finish() 在 interrupted 时 break，产不出 TurnEnd，初版把这
+    类轮次静默丢弃，`interrupted` 字段永远为假。真人验收最该看的恰恰是打断。
+
+    打断必须发生在**轮次进行中**（run_turn 开头会把 interrupted 重置），
+    所以这里用一个可控的慢调度器：先出一句，等在飞时插话。
+    """
+    from collections.abc import AsyncIterator
+
+    from voice_pipeline.core.scheduler.base import TurnItem
+    from voice_pipeline.core.turn_fsm import TurnState
+    from voice_pipeline.server.protocol import TtsSentence
+
+    class _SlowScheduler:
+        """出一句后挂住 80ms，给测试留出“播放中插话”的窗口。"""
+
+        async def on_audio(self, chunk: bytes) -> None:
+            return None
+
+        def text(self) -> str:
+            return ""
+
+        def cancel(self) -> None:
+            return None
+
+        async def on_end_of_utterance(self) -> AsyncIterator[TurnItem]:
+            await asyncio.sleep(0.02)
+            yield TtsSentence(seq=1, text="这是一句很长的话")
+            await asyncio.sleep(0.08)  # 播放中：用户在此插话
+
+    out = tmp_path / "turns.jsonl"
+    session = _session(TurnRecorder(str(out)))
+    session._scheduler = _SlowScheduler()
+
+    task = asyncio.create_task(session.run_turn())
+    await asyncio.sleep(0.05)  # 让它跑到 yield 之后
+    # 打断只生效于 SPEAKING/THINKING，状态机先在 finish() 里推到 THINKING。
+    assert session._fsm.state is TurnState.THINKING
+    assert session.barge_in() is True, "THINKING 下打断必须成功"
+    await task
+
+    records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1, f"打断轮必须落盘 1 行，实际 {len(records)}"
+    assert records[0]["interrupted"] is True
+    assert records[0]["barge_in_count"] >= 1, "账单要能看到打断发生了"
+    # 被打断时 AI 没出声，口径B 如实为 -1（缺失），不得填 0。
+    assert records[0]["caliber_b_ms"] == -1.0
 
 
 def test_every_gating_mode_has_a_bill_code() -> None:
