@@ -61,6 +61,13 @@ class SerialScheduler:
         self._asr.reset()
         yield AsrFinal(text=transcript)
 
+        if not transcript:
+            # 空转写不起轮（回声自激回环的第二道门）：对空问题作答只会
+            # 生成更多声音喂回麦克风。账单照出（证据留痕），但 LLM/TTS 不跑。
+            self._metrics.mark("turn_end")
+            yield TurnEnd(metrics=self._metrics.bill())
+            return
+
         sentence_seq = 0
         saw_token = False
         async for piece in self._llm.astream(

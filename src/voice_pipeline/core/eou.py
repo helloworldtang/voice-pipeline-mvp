@@ -53,6 +53,9 @@ class EouDetector(Protocol):
     def push_audio(self, chunk: bytes) -> None: ...
     def update_text(self, partial: str) -> None: ...
     def should_end(self) -> bool: ...
+    def unlatch(self) -> None:
+        """只解除判停闩锁、保留静音/VAD 状态（空转写门用，见 FusedEou.unlatch）。"""
+        ...
     def reset(self) -> None: ...
     def silence_ms(self) -> float: ...
     def speech_ms(self) -> float: ...
@@ -419,6 +422,18 @@ class FusedEou:
         if not self._decided:
             self._decided = True
             self._decided_at_ms = self._elapsed
+
+    def unlatch(self) -> None:
+        """只解除判停闩锁，**保留**静音计时与 VAD 的人声状态。
+
+        空转写门用它拦「有能量无文字」的判停（session.pending_end）：全量
+        reset 会把 has_speech 一起清掉，纯静音喂不回来，EOU 从此再闩不上、
+        计数器走不到放行上限——链路卡死在"永远判不了停"（scripted 回放
+        实测 20s 超时）。只解闩锁则下一帧条件仍满足时立即重新闩上，
+        拦截计数每帧 +1，到上限自然放行。
+        """
+        self._decided = False
+        self._decided_at_ms = 0.0
 
     def reset(self) -> None:
         # 抢话观察窗**横跨 reset**：判停发生在静音里，人声回到窗口内往往在 reset

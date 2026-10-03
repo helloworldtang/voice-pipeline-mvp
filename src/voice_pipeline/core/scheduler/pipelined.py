@@ -205,6 +205,13 @@ class PipelinedScheduler:
         self._eou_done = True
         yield AsrFinal(text=transcript)
 
+        if not transcript:
+            # 空转写不起轮：与 serial 同一条纪律（回声自激回环第二道门）
+            self._metrics.mark("turn_end")
+            self._eou_done = False
+            yield TurnEnd(metrics=self._metrics.bill())
+            return
+
         run = await self._settle(transcript)
         if run is None:
             self.spec_misses += 1

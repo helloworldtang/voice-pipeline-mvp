@@ -40,6 +40,9 @@ from voice_pipeline.server.protocol import AsrFinal, AudioStop, TtsSentence, Tur
 # 更早的轮次对当前问题几乎没有贡献，却每轮都要整包发给 LLM 付费。
 MAX_HISTORY_MESSAGES = 20
 
+# 空转写门的放行上限（次）：100ms 帧节奏下 ≈1s——超过它说明 ASR 不会再出字了
+EMPTY_GATE_MAX_BLOCKS = 10
+
 
 class Session:
     """一个 WS 连接一个 Session，trace_id 贯穿日志与账单。
@@ -94,6 +97,8 @@ class Session:
         self._turn_running = False
         # 本轮判停指标是否已抓进账单（防止被 reset 后的 0 覆盖）
         self._eou_collected = False
+        # 空转写门的连续拦截计数（见 pending_end）
+        self._empty_blocks = 0
 
         real = mode.startswith("real-") or mode == "real"
         spec_mode = mode.removeprefix("real-")
@@ -151,8 +156,31 @@ class Session:
         return []
 
     def pending_end(self) -> bool:
-        """EOU 判停器是否已判定用户说完。real 模式下由传输层轮询以自动收尾。"""
-        return self._eou.should_end() if self._eou is not None else False
+        """EOU 判停器是否已判定用户说完。real 模式下由传输层轮询以自动收尾。
+
+        **空转写门（2026-10-04 真人验收抓到的回声自激回环）**：外放回声/噪声
+        能量够 VAD 认定「有人声」（≥0.01）、ASR 却认不出任何字——EOU 在这种
+        音频上判停会触发「AI 自问自答」回环（实测一句"我想睡"引来 6 连答，
+        账单 6 轮 user_text 全空）。判停作废、判停器重置；ASR 出字了再判。
+        代价：超短句的判停最多晚一个 partial 周期（~300ms），换回环根治。
+
+        **放行上限**：ASR 一直不出字（切轮残余、极怪回声）时不许无限拦——
+        连续拦 EMPTY_GATE_MAX_BLOCKS 次（100ms 帧节奏下 ≈1s）后放行，由
+        第二道门（调度器空转写不起轮，不出音频）兜底：回环照样断，
+        而链路不会卡死在"永远判不了停"。
+        """
+        if self._eou is None:
+            return False
+        if not self._eou.should_end():
+            return False
+        if self._scheduler is not None and not self._scheduler.text():
+            self._empty_blocks += 1
+            if self._empty_blocks < EMPTY_GATE_MAX_BLOCKS:
+                # unlatch 而非 reset：reset 会连 has_speech 一起清掉，纯静音
+                # 喂不回 VAD，EOU 永远再闩不上、计数走不到放行（实测卡死）。
+                self._eou.unlatch()
+                return False
+        return True
 
     def barge_in(self, *, source: str = "mic") -> bool:
         """三层 barge-in 的总入口（L2/L3 在这里落地）。
@@ -245,6 +273,7 @@ class Session:
         self._turn_running = True
         self.interrupted = False
         self._eou_collected = False
+        self._empty_blocks = 0
         self._recorded_this_turn = False
         # 每轮一本新账：TurnMetrics 的 mark 只记首次到达，跨轮复用不清账的话，
         # 第 2 轮起的账单会复读第 1 轮。必须在 _collect_eou_metrics 之前清——

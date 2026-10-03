@@ -14,8 +14,10 @@
 
 from __future__ import annotations
 
+import struct
 from collections.abc import AsyncIterator
 
+from voice_pipeline.core.eou import FusedEou, GatingMode
 from voice_pipeline.providers.tts.sim_tts import SimTts
 from voice_pipeline.server.protocol import TurnEnd
 from voice_pipeline.server.session import MAX_HISTORY_MESSAGES, Session
@@ -134,3 +136,90 @@ async def test_each_turn_gets_a_fresh_bill() -> None:
     assert bills[0]["caliber_b_ms"] >= 0
     assert bills[1]["caliber_b_ms"] >= 0
     assert bills[1]["utterance_end"] > bills[0]["utterance_end"]
+
+
+class EmptyTextAsr:
+    """回声形态的 ASR：VAD 听见人声（音频能量够），却认不出任何字（text() 恒空）。"""
+
+    def __init__(self) -> None:
+        self.frames = 0
+
+    async def push_audio(self, chunk: bytes) -> None:
+        self.frames += 1
+
+    def text(self) -> str:
+        return ""
+
+    async def finalize(self) -> str:
+        return ""
+
+    def reset(self) -> None:
+        self.frames = 0
+
+
+async def test_echo_loop_gated_by_empty_transcript() -> None:
+    """回声自激回环的根治门：真人验收实测一句"我想睡"引来 6 连答，账单
+    后续轮 user_text 全空——EOU 在「有能量、无文字」的回声音频上判停，
+    AI 作答的声音又回灌麦克风。判停必须被空转写门拦下并重置。
+    """
+    llm = SpyLlm()
+    session = Session(
+        mode="real-serial",
+        asr=EmptyTextAsr(),
+        llm=llm,
+        tts=SimTts(),
+        eou=FusedEou(gating=GatingMode.CONSERVATIVE, min_silence_ms=100.0),
+    )
+    speech = _speech_frame(600)  # RMS≈0.018：过 EOU 人声阈(0.01)、不过打断阈(0.02)
+    silence = _speech_frame(0)
+
+    # 「AI 的回声」：有人声能量的音频 + 静音尾巴 → EOU 事实上会判停
+    for _ in range(3):
+        await session.on_audio(speech)
+    for _ in range(2):
+        await session.on_audio(silence)
+    assert session._eou is not None and session._eou.should_end(), "前置：EOU 确已判停"
+    # 门生效：pending_end 必须拦下并重置判停器，轮次不起
+    assert session.pending_end() is False
+    assert isinstance(session._eou, FusedEou)
+    assert not session._eou._decided, "判停器应已解闩（保留 VAD 状态，见 unlatch）"
+    await session.run_turn()  # 即使被外部驱动，空转写也不进 LLM
+    assert llm.calls == [], "空转写绝不该触发 LLM——那只会生成更多声音喂回麦克风"
+
+    # 放行上限：ASR 永远不出字（极端回声）时，门在 ~EMPTY_GATE_MAX_BLOCKS 次
+    # 后放行——链路不许卡死在"永远判不了停"；放行的轮由第二道门兜底（不出音频）。
+    session._empty_blocks = 0
+    fired = 0
+    for _ in range(30):
+        await session.on_audio(speech)
+        await session.on_audio(silence)
+        fired += 1
+        if session.pending_end():
+            break
+    assert fired <= 15, f"门拦了 {fired} 次还没放行——上限失效会卡死链路"
+    llm.calls.clear()
+    await session.run_turn()
+    assert llm.calls == [], "放行的空转写轮同样不进 LLM（回环仍是断的）"
+
+
+async def test_empty_transcript_skips_llm_but_bills() -> None:
+    """第二道门：finalize 空转写 → 账单照出（证据留痕），LLM/TTS 不跑。"""
+    from voice_pipeline.server.protocol import TurnEnd
+
+    llm = SpyLlm()
+    asr = DeadWithoutResetAsr([""])  # 合法空转写
+    session = _session(asr, llm)
+    await session.on_audio(b"\x00" * 320)
+    await session.run_turn()
+
+    assert llm.calls == []
+    items = []
+    while not session.outbox.empty():
+        items.append(session.outbox.get_nowait())
+    types = [getattr(i, "type", "audio") for i in items]
+    assert "asr.final" in types
+    assert types[-1] == TurnEnd(metrics={}).type, "空转写轮也要有账单（证据留痕）"
+
+
+def _speech_frame(amp: int, ms: int = 100, sr: int = 16000) -> bytes:
+    return struct.pack("<" + "h" * (sr * ms // 1000), *([amp] * (sr * ms // 1000)))
