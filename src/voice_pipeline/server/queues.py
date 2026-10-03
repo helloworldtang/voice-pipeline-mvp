@@ -1,62 +1,111 @@
-"""双优先级队列：控制帧（打断/取消）永不被音频或文本积压阻塞。
+"""下行发送队列：杀停帧优先、其余严格保序、音频有界丢旧。
 
-铁律来源：技术方案 §2.6。打断信号若排在音频数据后面，用户按下打断到真正生效之间
-会隔着一整段积压，体验上就是「叫不停」。
+铁律来源（技术方案 §2.6）：打断信号若排在音频数据后面，用户按下打断到真正生效
+之间会隔着一整段积压，体验上就是「叫不停」。
+
+但**只有杀停类帧**（`audio.stop`）允许跳队。`turn.end` / `session.closed` 若也走
+优先道，会越过尚未发完的音频先到客户端——账单先于音频、收流方提前退出收流循环
+（bench_ws 正是收到 turn.end 就 break），那是另一种形式的「叫不停」。初版
+`DualPriorityQueue` 把所有控制帧都放进优先道，接线分析时发现这个顺序倒置，
+遂重构为本形态（2026-10-03，差距表「有界队列未接线」的兑现）。
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import deque
 from dataclasses import dataclass
 
-PRIO_CONTROL = 0
-PRIO_AUDIO = 1
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
-class Envelope:
-    priority: int
-    seq: int
-    payload: bytes | str
+class Entry:
+    """一个发送单元：要么单文本帧，要么 audio.chunk 通知 + 二进制数据成对。
+
+    音频的 JSON 通知与二进制必须**原子地**同进同出——背压丢弃若只丢一半，
+    客户端的「收到 audio.chunk 后跟一帧二进制」解析就永久错位。
+    """
+
+    text: str
+    data: bytes | None = None  # 非 None = 音频对：先发 text 再发 data
 
 
-class DualPriorityQueue:
-    """控制帧无界优先；音频帧有界，超限丢弃最旧的分片并计数（背压可见）。"""
+class OutboundQueue:
+    """双车道下行队列：杀停道无界优先；主道严格保序、音频有界丢最旧并计数。"""
 
     def __init__(self, max_audio_frames: int = 200) -> None:
-        self._control: deque[Envelope] = deque()
-        self._audio: deque[Envelope] = deque()
+        self._kill = deque[Entry]()  # audio.stop 等「晚到不如早到」的帧
+        self._main = deque[Entry]()  # 其余一切，含音频
+        self._audio_in_main = 0
         self._max_audio = max_audio_frames
-        self._seq = 0
         self._event = asyncio.Event()
+        self._unfinished = 0
+        self._drained = asyncio.Event()
+        self._drained.set()
         self.dropped_audio = 0
 
-    def put_control(self, payload: str) -> None:
-        self._seq += 1
-        self._control.append(Envelope(PRIO_CONTROL, self._seq, payload))
+    # ---- 生产（多协程安全：同一事件循环内无 await，天然原子） -----------------
+
+    def put_kill(self, text: str) -> None:
+        """杀停帧：插队到一切积压之前。仅限 audio.stop 语义的帧。"""
+        self._put(self._kill, Entry(text))
+
+    def put_event(self, text: str) -> None:
+        """保序事件（turn.end / session.closed / 转写流）。"""
+        self._put(self._main, Entry(text))
+
+    def put_audio(self, notice: str, data: bytes) -> None:
+        """音频对（audio.chunk JSON + PCM）。主道积压超限时丢**最旧的音频对**
+        （越过中间的事件单元），并计数——背压可见。"""
+        if self._audio_in_main >= self._max_audio:
+            # 定位主道里**最旧的一个音频对**原地删除——夹在它前面的事件单元
+            # 保序保留（turn.end 被背压丢掉比丢音频严重得多）。
+            for i, entry in enumerate(self._main):
+                if entry.data is not None:
+                    del self._main[i]
+                    self._audio_in_main -= 1
+                    self.dropped_audio += 1
+                    self._unfinished -= 1
+                    break
+            logger.warning(
+                "下行音频积压超限（≥%s 帧），丢弃最旧音频对（累计 %s）",
+                self._max_audio,
+                self.dropped_audio,
+            )
+        self._put(self._main, Entry(notice, data))
+        self._audio_in_main += 1
+
+    def _put(self, lane: deque[Entry], entry: Entry) -> None:
+        lane.append(entry)
+        self._unfinished += 1
         self._event.set()
 
-    def put_audio(self, payload: bytes) -> None:
-        self._seq += 1
-        if len(self._audio) >= self._max_audio:
-            self._audio.popleft()
-            self.dropped_audio += 1
-        self._audio.append(Envelope(PRIO_AUDIO, self._seq, payload))
-        self._event.set()
+    # ---- 消费（唯一发送协程调用） ---------------------------------------------
 
-    async def get(self) -> Envelope:
-        """先控制后音频；都空则等待。"""
+    async def get(self) -> Entry:
+        """先杀停后主道；都空则等待。**出队不递减完成数**——那是 task_done 的职责。"""
         while True:
-            if self._control:
-                return self._control.popleft()
-            if self._audio:
-                return self._audio.popleft()
+            if self._kill:
+                return self._kill.popleft()
+            if self._main:
+                return self._main.popleft()
             self._event.clear()
             await self._event.wait()
 
-    def qsize(self) -> tuple[int, int]:
-        return len(self._control), len(self._audio)
+    def task_done(self) -> None:
+        """一个发送单元**落地后**调用。join 以此为准——出队即计数会让调用方在
+        发送仍在飞时就退出收尾，随后的 cancel 把在飞的发送掐死在半路。"""
+        self._unfinished -= 1
+        if self._unfinished == 0:
+            self._drained.set()
 
-    def empty(self) -> bool:
-        return not self._control and not self._audio
+    async def join(self) -> None:
+        """等所有已入队单元发送完毕（与 asyncio.Queue.join 同语义）。"""
+        while self._unfinished > 0:
+            self._drained.clear()
+            await self._drained.wait()
+
+    def qsize(self) -> tuple[int, int]:
+        return len(self._kill), len(self._main)

@@ -41,6 +41,7 @@ from .protocol import (
     dump_event,
     parse_client_frame,
 )
+from .queues import OutboundQueue
 from .session import Session
 
 # 浏览器客户端默认位置：仓根 web/（src 布局运行时可达；Settings.web_dir 可覆盖）
@@ -69,23 +70,47 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             dump_event(SessionReady(session_id=session.session_id, trace_id=session.trace_id))
         )
 
+        # 下行两级：outbox →（pump 分类）→ tx →（sender 发送）→ wire。
+        # 分成两个协程的原因：sender 可能阻塞在慢客户端的 send 上，此时 pump
+        # 仍要继续分类——audio.stop 才能进杀停道、越过积压音频先行（queues.py）。
+        tx = OutboundQueue(max_audio_frames=cfg.max_audio_frames)
+
         async def pump(outbox: asyncio.Queue[TurnItem | AudioStop]) -> None:
-            """统一发送协程：独占 websocket.send，从 outbox 取 TurnItem 下发。"""
+            """分类协程：TurnItem → 杀停道 / 保序事件道 / 有界音频道。"""
             try:
                 while True:
                     item = await outbox.get()
                     if isinstance(item, AudioFragment):
-                        await websocket.send_text(
-                            dump_event(AudioChunk(seq=item.seq, bytes_len=len(item.data)))
+                        tx.put_audio(
+                            dump_event(AudioChunk(seq=item.seq, bytes_len=len(item.data))),
+                            item.data,
                         )
-                        await websocket.send_bytes(item.data)
+                    elif isinstance(item, AudioStop):
+                        tx.put_kill(dump_event(item))
                     else:
-                        await websocket.send_text(dump_event(item))
+                        tx.put_event(dump_event(item))
                     outbox.task_done()
             except asyncio.CancelledError:
                 return
 
+        async def sender() -> None:
+            """唯一常驻发送协程：从 tx 取发送单元下发（音频对原子发送）。"""
+            try:
+                while True:
+                    entry = await tx.get()
+                    await websocket.send_text(entry.text)
+                    if entry.data is not None:
+                        await websocket.send_bytes(entry.data)
+                    # join 的完成计数在**发送落地后**才递减：join 返回即代表客户端
+                    # 收得到，调用方随后 cancel 本协程不会掐掉在飞的发送
+                    # （TestClient 下实测：出队即计数的版本，session.closed 被
+                    # cancel 掐在 send 里，测试端永远收不到）。
+                    tx.task_done()
+            except asyncio.CancelledError:
+                return
+
         pump_task = asyncio.create_task(pump(session.outbox))
+        sender_task = asyncio.create_task(sender())
         turn_task: asyncio.Task[None] | None = None
         try:
             while True:
@@ -160,12 +185,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     if turn_task is not None:
                         with contextlib.suppress(asyncio.CancelledError):
                             await turn_task
-                    # 关键：run_turn 把本轮所有 TurnItem 投进了 outbox，但 pump 是独立协程，
-                    # 此刻可能还没发完（尤其是 turn.end）。必须先等 pump 把队列排空，再发
-                    # session.closed 并 break——否则 break 后的 finally 会 cancel pump，
+                    # 关键：run_turn 把本轮所有 TurnItem 投进了 outbox，但 pump/sender
+                    # 是独立协程，此刻可能还没发完（尤其是 turn.end）。必须先等两级
+                    # 队列排空再收尾——否则 break 后的 finally 会 cancel 两个协程，
                     # 剩余事件（含 turn.end）永远到不了客户端，测试/客户端就卡在等 turn.end。
+                    # closed 走保序事件道（排在残余音频之后），不抢道。
                     await session.outbox.join()
-                    await websocket.send_text(
+                    tx.put_event(
                         dump_event(
                             SessionClosed(
                                 session_id=session.session_id,
@@ -173,6 +199,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             )
                         )
                     )
+                    await tx.join()
                     break
 
                 if isinstance(frame, Interrupt) and not session.barge_in(source="client"):
@@ -185,6 +212,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             return
         finally:
             pump_task.cancel()
+            sender_task.cancel()
             if turn_task is not None:
                 turn_task.cancel()
 
