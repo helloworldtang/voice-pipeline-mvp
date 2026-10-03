@@ -2,7 +2,10 @@
 # 构建（GitHub 可达的机器上；ort so 走 GitHub release，国内网络用 --build-arg 换镜像）：
 #   docker build -f deploy/Dockerfile -t voice-pilot .
 # 运行见 deploy/compose.yml；模型不进镜像，挂载 /models。
-FROM python:3.12-slim
+# 基础镜像可换国内镜像源（示例）：
+#   docker build --build-arg BASE_IMAGE=docker.m.daocloud.io/library/python:3.12-slim ...
+ARG BASE_IMAGE=python:3.12-slim
+FROM ${BASE_IMAGE}
 
 # espeak-ng-data：melo/kokoro 中文音素词典依赖（VOICE_ESPEAK_DATA 指到包路径）
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -19,14 +22,21 @@ COPY pyproject.toml uv.lock README.md ./
 COPY src ./src
 COPY web ./web
 COPY scripts ./scripts
+# 本地预置的 libonnxruntime（deploy/ort/，gitignore 不进仓；没有则回退 GitHub release）
+COPY deploy/ort/ /tmp/ortlocal/
 
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
-    && export PATH="/root/.local/bin:$PATH" \
-    && curl -sL "$ORT_URL" -o /tmp/ort.tgz \
-    && ([ "$ORT_SHA" = SKIP ] || echo "$ORT_SHA  /tmp/ort.tgz" | sha256sum -c -) \
-    && tar xzf /tmp/ort.tgz -C /tmp --strip-components=2 \
-       onnxruntime-linux-x64-1.28.2/lib/libonnxruntime.so.1.28.2 \
-    && uv sync --frozen --no-dev \
+# uv 走 pip 安装（可指国内 PyPI 镜像）；GitHub 直连不可达的环境靠 ortlocal 免下载
+ARG PIP_INDEX_URL=https://mirrors.aliyun.com/pypi/simple
+RUN pip install --index-url "$PIP_INDEX_URL" uv \
+    && if [ -f /tmp/ortlocal/libonnxruntime.so.1.28.2 ]; then \
+           cp /tmp/ortlocal/libonnxruntime.so.1.28.2 /tmp/; \
+       else \
+           curl -sL "$ORT_URL" -o /tmp/ort.tgz \
+           && ([ "$ORT_SHA" = SKIP ] || echo "$ORT_SHA  /tmp/ort.tgz" | sha256sum -c -) \
+           && tar xzf /tmp/ort.tgz -C /tmp --strip-components=2 \
+              onnxruntime-linux-x64-1.28.2/lib/libonnxruntime.so.1.28.2; \
+       fi \
+    && UV_DEFAULT_INDEX="$PIP_INDEX_URL" uv sync --frozen --no-dev \
     && SITE=/app/.venv/lib/python3.12/site-packages \
     && cp /tmp/libonnxruntime.so.1.28.2 "$SITE/sherpa_onnx/lib/" \
     && ln -sf "$SITE/sherpa_onnx/lib/libonnxruntime.so.1.28.2" \
