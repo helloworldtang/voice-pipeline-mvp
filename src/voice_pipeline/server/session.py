@@ -104,6 +104,9 @@ class Session:
         if asr is None and llm is None and tts is None:
             providers = build_providers("real" if real else "sim")
             asr, llm, tts = providers.asr, providers.llm, providers.tts
+        # 账单里标注 LLM 引擎：SimLlm 意味着该轮数字不含 LLM（缺 key 静默退回），
+        # 这份验收记录就不能当真实延迟用——让 report_turns 能机器判读这一点。
+        self._llm_name = type(llm).__name__ if llm is not None else "SimLlm"
         deps: dict[str, object] = {
             "asr": asr or SimAsr(),
             "llm": llm or SimLlm(),
@@ -311,6 +314,7 @@ class Session:
             bill=bill,
             extra={
                 "interrupted": self.interrupted,
+                "llm": self._llm_name,
                 "user_text": user_text or "",
                 "assistant_text": "".join(assistant_parts),
             },

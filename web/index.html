@@ -14,6 +14,14 @@
   header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
   header h1 { font-size: 18px; margin: 0; flex: 1; }
   #status { font-size: 12px; opacity: .7; }
+  #dot { width: 9px; height: 9px; border-radius: 50%; background: #666; }
+  #dot.listening { background: #34a853; animation: pulse 1.2s infinite; }
+  #dot.thinking { background: #fbbc04; }
+  #dot.speaking { background: #8ab4f8; }
+  @keyframes pulse { 50% { opacity: .4; } }
+  #howto { font-size: 12px; color: #9aa3b2; background: #1c2028; border: 1px solid #2a3140;
+           border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; line-height: 1.8; }
+  #howto b { color: #c7cdd8; }
   #controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
   #controls input, #controls select, #controls button {
     background: #1c2028; color: inherit; border: 1px solid #333a46;
@@ -36,8 +44,16 @@
 <body>
 <header>
   <h1>voice-pilot</h1>
+  <span id="dot"></span>
   <span id="status">未连接</span>
 </header>
+
+<div id="howto">
+  <b>验收三式</b>：① 正常说完整句后<b>停住别补话</b>，等 AI 接（基准轮）；
+  ② 句中<b>停顿半秒再接着说</b>，看 AI 会不会抢答（抢话测试）；
+  ③ AI 播报中<b>直接插话「等一下」</b>，看它是否立刻停并等你说完（打断测试）。
+  状态点：绿=聆听中 · 黄=思考中 · 蓝=播报中。
+</div>
 
 <div id="controls">
   <input id="token" type="password" placeholder="token（可空）" style="width:130px">

@@ -97,6 +97,8 @@ def render(records: list[dict[str, Any]], source: str) -> str:
         return f"# 验收记录\n\n来源 `{source}`：**没有任何账单行**，无法出结论。\n"
 
     sessions = sorted({r.get("session_id", "?") for r in records})
+    llm_engines = {str(r.get("llm", "?")) for r in records}
+    llm_names = sorted(llm_engines)
     modes = sorted({r.get("mode", "?") for r in records})
     complete = [r for r in records if not r.get("interrupted")]
     interrupted = [r for r in records if r.get("interrupted")]
@@ -105,8 +107,18 @@ def render(records: list[dict[str, Any]], source: str) -> str:
         "# 真人验收记录（由脚本从账单 JSONL 生成）",
         "",
         f"> 来源：`{source}`　会话数：{len(sessions)}　模式：{', '.join(modes)}　"
-        f"轮次：{len(records)}（完整 {len(complete)} / 被打断 {len(interrupted)}）",
+        f"轮次：{len(records)}（完整 {len(complete)} / 被打断 {len(interrupted)}）"
+        f"　LLM：{', '.join(llm_names)}",
         "",
+        *(
+            [
+                "> ⚠️ **LLM 引擎包含 SimLlm——这些轮次不含真 LLM 延迟，本记录的口径B "
+                "只是本机侧下界，不能当真实延迟报**（多半是起服务时缺 DASHSCOPE_API_KEY）。",
+                "",
+            ]
+            if llm_engines - {"QwenLlm"}
+            else []
+        ),
         "> 本文件由 `scripts/report_turns.py` 生成，数字全部来自落盘账单，未经人工修饰。",
         "",
         "## 一、口径B 分布（完整轮次）",

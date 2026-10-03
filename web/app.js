@@ -24,6 +24,15 @@ const state = {
   beginSent: false,
 };
 
+// ---- 状态指示 -----------------------------------------------------------------
+// 绿=聆听 黄=思考 蓝=播报：抢话/打断测试都要求用户知道 AI 此刻在干什么，
+// 没有状态点就只能靠耳朵猜——验收体验的第一刚需。
+function setState(kind, text) {
+  const dot = $("dot");
+  dot.className = kind || "";
+  if (text) $("status").textContent = text;
+}
+
 // ---- 转写区 -----------------------------------------------------------------
 
 function addLine(cls, text) {
@@ -34,20 +43,40 @@ function addLine(cls, text) {
   return li;
 }
 
+let pendingPartial = null;
+
 function setPartial(text) {
-  let el = document.querySelector("#log .partial:last-of-type");
-  if (!el) el = addLine("partial", "");
-  el.textContent = text;
+  if (!text) return; // 空 partial 不占行
+  if (!pendingPartial || !pendingPartial.isConnected) pendingPartial = addLine("partial", "");
+  pendingPartial.textContent = text;
 }
+
+function settlePartial(finalText) {
+  // final 落定：灰行升级为正式行（同一句话不再显示两遍）
+  if (pendingPartial && pendingPartial.isConnected && finalText) {
+    pendingPartial.className = "user";
+    pendingPartial.textContent = finalText;
+    pendingPartial = null;
+    return;
+  }
+  pendingPartial = null;
+  if (finalText) addLine("user", finalText);
+}
+
+let lastTailMs = null; // 停播队列残余（打断取证），跟随下一轮 chips 一起呈现
 
 function setChips(metrics) {
   const chips = [];
   if (metrics.caliber_b_ms >= 0) chips.push(["口径B", Math.round(metrics.caliber_b_ms) + "ms"]);
+  else if (metrics.barge_in_count > 0) chips.push(["打断轮", "无首音"]);
   if (metrics.eou_latency_ms >= 0) chips.push(["判停", Math.round(metrics.eou_latency_ms) + "ms"]);
+  if (metrics.premature_eou === 1.0) chips.push(["抢话", "已记"]);
+  if (metrics.barge_in_count > 0) chips.push(["打断", `×${metrics.barge_in_count}`]);
   const llm = metrics.llm_first_token - metrics.utterance_end;
   if (Number.isFinite(llm) && metrics.llm_first_token >= 0) chips.push(["LLM首token", Math.round(llm) + "ms"]);
   const tts = metrics.tts_first_chunk - metrics.first_sentence_done;
   if (Number.isFinite(tts) && metrics.tts_first_chunk >= 0) chips.push(["TTS首片", Math.round(tts) + "ms"]);
+  if (lastTailMs !== null) chips.push(["丢弃队列", lastTailMs + "ms"]);
   $("chips").innerHTML = chips.map(([k, v]) => `<span class="chip">${k} <b>${v}</b></span>`).join("");
 }
 
@@ -80,10 +109,7 @@ function stopPlayback() {
   if (ctx && state.nextStart > ctx.currentTime) {
     const tailMs = Math.round((state.nextStart - ctx.currentTime) * 1000);
     console.info(`[voice-pilot] 停播：队列残余 ${tailMs}ms（未出声即被丢弃）`);
-    const chip = document.createElement("span");
-    chip.className = "chip";
-    chip.textContent = `丢弃队列 ${tailMs}ms`;
-    $("chips").appendChild(chip);
+    lastTailMs = tailMs;
   }
   state.playSources.forEach((s) => { try { s.stop(); } catch { /* already ended */ } });
   state.playSources = [];
@@ -128,6 +154,7 @@ async function startMic() {
   state.micOn = true;
   $("mic").textContent = "关麦";
   $("mic").classList.add("on");
+  setState("listening", "聆听中——请说话");
 }
 
 function stopMic() {
@@ -153,20 +180,27 @@ function handleEvent(ev) {
         state.beginSent = true;
         $("status").textContent = "已连接，等待会话…";
       } else {
-        $("status").textContent = "就绪";
+        setState("", "就绪——点「开麦」开始");
         $("mic").disabled = false;
       }
       break;
+    case "turn.start": setState("thinking", "思考中…"); break;
     case "asr.partial": setPartial(ev.text); break;
-    case "asr.final": addLine("user", ev.text); break;
+    case "asr.final": settlePartial(ev.text); break;
     case "tts.sentence": addLine("assistant", ev.text); break;
-    case "turn.end": setChips(ev.metrics || {}); break;
-    case "audio.stop": stopPlayback(); break;
+    case "turn.end":
+      setChips(ev.metrics || {});
+      setState("listening", "聆听中");
+      break;
+    case "audio.stop":
+      stopPlayback();
+      setState("listening", "已打断，聆听中");
+      break;
     case "error":
       addLine("err", `错误 ${ev.code}: ${ev.message}`);
       break;
     case "session.closed":
-      $("status").textContent = "会话已关闭";
+      setState("", "会话已关闭");
       break;
     default: break;
   }
@@ -189,16 +223,17 @@ function connect() {
       try { ev = JSON.parse(msg.data); } catch { return; }
       handleEvent(ev);
     } else {
+      setState("speaking", "播报中");
       playPcm16(msg.data);
     }
   };
   state.ws.onclose = () => {
-    $("status").textContent = "连接断开";
+    setState("", "连接断开");
     $("mic").disabled = true;
     stopPlayback();
     // 自动重连：指数退避，上限 15s。手动关麦不重连。
     const delay = Math.min(15000, 1000 * 2 ** state.reconnectAttempt++);
-    $("status").textContent = `断开，${Math.round(delay / 1000)}s 后重连…`;
+    setState("", `断开，${Math.round(delay / 1000)}s 后重连…`);
     if (state.micOn) setTimeout(connect, delay);
   };
   state.ws.onerror = () => { /* onclose 会接手 */ };
