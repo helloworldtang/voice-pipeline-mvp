@@ -14,6 +14,7 @@ from voice_pipeline.providers.factory import build_llm
 from voice_pipeline.providers.llm.qwen_llm import (
     API_KEY_ENV,
     DEFAULT_MODEL,
+    DEFAULT_SYSTEM,
     QwenLlm,
     build_messages,
     iter_content,
@@ -118,3 +119,15 @@ def test_build_messages_passes_history_verbatim() -> None:
     history = [{"role": "user", "content": "问话"}]
     build_messages("系统提示", history, "下一句")
     assert history == [{"role": "user", "content": "问话"}]
+
+
+def test_system_prompt_env_overrides_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """首句字数是剩余唯一性能杠杆（~79ms/字），必须免改代码可调。"""
+    monkeypatch.setenv(API_KEY_ENV, "sk-test-not-used")
+    monkeypatch.setenv("VOICE_LLM_SYSTEM", "十个字以内回答。")
+    llm = QwenLlm()
+    assert llm._system == "十个字以内回答。"
+    # 显式参数优先于 env
+    assert QwenLlm(system="自定义。")._system == "自定义。"
+    monkeypatch.delenv("VOICE_LLM_SYSTEM")
+    assert QwenLlm()._system == DEFAULT_SYSTEM

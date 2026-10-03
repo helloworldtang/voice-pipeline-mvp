@@ -33,11 +33,18 @@ import httpx
 logger = logging.getLogger(__name__)
 
 API_KEY_ENV = "DASHSCOPE_API_KEY"
+SYSTEM_ENV = "VOICE_LLM_SYSTEM"
 DEFAULT_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 DEFAULT_MODEL = "qwen-flash"
 
 # 语音助理口径：答案越短，首完整句到得越早——这直接压的是口径B 里 LLM 那一格。
+# 这是流程拆解后「唯一剩下的真实杠杆」（~79ms/字），所以必须能用环境变量
+# VOICE_LLM_SYSTEM 调——否则每次实验都要改代码。
 DEFAULT_SYSTEM = "你是语音助手。回答要短，一句话说完，不要 markdown，不要用列表。直接给结论。"
+
+
+def _resolve_system(system: str | None) -> str:
+    return system or os.environ.get(SYSTEM_ENV) or DEFAULT_SYSTEM
 
 
 def iter_content(lines: Iterable[str]) -> Iterator[str]:
@@ -104,7 +111,7 @@ class QwenLlm:
         *,
         api_key: str | None = None,
         base_url: str = DEFAULT_BASE_URL,
-        system: str = DEFAULT_SYSTEM,
+        system: str | None = None,
         max_tokens: int = 256,
         timeout_s: float = 30.0,
     ) -> None:
@@ -117,7 +124,7 @@ class QwenLlm:
         self.model = model
         self._api_key = resolved
         self._base_url = base_url
-        self._system = system
+        self._system = _resolve_system(system)
         self._max_tokens = max_tokens
         self._timeout_s = timeout_s
 
