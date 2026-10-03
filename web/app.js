@@ -72,6 +72,19 @@ function playPcm16(arrayBuffer) {
 }
 
 function stopPlayback() {
+  // 尾音量化（差距表「打断尾音未量化」，2026-10-03）：停播时刻播放队列里
+  // 还排着多少未出声的音频。nextStart 是背靠背排程的末端，与 currentTime
+  // 之差 = 打断发生时「已被服务端下发、但还没轮到出声」的总量——被丢弃的
+  // 正是这一段。真正的尾音（OS 音频管线里已在途的毫秒级）测不到，如实留白。
+  const ctx = state.playCtx;
+  if (ctx && state.nextStart > ctx.currentTime) {
+    const tailMs = Math.round((state.nextStart - ctx.currentTime) * 1000);
+    console.info(`[voice-pilot] 停播：队列残余 ${tailMs}ms（未出声即被丢弃）`);
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.textContent = `丢弃队列 ${tailMs}ms`;
+    $("chips").appendChild(chip);
+  }
   state.playSources.forEach((s) => { try { s.stop(); } catch { /* already ended */ } });
   state.playSources = [];
   state.nextStart = 0;

@@ -1,0 +1,26 @@
+# voice-pilot 容器编排：模型与密钥都不进镜像/不进仓。
+#   mkdir -p models && ./scripts/download_models.sh   # 模型落到仓内 models/
+#   cp deploy/voice-pilot.env.example voice-pilot.env && 填 key/token
+#   docker compose -f deploy/compose.yml up -d
+services:
+  voice-pilot:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: voice-pilot:latest
+    restart: unless-stopped
+    env_file: voice-pilot.env
+    volumes:
+      - ../models:/models:ro
+    ports:
+      # 只绑本机：公网出口交给反代（caddy/nginx），与 systemd 部署同边界
+      - "127.0.0.1:8000:8000"
+    deploy:
+      resources:
+        limits:
+          memory: 1200M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
