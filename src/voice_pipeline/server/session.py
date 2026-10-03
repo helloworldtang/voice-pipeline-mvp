@@ -184,11 +184,14 @@ class Session:
     def _collect_eou_metrics(self) -> None:
         """把 FusedEou 的验收指标抓进账单。**必须在本轮 reset 之前调用**。
 
-        reset 会清掉静音计时与抢话/漏判标志，采晚了 eou_latency_ms 就是 0 ——
+        reset 会清掉静音计时与漏判标志，采晚了 eou_latency_ms 就是 0 ——
         而 0 看起来像个正常数字，不像缺失，所以这个失效能潜伏一整个里程碑。
+
+        ⚠️ 这里**不采** premature_eou：抢话的证据窗口在判停后 ~300ms，证据落在
+        reset **之后**才出现（reset 现在会把观察窗带过去，见 FusedEou.reset）。
+        采的动作移到 `_record_turn`——账单定型那一刻用 `take_premature()` 读走。
         """
         if isinstance(self._eou, FusedEou):
-            self.metrics.premature_eou = self._eou.premature_eou
             self.metrics.missed_eou = self._eou.missed_eou
             self.metrics.eou_latency_ms = self._eou.eou_latency_ms()
             self.metrics.eou_mode = self._gating.value
@@ -290,6 +293,14 @@ class Session:
         被打断的轮次 `first_audio_out` 可能未打点（AI 还没出声就被掐了），
         那时口径B 如实为 -1（缺失），不做推测填补。
         """
+        # 抢话取证在记账这一刻才定型：证据窗口横跨判停后的 reset（见
+        # _collect_eou_metrics 的警告）。bill 是调度器在 TurnEnd 构造时就定型的
+        # dict，此刻改 self.metrics 已经晚了——直接改写账单本身。take 读后即清，
+        # 防上一轮幽灵污染下一轮。
+        if isinstance(self._eou, FusedEou):
+            premature = self._eou.take_premature()
+            self.metrics.premature_eou = premature
+            bill = {**bill, "premature_eou": 1.0 if premature else 0.0}
         self._recorded_this_turn = True
         self._turn_index += 1
         self._recorder.record(

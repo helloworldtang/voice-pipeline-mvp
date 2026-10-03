@@ -232,7 +232,7 @@ uv run python scripts/live_client.py --url ws://localhost:8000/ws   # 需 pyaudi
 | **回声抑制未做（降级为已知代价）** | barge-in 仅 L1 能量判定 | 脚本客户端外放会自激误触发；**浏览器端靠 AEC 免耳机，live_client 仍需入耳式耳机物理隔离** | 文本↔ASR 重合抑制 / 软件 AEC（二期） |
 | **JSONL 事件流已落地**（2026-09-27，从缺口转交付） | `metrics/jsonl.py`：每轮一行，含 waterfall 各点 + 双份文本；`VOICE_EVENTS_JSONL` 启用（默认关，零副作用） | 首日就拦下一个静默错的账单字段（`eou_mode` 漏 `neural` 默认档） | 多 worker 部署需换集中式收集 |
 | **打断尾音未量化** | `barge_in_latency_ms` 只记服务端检测时刻 | 不含客户端播放缓冲残留音频的实际停播耗时 | 需带播放队列的真机测量 |
-| **`premature_eou` 恒为 0（分析盲区）** | `run_turn` 采完指标就 `eou.reset()`，把「判停后又出现人声」的证据擦掉 | **一等验收指标（抢话率）实际不可用**——它看着像「没抢话」，不反映任何东西 | 判定窗需跨过 reset 保留；在那之前抢话只能靠耳朵听 |
+| `premature_eou` 恒为 0（分析盲区） | `run_turn` 采完指标就 `eou.reset()`，把「判停后又出现人声」的证据擦掉 | 一等验收指标（抢话率）曾不可用 | ✅ 已修（2026-10-03）：观察窗跨 reset 存活 + `take_premature()` 记账时读走；真链路复验切轮账单记 1.0 |
 | **默认档 `neural` 句内停顿切轮** | 受控实验：同音频下 `neural` 把「今天上海天气怎么样」切成 `今` + `海天气怎么样` 两轮，`conservative` 完整 | ⚠️ 样本是 TTS 合成语音（内部静音实测 150~240ms > 100ms 确认窗），**真人是否切轮未验**；若真人也切，默认档要退回 `conservative` | 真人验收现场复现；必要时加「最少说话时长」护栏 |
 | **scripted 客户端未做** | 只有 live（`scripts/live_client.py`） | CI 里没有「回放固定音频走 WS」的确定性回归 | 补 `client/scripted_client.py` |
 | **有界队列未接线** | `DualPriorityQueue` 已实现且有单测，但 WS 主链路用的是**无界 outbox** | 背压/丢弃计数在真实链路未生效 | 接进 `server/app.py` |

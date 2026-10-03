@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from voice_pipeline.core.eou import GatingMode
+from voice_pipeline.core.eou import FusedEou, GatingMode
 from voice_pipeline.metrics.events import TurnMetrics
 from voice_pipeline.metrics.jsonl import ENV_PATH, TurnRecorder
 from voice_pipeline.providers.asr.sim_asr import SimAsr
@@ -172,3 +172,50 @@ def test_every_gating_mode_has_a_bill_code() -> None:
 def test_bill_code_marks_missing_only_when_unset() -> None:
     """-1 的语义是“未用判停器”。没设档位时才允许是 -1。"""
     assert TurnMetrics().bill()["eou_mode"] == -1.0
+
+
+def _frame(amp: int, ms: int = 100, sr: int = 16000) -> bytes:
+    import struct
+
+    return struct.pack("<" + "h" * (sr * ms // 1000), *([amp] * (sr * ms // 1000)))
+
+
+async def test_premature_eou_lands_in_bill_and_does_not_leak(tmp_path: Path) -> None:
+    """抢话取证闭环：判停后又开口 → 该轮账单 premature_eou=1；且读后即清，
+    下一轮干净账不被上一轮的幽灵污染。
+
+    修前症状（真链路验收 §5）：run_turn 采完指标立即 reset，把 _decided 清掉，
+    抢话率恒为 0——一个恒定报 0 的指标比缺指标更危险。
+    """
+    rec = TurnRecorder(str(tmp_path / "turns.jsonl"))
+    # amp=500 → RMS≈0.015：高于 EOU 人声阈（0.01）、低于 barge-in 阈（0.02），
+    # 这样判停后补的这帧只触发抢话取证，不触发打断。
+    session = Session(
+        mode="real-serial",
+        asr=SimAsr(),
+        llm=SimLlm(),
+        tts=SimTts(),
+        eou=FusedEou(gating=GatingMode.CONSERVATIVE, min_silence_ms=100.0),
+        recorder=rec,
+    )
+    speech, silence = _frame(500), _frame(0)
+
+    for _ in range(3):
+        await session.on_audio(speech)  # 300ms 人声 ≥ min_speech
+    for _ in range(2):
+        await session.on_audio(silence)  # 200ms 静音 ≥ 100ms → 判停
+    assert session.pending_end()
+    await session.on_audio(speech)  # 判停后立刻又开口 → 抢话证据
+    await session.run_turn()
+
+    # 第 2 轮：干净轮，不应继承上一轮的抢话标志
+    for _ in range(3):
+        await session.on_audio(speech)
+    for _ in range(2):
+        await session.on_audio(silence)
+    await session.run_turn()
+
+    rows = [json.loads(line) for line in (tmp_path / "turns.jsonl").read_text().splitlines()]
+    assert len(rows) == 2
+    assert rows[0]["premature_eou"] == 1.0, "判停后开口的轮次必须记为抢话"
+    assert rows[1]["premature_eou"] == 0.0, "下一轮不得继承上一轮的幽灵标志"

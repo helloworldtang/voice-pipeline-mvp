@@ -212,3 +212,48 @@ def test_conservative_survives_intra_sentence_pause() -> None:
     assert not eou.should_end(), "350ms 句内停顿就判停 = 抢话"
     eou.push_audio(_silence(200))  # 累计 550ms ≥ 500ms 阈值
     assert eou.should_end(), "真说完（静音 ≥500ms）应判停"
+
+
+def test_premature_window_survives_reset():
+    """抢话观察窗横跨 reset：run_turn 采完指标立即 reset，判停后的人声大多落在
+    reset 之后——reset 把 _decided 清掉曾经让 premature_eou 恒为 0（系统性漏报，
+    真链路验收 2026-09-27 §5 抓到）。"""
+    det = FusedEou(gating=GatingMode.CONSERVATIVE, min_silence_ms=300.0)
+    for _ in range(3):
+        det.push_audio(_speech(100))
+    for _ in range(3):
+        det.push_audio(_silence(100))
+    assert det.should_end()
+    det.reset()  # Session.run_turn 在判停后立即做这件事
+
+    det.push_audio(_silence(100))  # 静音继续走窗口（帧时长计）
+    det.push_audio(_speech(100))  # 判停后 ~200ms 又开口 → 在 300ms 窗内
+    assert det.premature_eou, "reset 后窗口内的人声必须仍能记为抢话"
+
+
+def test_premature_window_expires_across_reset():
+    """窗口过期后就不再记：判停半秒后才开口是新一轮说话，不是抢话。"""
+    det = FusedEou(gating=GatingMode.CONSERVATIVE, min_silence_ms=300.0)
+    for _ in range(3):
+        det.push_audio(_speech(100))
+    for _ in range(3):
+        det.push_audio(_silence(100))
+    assert det.should_end()
+    det.reset()
+    for _ in range(4):  # 400ms > 300ms 窗口，耗尽残余
+        det.push_audio(_silence(100))
+    det.push_audio(_speech(100))
+    assert not det.premature_eou
+
+
+def test_take_premature_reads_once_and_clears():
+    """读后即清：上一轮的幽灵标志不许污染下一轮的账。"""
+    det = FusedEou(gating=GatingMode.CONSERVATIVE, min_silence_ms=300.0)
+    for _ in range(3):
+        det.push_audio(_speech(100))
+    for _ in range(3):
+        det.push_audio(_silence(100))
+    assert det.should_end()
+    det.push_audio(_speech(100))
+    assert det.take_premature() is True
+    assert det.take_premature() is False  # 已清

@@ -329,11 +329,14 @@ class FusedEou:
         self._last_terminal_ms = -math.inf  # 韵律终顿最近一次成立的时刻（锁存）
         self._decided = False
         self._decided_at_ms = 0.0
+        # 抢话观察窗的「残余量」：reset 不抹掉证据（见 reset 的注释）
+        self._premature_watch_ms = 0.0
         self.premature_eou = False
         self.missed_eou = False
 
     def push_audio(self, chunk: bytes) -> None:
-        self._elapsed += _frame_ms(chunk, self.sample_rate)
+        frame_ms = _frame_ms(chunk, self.sample_rate)
+        self._elapsed += frame_ms
         self._silence.push_audio(chunk)
         if self._prosody is not None:
             self._prosody.push_audio(chunk)
@@ -344,13 +347,17 @@ class FusedEou:
             self._semantic.push_audio(chunk)
         if self._neural is not None:
             self._neural.push_audio(chunk)
-        # 抢话：判停决定之后、窗口内又出现人声 → 这次判停是错的
-        if (
-            self._decided
-            and not self.premature_eou
-            and rms_of(chunk) >= ENERGY_FLOOR
-            and (self._elapsed - self._decided_at_ms) <= self.premature_window_ms
-        ):
+        # 抢话：判停决定之后、窗口内又出现人声 → 这次判停是错的。
+        # 窗口有两条活路：本代表内（_decided 仍真，elapsed 计）；
+        # 或跨过 reset 的残余窗（run_turn 采完指标立即 reset，判停后 300ms 内的
+        # 人声大多落在 reset 之后——老实现在这里把 _decided 清掉，抢话从此恒 0）。
+        if self._decided:
+            in_window = (self._elapsed - self._decided_at_ms) <= self.premature_window_ms
+        else:
+            in_window = self._premature_watch_ms > 0.0
+        if self._premature_watch_ms > 0.0:
+            self._premature_watch_ms -= frame_ms
+        if not self.premature_eou and rms_of(chunk) >= ENERGY_FLOOR and in_window:
             self.premature_eou = True
 
     def update_text(self, partial: str) -> None:
@@ -414,6 +421,15 @@ class FusedEou:
             self._decided_at_ms = self._elapsed
 
     def reset(self) -> None:
+        # 抢话观察窗**横跨 reset**：判停发生在静音里，人声回到窗口内往往在 reset
+        # 之后（Session.run_turn 采完指标立即 reset）。这里把窗口的剩余量带过去，
+        # 按**帧时长**而不是墙钟递减——测试与回放才确定。
+        if self._decided:
+            self._premature_watch_ms = max(
+                0.0, self._decided_at_ms + self.premature_window_ms - self._elapsed
+            )
+        else:
+            self._premature_watch_ms = 0.0
         self._silence.reset()
         if self._prosody is not None:
             self._prosody.reset()
@@ -425,8 +441,22 @@ class FusedEou:
         self._last_terminal_ms = -math.inf
         self._decided = False
         self._decided_at_ms = 0.0
-        self.premature_eou = False
+        # ⚠️ premature_eou **不在 reset 清**：它是「刚过去那次判停」的证据，而账单
+        # 要到 turn.end（秒级之后）才定型——这里清掉等于取证窗口在定型前被抹
+        # （判停后、reset 前开口的那种抢话就丢在缝里）。唯一的清点是 take_premature。
         self.missed_eou = False
+
+    def take_premature(self) -> bool:
+        """读走抢话标志（读后即清，连同残余观察窗）。
+
+        为什么读后即清：标志的取证窗口在判停后 ~300ms，而账单定型在 turn.end
+        （秒级）——Session 必须在**记账时**而不是判停时来读。不清的话，上一轮
+        的幽灵标志会被下一轮 `_collect_eou_metrics` 当成本轮的抢话采走。
+        """
+        value = self.premature_eou
+        self.premature_eou = False
+        self._premature_watch_ms = 0.0
+        return value
 
     def silence_ms(self) -> float:
         return self._silence.silence_ms()
