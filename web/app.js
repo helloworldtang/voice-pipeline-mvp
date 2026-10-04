@@ -24,6 +24,37 @@ const state = {
   beginSent: false,
 };
 
+// ---- 验收剧本（句子是实测选定的：kokoro 合成→真 ASR 回灌打分，满分句优先，
+// 抢话句要求两段都可识别——2026-10-04 测量） ------------------------------------
+const SCRIPT = [
+  { type: "基准", text: "今天上海天气怎么样" },
+  { type: "追问", text: "那明天呢" },
+  { type: "基准", text: "明天要下雨吗" },
+  { type: "基准", text: "给我讲个笑话" },
+  { type: "基准", text: "你会说英语吗" },
+  { type: "抢话", text: "我想订……（停半秒）……明天下午的会议室" },
+  { type: "抢话", text: "帮我查一下……（停半秒）……去北京的火车票" },
+  { type: "抢话", text: "我等会儿……（停半秒）……还要开个会" },
+  { type: "打断", text: "随便问一句，AI 播报中直接说「等一下」" },
+  { type: "打断", text: "再问一句，播报中插话「停一下」" },
+];
+let scriptIdx = 0;
+
+function renderScript() {
+  const ol = $("script-steps");
+  ol.innerHTML = "";
+  SCRIPT.forEach((step, i) => {
+    const li = document.createElement("li");
+    li.className = "step" + (i === scriptIdx ? " current" : "");
+    li.innerHTML = `<span class="tag">${step.type}</span>${step.text}`;
+    li.onclick = () => { scriptIdx = i; renderScript(); };
+    ol.appendChild(li);
+  });
+}
+function advanceScript() {
+  if (scriptIdx < SCRIPT.length - 1) { scriptIdx += 1; renderScript(); }
+}
+
 // ---- 状态指示 -----------------------------------------------------------------
 // 绿=聆听 黄=思考 蓝=播报：抢话/打断测试都要求用户知道 AI 此刻在干什么，
 // 没有状态点就只能靠耳朵猜——验收体验的第一刚需。
@@ -44,6 +75,7 @@ function addLine(cls, text) {
 }
 
 let pendingPartial = null;
+let lastAssistantLi = null;
 
 function setPartial(text) {
   if (!text) return; // 空 partial 不占行
@@ -184,16 +216,37 @@ function handleEvent(ev) {
         $("mic").disabled = false;
       }
       break;
-    case "turn.start": setState("thinking", "思考中…"); break;
+    case "turn.start": setState("thinking", "思考中…"); lastAssistantLi = null; break;
     case "asr.partial": setPartial(ev.text); break;
-    case "asr.final": settlePartial(ev.text); break;
-    case "tts.sentence": addLine("assistant", ev.text); break;
-    case "turn.end":
-      setChips(ev.metrics || {});
+    case "asr.final":
+      settlePartial(ev.text);
+      if (ev.text) advanceScript(); // 念完一句（转写非空）自动亮下一句
+      break;
+    case "tts.sentence": lastAssistantLi = addLine("assistant", ev.text); break;
+    case "turn.end": {
+      const m = ev.metrics || {};
+      // 耗时是验收指标，跟着对话行走（一眼可查），chips 仍是最近一轮的完整账
+      if (lastAssistantLi) {
+        const lat = document.createElement("span");
+        lat.className = "lat";
+        lat.textContent = m.caliber_b_ms >= 0
+          ? `⏱${Math.round(m.caliber_b_ms)}ms`
+          : m.barge_in_count > 0 ? "⏱—（被打断）" : "";
+        lastAssistantLi.appendChild(lat);
+      }
+      setChips(m);
       setState("listening", "聆听中");
       break;
+    }
     case "audio.stop":
       stopPlayback();
+      // 打断轮服务端不补 turn.end（轮次作废），耗时标注挂这里
+      if (lastAssistantLi) {
+        const lat = document.createElement("span");
+        lat.className = "lat";
+        lat.textContent = "（被打断）";
+        lastAssistantLi.appendChild(lat);
+      }
       setState("listening", "已打断，聆听中");
       break;
     case "error":
@@ -254,4 +307,5 @@ $("mic").addEventListener("click", async () => {
   }
 });
 
+renderScript();
 connect();
