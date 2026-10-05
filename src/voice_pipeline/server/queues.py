@@ -85,12 +85,21 @@ class OutboundQueue:
     # ---- 消费（唯一发送协程调用） ---------------------------------------------
 
     async def get(self) -> Entry:
-        """先杀停后主道；都空则等待。**出队不递减完成数**——那是 task_done 的职责。"""
+        """先杀停后主道；都空则等待。
+
+        **出队不递减完成数**（那是 task_done 的职责），但音频占用计数在这里减——
+        它度量的是车道占用而非未完成发送。真人验收实测踩坑：只增不减的话，
+        累计下发 200 帧音频（约 40s 内容）后每个新音频都误报「积压超限」并
+        可能真丢队列里的新音频（2026-10-04 验收日志 100+ 条误报、误丢 7 对）。
+        """
         while True:
             if self._kill:
                 return self._kill.popleft()
             if self._main:
-                return self._main.popleft()
+                entry = self._main.popleft()
+                if entry.data is not None:
+                    self._audio_in_main -= 1
+                return entry
             self._event.clear()
             await self._event.wait()
 

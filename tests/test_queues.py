@@ -74,3 +74,20 @@ async def test_join_waits_until_drained() -> None:
     await q.join()
     assert drained == ["a", "b"]
     task.cancel()
+
+
+async def test_audio_counter_decreases_on_consume() -> None:
+    """回归（2026-10-04 真人验收）：占用计数只增不减 → 累计 200 帧后每个新音频
+    都误报积压超限、甚至误丢队列里的新音频。消费必须递减。"""
+    q = OutboundQueue(max_audio_frames=5)
+    for round_ in range(3):  # 3 轮 × 5 帧 = 15 帧，远超 5 的上限
+        for i in range(5):
+            q.put_audio(f'{{"r{round_}:{i}"}}', b"x")
+        for _ in range(5):
+            await q.get()
+            q.task_done()
+    assert q.dropped_audio == 0, "消费及时时绝不许误报丢弃"
+    q.put_audio('{"last"}', b"y")
+    entry = await q.get()
+    q.task_done()
+    assert entry.data == b"y", "误报路径还会把刚入队的新音频丢掉"

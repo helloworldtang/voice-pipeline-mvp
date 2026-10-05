@@ -64,12 +64,14 @@ class Session:
         clock: SessionClock | None = None,
         grace_ms: float = 0.0,
         eou: EouDetector | None = None,
+        # 默认 conservative（第四次定档，2026-10-04）：neural 在真人半秒停顿下
+        # 抢话 3/3（D5 真人验收），退回。前三次定档史见下方注释。
         # 默认 neural（D2 实测后从 conservative 切过来，2026-09-22）：
         # 官方测试集受控实验（中文 n=335）静音 100ms + 神经判停 → 句末检出 70%、
         # 句中抢话 4.6%；静音窗要 500ms 才敢判停，而句中停顿一到 500ms 就 100% 抢话。
         # 神经档 70% 的轮次 ~100ms 就判停，剩下 30% 走 800ms 兜底（期望 ≈310ms）。
         # 缺权重时 build_eou 退回 conservative 并告警 —— 账单 eou_mode 会如实写回。
-        gating: GatingMode = GatingMode.NEURAL,
+        gating: GatingMode = GatingMode.CONSERVATIVE,
         recorder: TurnRecorder | None = None,
     ) -> None:
         self.session_id = uuid4().hex[:12]
@@ -99,6 +101,9 @@ class Session:
         self._eou_collected = False
         # 空转写门的连续拦截计数（见 pending_end）
         self._empty_blocks = 0
+        # 空轮冷却：放行过一个空转写轮后，判停必须等新的人声再启动——否则持续
+        # 的环境噪声/回声能量会以 ~1Hz 空转出账单（2026-10-04 验收实测 64 条）
+        self._await_fresh_speech = False
 
         real = mode.startswith("real-") or mode == "real"
         spec_mode = mode.removeprefix("real-")
@@ -143,6 +148,8 @@ class Session:
                 self._eou.push_audio(chunk)
             return [AudioFragment(seq=self.frames_echoed, data=chunk)]
         await self._scheduler.on_audio(chunk)
+        if self._barge.is_speech(chunk):
+            self._await_fresh_speech = False
         if self._eou is not None:
             self._eou.push_audio(chunk)
             self._eou.update_text(self._scheduler.text())
@@ -171,6 +178,8 @@ class Session:
         """
         if self._eou is None:
             return False
+        if self._await_fresh_speech:
+            return False  # 空轮冷却中：等新的人声（on_audio 里清这个标志）
         if not self._eou.should_end():
             return False
         if self._scheduler is not None and not self._scheduler.text():
@@ -180,6 +189,8 @@ class Session:
                 # 喂不回 VAD，EOU 永远再闩不上、计数走不到放行（实测卡死）。
                 self._eou.unlatch()
                 return False
+            # 放行的是空轮：进入冷却，直到下一阵真实人声
+            self._await_fresh_speech = True
         return True
 
     def barge_in(self, *, source: str = "mic") -> bool:

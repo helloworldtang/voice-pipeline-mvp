@@ -44,7 +44,11 @@ class SessionBegin(BaseModel):
     #   官方测试集受控实验（中文 n=335）：静音 100ms + 神经判停 → 句末检出 70%、
     #   句中抢话 4.6%；conservative 要等 500ms 才判停，而句中停顿一旦到 500ms 就 100% 抢。
     # 缺权重时 build_eou 会退回 conservative 并告警，那时账单里的 eou_mode 是 conservative。
-    gating: GatingMode = GatingMode.NEURAL
+    # 默认档第四次定档（2026-10-04，真人验收 D5）：neural 的 100ms 确认窗在真人
+    # 半秒停顿下抢话 3/3（"我想"/"帮我查一下"/"我等会儿"全部在停顿处抢答），
+    # 退回 conservative（判停 100→500ms，换 0% 抢话）。neural 仍是可选项：
+    # 说话不停顿的场景它快 400ms。
+    gating: GatingMode = GatingMode.CONSERVATIVE
     # pipelined 专用：EOU 后最多再等多少毫秒让投机落地（0 = 不等，没好就走串行）。
     # 本机实测 grace=0 时 6/6 全未命中，grace=300 才吃到那唯一一次 179ms。
     grace_ms: float = 0.0

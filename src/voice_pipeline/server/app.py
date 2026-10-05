@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import secrets
 from collections.abc import AsyncIterator, MutableMapping
 from contextlib import asynccontextmanager
@@ -45,6 +46,8 @@ from .queues import OutboundQueue
 from .session import Session
 
 # 浏览器客户端默认位置：仓根 web/（src 布局运行时可达；Settings.web_dir 可覆盖）
+logger = logging.getLogger(__name__)
+
 DEFAULT_WEB_DIR = Path(__file__).resolve().parents[3] / "web"
 
 
@@ -203,11 +206,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     break
 
                 if isinstance(frame, Interrupt) and not session.barge_in(source="client"):
-                    # 客户端主动打断（按键 / 本地回声检测）：触发三层 barge-in；
-                    # 没有进行中的轮次则回 no_active_turn 错误。
-                    await websocket.send_text(
-                        dump_event(ErrorEvent(code="no_active_turn", message="no turn in progress"))
-                    )
+                    # 客户端本地打断是「快路径」，经常在服务端轮次已结束后由播放
+                    # 尾音再触发一次（2026-10-04 验收：两轮打断各跟一条误报）。
+                    # 此时无事可停，静默丢弃即可——报错只会污染验收界面。
+                    logger.debug("interrupt with no active turn: dropped")
         except WebSocketDisconnect:
             return
         finally:

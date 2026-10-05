@@ -229,6 +229,7 @@ function handleEvent(ev) {
       if (lastAssistantLi) {
         const lat = document.createElement("span");
         lat.className = "lat";
+        lat.title = "口径B：EOU 判定说完 → AI 首音到达（不含说话时长与判停等待）";
         lat.textContent = m.caliber_b_ms >= 0
           ? `⏱${Math.round(m.caliber_b_ms)}ms`
           : m.barge_in_count > 0 ? "⏱—（被打断）" : "";

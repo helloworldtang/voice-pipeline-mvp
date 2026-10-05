@@ -63,17 +63,18 @@ def test_unknown_mode_is_rejected() -> None:
         parse_client_frame(json.dumps({"type": "session.begin", "mode": "turbo"}))
 
 
-def test_default_gating_is_neural_not_semantic() -> None:
-    """默认档是 neural（D2 实测后的第三次定档），**不是** semantic。
+def test_default_gating_is_conservative_after_human_trials() -> None:
+    """默认档是 conservative（第四次定档，2026-10-04 真人验收 D5）。
 
-    semantic 已经被实测否掉两次：它的 L2「终顿」是黏性锁存（说话中任意一帧能量跌到
-    峰值 40% 以下就永久置真），句内停顿 250~350ms 下抢话 20~40%
-    （`scripts/probe_premature.py`）。neural 换掉的就是这个 L2。
+    定档史：semantic 被否两次（L2 终顿黏性锁存，句内停顿 250~350ms 抢话
+    20~40%）→ neural 上位（合成语音受控实验 70.4% 检出/4.6% 抢话）→
+    **真人验收否掉 neural 默认**：半秒句中停顿下抢话 3/3（"我想"/"帮我查一下"/
+    "我等会儿"全部在停顿处抢答），100ms 确认窗扛不住真人停顿。
 
-    防回退：有人为了「不引模型依赖」改回 conservative，代价是判停延迟 500ms；
-    有人为了「快」改回 semantic，代价是每 3~5 句抢一次话。
+    防回退：改回 neural 默认前先跑真人抢话三连测（手册剧本 6-8 句）——
+    合成语音的内部静音与真人停顿不是同一分布，这正是 D5 的教训。
     """
-    assert SessionBegin().gating is GatingMode.NEURAL
+    assert SessionBegin().gating is GatingMode.CONSERVATIVE
 
 
 def test_neural_gating_travels_on_the_wire() -> None:

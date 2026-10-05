@@ -148,8 +148,10 @@ WS 协议：`session.begin{mode, gating, grace_ms}` → 上行 PCM16 音频帧 �
 | `pipelined` | **实验组**：用户说话期间投机跑 LLM+TTS（sim 三替身），唯一能逼近 300ms 的路径 |
 | `real` / `real-serial` / `real-pipelined` | 同上，换真模型真 LLM（缺模型会明确报错） |
 
-`gating` 四档 `conservative|semantic|aggressive|neural`，**默认 `neural`**——这是 2026-09-22
-第三次定档的结论（前两次：semantic 抢话 20~40% → 退回 conservative）：
+`gating` 四档 `conservative|semantic|aggressive|neural`，**默认 `conservative`**——第四次定档
+（2026-10-04 真人验收 D5：neural 在半秒句中停顿下抢话 3/3，100ms 确认窗扛不住真人停顿，
+判停 100→500ms 换 0% 抢话；neural 仍是可选项，说话不停顿的场景快 400ms。
+定档史：semantic 抢话 20~40% 被否两次 → neural 上位 → 真人停顿否掉 neural 默认）：
 
 | 档位 | 依据 | 判停延迟 | 抢话率 |
 |---|---|---|---|

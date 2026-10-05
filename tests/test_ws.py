@@ -73,12 +73,16 @@ def test_ws_reports_bad_frame_and_keeps_session_alive() -> None:
         assert ws.receive_bytes() == b"\x07"
 
 
-def test_ws_interrupt_without_turn_reports_no_active_turn() -> None:
+def test_ws_interrupt_without_turn_is_silently_dropped() -> None:
+    """无活动轮次的 interrupt 静默丢弃：客户端本地打断是快路径，常在轮次
+    结束后由播放尾音再触发一次——报错只会污染验收界面（2026-10-04 实测）。
+    契约：不回错误帧、连接保持可用。"""
     with TestClient(create_app()).websocket_connect("/ws") as ws:
         ws.receive_json()
-        ws.send_text(json.dumps({"type": "interrupt", "reason": "barge-in"}))
-        err = ws.receive_json()
-        assert err["code"] == "no_active_turn"
+        ws.send_text(json.dumps({"type": "interrupt", "reason": "tail-audio"}))
+        # 没有错误帧回来说明被吞掉；连接仍活着（echo 一帧验证）
+        ws.send_text(SessionBegin(mode="echo").model_dump_json())
+        assert ws.receive_json()["type"] == "session.ready"
 
 
 def test_serial_mode_runs_full_chain_over_ws() -> None:
