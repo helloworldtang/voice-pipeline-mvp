@@ -1,0 +1,116 @@
+{
+  "machine": "arm64 macOS 26.6.2",
+  "python": "3.12.13",
+  "mode": "real-serial",
+  "sessions": 2,
+  "rounds": 2,
+  "max_sessions": 2,
+  "gating": "conservative",
+  "uplink": "kokoro 合成语音 → 16k（两组同一份数据，只拧服务端开关）",
+  "cases": {
+    "shared_before": {
+      "shared": true,
+      "per_worker_p50": {
+        "0": 1652.7,
+        "1": 2047.4
+      },
+      "p50_ms": 1652.7,
+      "wall_total_ms": 9968.4,
+      "turns": [
+        {
+          "worker": 0,
+          "caliber_b_ms": 1693.861,
+          "eou_latency_ms": 596.0,
+          "wall_ms": 3624.1,
+          "audio_bytes": 39734,
+          "eou_missed": 0,
+          "note": "utt0"
+        },
+        {
+          "worker": 0,
+          "caliber_b_ms": 1611.611,
+          "eou_latency_ms": 595.812,
+          "wall_ms": 4252.9,
+          "audio_bytes": 61858,
+          "eou_missed": 0,
+          "note": "utt1"
+        },
+        {
+          "worker": 1,
+          "caliber_b_ms": 1574.508,
+          "eou_latency_ms": 596.0,
+          "wall_ms": 3542.8,
+          "audio_bytes": 36946,
+          "eou_missed": 0,
+          "note": "utt0"
+        },
+        {
+          "worker": 1,
+          "caliber_b_ms": 2520.209,
+          "eou_latency_ms": 595.812,
+          "wall_ms": 5159.4,
+          "audio_bytes": 93402,
+          "eou_missed": 0,
+          "note": "utt1"
+        }
+      ],
+      "rejection": {
+        "got_error": false,
+        "code": "no_rejection",
+        "close_code": null
+      }
+    },
+    "pooled": {
+      "shared": false,
+      "per_worker_p50": {
+        "0": 2318.8,
+        "1": 2041.6
+      },
+      "p50_ms": 2163.2,
+      "wall_total_ms": 10345.5,
+      "turns": [
+        {
+          "worker": 0,
+          "caliber_b_ms": 1898.459,
+          "eou_latency_ms": 596.0,
+          "wall_ms": 3826.6,
+          "audio_bytes": 40168,
+          "eou_missed": 0,
+          "note": "utt0"
+        },
+        {
+          "worker": 0,
+          "caliber_b_ms": 2739.235,
+          "eou_latency_ms": 595.812,
+          "wall_ms": 5374.7,
+          "audio_bytes": 83300,
+          "eou_missed": 0,
+          "note": "utt1"
+        },
+        {
+          "worker": 1,
+          "caliber_b_ms": 1655.293,
+          "eou_latency_ms": 596.0,
+          "wall_ms": 3612.4,
+          "audio_bytes": 40168,
+          "eou_missed": 0,
+          "note": "utt0"
+        },
+        {
+          "worker": 1,
+          "caliber_b_ms": 2427.843,
+          "eou_latency_ms": 595.812,
+          "wall_ms": 5070.9,
+          "audio_bytes": 88090,
+          "eou_missed": 0,
+          "note": "utt1"
+        }
+      ],
+      "rejection": {
+        "got_error": true,
+        "code": "session_limit",
+        "close_code": 1013
+      }
+    }
+  }
+}

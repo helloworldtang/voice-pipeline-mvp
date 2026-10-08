@@ -71,10 +71,29 @@ def test_default_gating_is_conservative_after_human_trials() -> None:
     **真人验收否掉 neural 默认**：半秒句中停顿下抢话 3/3（"我想"/"帮我查一下"/
     "我等会儿"全部在停顿处抢答），100ms 确认窗扛不住真人停顿。
 
+    这里覆盖全部四层默认：`SessionBegin`（wire）/ `Session` / `build_eou` /
+    `FusedEou`。只断言 wire 那一层不够——2026-10-08 盘点发现 `build_eou` 的默认
+    还停在 NEURAL（第四次定档只改了前三处），直接调它的脚本（`probe_eou.py`、
+    `report_turns` 之外的探针）会静默跑在已被否掉的档上，而账单 `eou_mode`
+    仍写 conservative，两处对不上却没人报错。
+
     防回退：改回 neural 默认前先跑真人抢话三连测（手册剧本 6-8 句）——
     合成语音的内部静音与真人停顿不是同一分布，这正是 D5 的教训。
     """
+    import inspect
+
+    from voice_pipeline.core.eou import FusedEou
+    from voice_pipeline.providers.factory import build_eou
+    from voice_pipeline.server.session import Session
+
     assert SessionBegin().gating is GatingMode.CONSERVATIVE
+    assert inspect.signature(Session).parameters["gating"].default is GatingMode.CONSERVATIVE
+    assert inspect.signature(build_eou).parameters["gating"].default is GatingMode.CONSERVATIVE
+    assert inspect.signature(FusedEou).parameters["gating"].default is GatingMode.CONSERVATIVE
+    # 真正构造一次：默认档不该去碰神经权重（本机可能没下权重，会走告警退回——
+    # 那时 eou.gating 仍是 conservative，断言照样成立，但拿不到「默认真的生效」的证据，
+    # 所以额外断言没有 detector 被挂上去）。
+    assert build_eou().neural is None
 
 
 def test_neural_gating_travels_on_the_wire() -> None:

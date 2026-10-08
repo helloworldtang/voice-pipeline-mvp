@@ -163,7 +163,7 @@ def _build_asr_shared(engine: Callable[..., AsrProvider]) -> AsrProvider:
 
 
 def build_eou(
-    gating: GatingMode = GatingMode.NEURAL,
+    gating: GatingMode = GatingMode.CONSERVATIVE,
     sample_rate: int = 16000,
     *,
     neural: bool | None = None,
@@ -175,6 +175,11 @@ def build_eou(
     默认用模型无关的启发式 L2(韵律)/L3(语义)；`gating=NEURAL` 或 `neural=True` 时
     把 L2 换成 Smart Turn v3 神经网络版（D2）。**缺权重必须告警并退回 conservative**——
     静默退回会把启发式的数字当成神经版的数字报出去。
+
+    ⚠️ 默认档必须与 Session / FusedEou / SessionBegin 三处**保持一致**（第四次定档
+    conservative，2026-10-04 真人验收：neural 在真人半秒句内停顿下抢话 3/3）。
+    这里漏改不会报错，只会让「直接调 build_eou 的脚本」静默跑在另一个档上，
+    数字却混进同一份账单——`test_default_gating_is_conservative_across_layers` 钉住。
     """
     detector: SmartTurnEou | None = None
     want_neural = neural if neural is not None else (gating is GatingMode.NEURAL)

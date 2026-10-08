@@ -28,6 +28,7 @@ from fastapi.staticfiles import StaticFiles
 
 from voice_pipeline.config import Settings
 from voice_pipeline.core.scheduler.base import AudioFragment, TurnItem
+from voice_pipeline.providers.pool import ProviderLease, ProviderPool
 
 from .protocol import (
     AudioChunk,
@@ -60,6 +61,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="voice-pipeline", version="0.1.0", lifespan=lifespan)
     app.state.settings = cfg
+    # 并发租借池：real 模式的每个会话独占一份本地推理资源（Acceptance 判据 9）。
+    # 池挂在 app 上而不是做成模块级全局——测试里每个 create_app() 都是独立的服务实例，
+    # 用全局池的话一个用例的会话会永久占住另一个用例的名额。
+    pool = ProviderPool(max_sessions=cfg.max_sessions, shared=cfg.shared_inference)
+    app.state.pool = pool
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -72,6 +78,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         await websocket.send_text(
             dump_event(SessionReady(session_id=session.session_id, trace_id=session.trace_id))
         )
+        # 本连接借到的本地推理资源（real 模式才有，sim/echo 为 None）。关闭路径
+        # 有多个出口，统一在 finally 归还；release 幂等。
+        lease: ProviderLease | None = None
 
         # 下行两级：outbox →（pump 分类）→ tx →（sender 发送）→ wire。
         # 分成两个协程的原因：sender 可能阻塞在慢客户端的 send 上，此时 pump
@@ -157,6 +166,30 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         )
                         await websocket.close(code=1008)
                         return
+                    # 借本地推理资源（real 系列才占槽）。先还旧的再借新的：同一条连接
+                    # 换模式不该同时占两个名额——在 capacity=2 的机器上，自己占着自己
+                    # 去申请第二个，会被自己挤到拒绝。
+                    if lease is not None:
+                        lease.release()
+                        lease = None
+                    lease = await pool.acquire(frame.mode)
+                    if lease is None:
+                        # 满是**背压**，不是错误：明确拒绝，不让新会话静默挤占旧会话
+                        # 的推理（隐性串行比 1013 糟——后者至少能被客户端解释）。
+                        await websocket.send_text(
+                            dump_event(
+                                ErrorEvent(
+                                    code="session_limit",
+                                    message=(
+                                        "server busy: "
+                                        f"{pool.busy}/{pool.capacity} local inference "
+                                        "sessions in use, try again later"
+                                    ),
+                                )
+                            )
+                        )
+                        await websocket.close(code=1013)
+                        return
                     # 换模式即重建会话（含新的 outbox 与 pump）。
                     # gating / grace_ms 必须透传：它们是 300ms 实验的两个旋钮，
                     # 协议里有、构造时丢掉，就等于旋钮是画上去的。
@@ -164,6 +197,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         mode=frame.mode,
                         gating=frame.gating,
                         grace_ms=frame.grace_ms,
+                        asr=lease.providers.asr,
+                        llm=lease.providers.llm,
+                        tts=lease.providers.tts,
                         # 账单落盘走环境变量 VOICE_EVENTS_JSONL（Session 默认
                         # 从 env 读，见 metrics/jsonl.py）：这是运维开关，
                         # 不是每次会话的实验旋钮，所以不上 wire 协议。
@@ -217,6 +253,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             sender_task.cancel()
             if turn_task is not None:
                 turn_task.cancel()
+            # 槽必须归还：漏一个就永久少一个名额（跑到后来所有新连接都 1013，
+            # 而日志里只有一句「已达上限」）。release 幂等，多个出口都安全。
+            if lease is not None:
+                lease.release()
 
     # 浏览器客户端（web/），必须挂在所有显式路由之后：Starlette 按注册顺序匹配，
     # mount("/") 先注册会吞掉 /healthz 与 /ws。目录不存在不挂载——纯 WS 部署

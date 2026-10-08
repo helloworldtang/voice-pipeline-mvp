@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
 import time
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
@@ -75,6 +76,11 @@ class StreamingAsr(ABC):
     ) -> None:
         self._sr = sample_rate
         self._window = int(sample_rate * window_ms / 1000)
+        # 流操作互斥锁：push/finalize 搬到线程后，pipelined 的投机任务可能在
+        # recognize 还在 worker 线程里跑时同步调 text()（get_result 同一条 C++ 流）。
+        # ORT 推理会放 GIL，跨线程读写同一条流是真实的数据竞争。锁无争用时
+        # 开销可忽略。
+        self._stream_lock = threading.Lock()
         # recognizer 携带模型权重（重，进程内共享）；stream 是纯会话状态（轻，每连接新建）。
         # 跨连接共享 recognizer 意味着并发推理在同一 ORT session 上串行——单用户试点无碍。
         self._recognizer = recognizer or self._make_recognizer()
@@ -92,6 +98,10 @@ class StreamingAsr(ABC):
         return self.fed_samples / self._sr * 1000.0
 
     def text(self) -> str:
+        with self._stream_lock:
+            return self._text_locked()
+
+    def _text_locked(self) -> str:
         result = self._recognizer.get_result(self._stream)
         raw = result if isinstance(result, str) else result.text
         # 去掉 sentencepiece 词首标记与所有空格，便于与参考文本比对
@@ -102,14 +112,30 @@ class StreamingAsr(ABC):
         return bool(self.text())
 
     async def push_audio(self, chunk: bytes) -> None:
+        """认（decode）必须在**线程**里跑。
+
+        为什么搬出事件循环：这是 CPU 活（几十 ms 量级 × 每 100ms 一帧），留在循环里
+        会把所有连接一起堵住——那时「给每个会话一份独占的 recognizer」就没有意义了：
+        它根本并行不起来，只是把一份守序的排队换成了两份互相抢 CPU 的排队。
+        实测依据：2026-10-08 并发 A/B，只做资源独占、不动这一行，双路并发下**每路**
+        口径B 反而比共享慢 190ms（n=6，两组分布不重叠）。
+
+        **顺序性由调用方保证**：传输层是 `await session.on_audio(...)` 一帧一帧串着
+        调的，同一个会话不会有两帧同时跑进来，因此这里不需要额外加锁。
+        """
         start = time.perf_counter()
         self._buf = np.concatenate([self._buf, pcm16_to_f32(chunk)])
         self.fed_samples += len(chunk) // 2
-        while len(self._buf) >= self._window:
-            block, self._buf = self._buf[: self._window], self._buf[self._window :]
-            self._stream.accept_waveform(self._sr, block)
-            self.frames += 1
-            self._drain()
+
+        def _recognize() -> None:
+            with self._stream_lock:
+                while len(self._buf) >= self._window:
+                    block, self._buf = self._buf[: self._window], self._buf[self._window :]
+                    self._stream.accept_waveform(self._sr, block)
+                    self.frames += 1
+                    self._drain()
+
+        await asyncio.to_thread(_recognize)
         self.wall_ms += (time.perf_counter() - start) * 1000.0
 
     def _drain(self) -> None:
@@ -117,20 +143,25 @@ class StreamingAsr(ABC):
             self._recognizer.decode_stream(self._stream)
 
     async def finalize(self) -> str:
-        if len(self._buf) > 0:
-            self._stream.accept_waveform(self._sr, self._buf)
-            self._buf = np.empty(0, dtype=np.float32)
-            self._drain()
-        self._stream.input_finished()
-        self._drain()
+        def _close() -> None:
+            with self._stream_lock:
+                if len(self._buf) > 0:
+                    self._stream.accept_waveform(self._sr, self._buf)
+                    self._buf = np.empty(0, dtype=np.float32)
+                    self._drain()
+                self._stream.input_finished()
+                self._drain()
+
+        await asyncio.to_thread(_close)
         return self.text()
 
     def reset(self) -> None:
-        self._stream = self._recognizer.create_stream()
-        self._buf = np.empty(0, dtype=np.float32)
-        self.frames = 0
-        self.fed_samples = 0
-        self.wall_ms = 0.0
+        with self._stream_lock:
+            self._stream = self._recognizer.create_stream()
+            self._buf = np.empty(0, dtype=np.float32)
+            self.frames = 0
+            self.fed_samples = 0
+            self.wall_ms = 0.0
 
 
 class ParaformerStreamingAsr(StreamingAsr):

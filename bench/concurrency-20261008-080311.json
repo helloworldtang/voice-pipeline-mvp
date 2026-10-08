@@ -1,0 +1,46 @@
+{
+  "machine": "arm64 macOS 26.6.2",
+  "python": "3.12.13",
+  "mode": "real-serial",
+  "sessions": 2,
+  "rounds": 1,
+  "max_sessions": 2,
+  "gating": "conservative",
+  "uplink": "kokoro 合成语音 → 16k（两组同一份数据，只拧服务端开关）",
+  "cases": {
+    "pooled": {
+      "shared": false,
+      "per_worker_p50": {
+        "0": 1957.9,
+        "1": 1889.9
+      },
+      "p50_ms": 1923.9,
+      "wall_total_ms": 5139.6,
+      "turns": [
+        {
+          "worker": 0,
+          "caliber_b_ms": 1957.948,
+          "eou_latency_ms": 596.812,
+          "wall_ms": 3917.9,
+          "audio_bytes": 39564,
+          "eou_missed": 0,
+          "note": "utt0"
+        },
+        {
+          "worker": 1,
+          "caliber_b_ms": 1889.921,
+          "eou_latency_ms": 596.812,
+          "wall_ms": 3820.1,
+          "audio_bytes": 39564,
+          "eou_missed": 0,
+          "note": "utt0"
+        }
+      ],
+      "rejection": {
+        "got_error": false,
+        "code": "no_rejection",
+        "close_code": null
+      }
+    }
+  }
+}

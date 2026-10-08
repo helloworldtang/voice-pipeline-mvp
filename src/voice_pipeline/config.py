@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from voice_pipeline.providers.pool import DEFAULT_MAX_SESSIONS
+
 
 class Settings(BaseSettings):
     """服务与音频链路参数。所有延迟/分片参数集中在此，实验可整体覆写。"""
@@ -30,6 +32,17 @@ class Settings(BaseSettings):
 
     # 浏览器客户端静态目录（默认仓根 web/；不存在的部署可指到别处或留空不挂载）
     web_dir: str = ""
+
+    # 并发上限：同时占用本地推理（real 模式）的会话数。超出即明确拒绝
+    # （error session_limit + 1013），不静默降级回共享推理——共享推理会让
+    # 两个用户互相拖慢且毫无信号。为什么只卡 real：唯有 ORT session 是被独占的
+    # 硬资源，sim/echo 连接不烧它。详见 providers/pool.py。
+    max_sessions: int = DEFAULT_MAX_SESSIONS
+
+    # A/B 测量开关：复现改造前「所有会话共用一份本地推理」的形态（并发即隐性串行）。
+    # 存在的唯一理由是给 `scripts/bench_concurrency.py` 当对照组——同机同 provider，
+    # 只拧这一个开关。生产不要开。
+    shared_inference: bool = False
 
 
 def get_settings() -> Settings:

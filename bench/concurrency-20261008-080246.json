@@ -1,0 +1,24 @@
+{
+  "machine": "arm64 macOS 26.6.2",
+  "python": "3.12.13",
+  "mode": "serial",
+  "sessions": 2,
+  "rounds": 2,
+  "max_sessions": 2,
+  "gating": "conservative",
+  "uplink": "kokoro 合成语音 → 16k（两组同一份数据，只拧服务端开关）",
+  "cases": {
+    "pooled": {
+      "shared": false,
+      "per_worker_p50": {},
+      "p50_ms": null,
+      "wall_total_ms": 4739.4,
+      "turns": [],
+      "rejection": {
+        "got_error": false,
+        "code": "no_rejection",
+        "close_code": null
+      }
+    }
+  }
+}
