@@ -128,7 +128,7 @@ def main() -> None:
     ap.add_argument("--wav", required=True, help="16k 或任意采样率的单声道 WAV")
     ap.add_argument("--url", default="ws://127.0.0.1:8000/ws")
     ap.add_argument("--mode", default="real-serial")
-    ap.add_argument("--gating", default="neural")
+    ap.add_argument("--gating", default="conservative")  # 第四次定档（2026-10-04）
     ap.add_argument("--token", default=None)
     ap.add_argument("--repeat", type=int, default=1)
     ap.add_argument("--eou-wait-s", type=float, default=20.0)

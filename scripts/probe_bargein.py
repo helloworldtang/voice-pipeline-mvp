@@ -48,7 +48,7 @@ async def main() -> None:
         f"ws://127.0.0.1:{PORT}/ws", max_size=None, open_timeout=30
     ) as ws:
         await ws.recv()  # 首个默认 session.ready
-        await ws.send(SessionBegin(mode="real-serial", gating="neural").model_dump_json())
+        await ws.send(SessionBegin(mode="real-serial", gating="conservative").model_dump_json())
         await ws.recv()  # rebound session.ready
 
         for i in range(0, len(pcm) - BLOCK, BLOCK):
