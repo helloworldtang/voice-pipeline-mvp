@@ -248,11 +248,12 @@ uv run python scripts/live_client.py --url ws://localhost:8000/ws   # 需 pyaudi
 
 > ⚠️ **2026-09-27 两处修正**（原列表已过时）：
 > ① **鉴权已做一半**——静态 token 鉴权已落地（`VOICE_WS_TOKEN`），仅 TLS/域名未上，故从「范围外」移到差距表；
-> ② **并发仍在范围外，但已记录为第四层目标的显式缺口**（单用户试点 → 产品化必领）。
+> ② 并发曾列为范围外缺口，**2026-10-08 已落地**（判据 9 转 ✅），见差距表对应行；
+> 剩余缺口收敛为判据 4（TLS/公网开麦）与判据 8（回声根治后的干净真人验收）。
 
 ## 发版检查单
 
-- [x] 质量门禁四件套全绿：`ruff check` / `ruff format --check` / `mypy`(strict) / `pytest`（127 passed）
+- [x] 质量门禁四件套全绿：`ruff check` / `ruff format --check` / `mypy`(strict) / `pytest`（152 passed，2026-10-08 复跑）
 - [x] CI 与本地同命令同结果（py3.10 / py3.12 矩阵）
 - [x] LICENSE = MIT（见 `LICENSE`）
 - [x] README：本机准备 / 快速开始 / 承诺映射表 / 对比定位 / 差距表
