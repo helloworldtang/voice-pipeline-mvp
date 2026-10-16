@@ -179,13 +179,30 @@ class PipelinedScheduler:
         if run.sentences == 1:
             self._metrics.tts_first_chars = len(sentence)
         first_chunk = True
+        tr = self._metrics.tracer
+        # 投机合成与正品合成同名（tts.synth），靠 speculative 属性区分：
+        # 命中率低的时候要能一眼看出"CPU 花在注定作废的东西上"有多少。
+        synth = (
+            tr.start(
+                "tts.synth",
+                tr.root,
+                {"seq": run.sentences, "chars": len(sentence), "speculative": 1},
+            )
+            if tr
+            else None
+        )
+        head = tr.start("tts.first_chunk", synth) if tr and run.sentences == 1 else None
         items: list[TurnItem] = [TtsSentence(seq=run.sentences, text=sentence)]
         async for block in synth_to_fragments(self._tts, sentence, chunker):
             if first_chunk and run.sentences == 1:
                 first_chunk = False
                 self._metrics.mark("tts_first_chunk")
                 run.ready_ms = self._metrics.clock.elapsed_ms()
+                if tr and head:
+                    tr.finish(head)
             items.append(AudioFragment(seq=chunker.next_seq(), data=block))
+        if tr and synth:
+            tr.finish(synth)
         if run.sentences == 1:
             run.head = items
         else:
@@ -197,12 +214,17 @@ class PipelinedScheduler:
         self._metrics.mark("utterance_end")
         yield TurnStart()
 
+        tr = self._metrics.tracer
+        root = (tr.window or tr.root) if tr is not None else None
+        fin = tr.start("asr.finalize", root) if tr else None
         transcript = await self._asr.finalize()
         # finalize 已终结识别流，立即开新流收 EOU 之后到达的音频（同 serial）。
         # reset 会让 text() 归零，所以必须先立 _eou_done 旗标，否则仍在算尾巴的
         # 投机任务拿新流的空 partial 做前缀校验，会把本已命中的投机误判作废。
         self._asr.reset()
         self._eou_done = True
+        if tr and fin:
+            tr.finish(fin, {"chars": len(transcript)})
         yield AsrFinal(text=transcript)
 
         if not transcript:
@@ -215,6 +237,14 @@ class PipelinedScheduler:
         run = await self._settle(transcript)
         if run is None:
             self.spec_misses += 1
+            if tr and root is not None:
+                tr.record(
+                    "spec.miss",
+                    self._metrics.elapsed("utterance_end") or -1.0,
+                    self._metrics.clock.elapsed_ms(),
+                    parent=root,
+                    attrs={"reason": self.spec_last_reason},
+                )
             async for item in self._fallback(transcript):
                 yield item
         else:
@@ -288,7 +318,7 @@ class PipelinedScheduler:
 
     async def _pass_through(self, item: TurnItem) -> AsyncIterator[TurnItem]:
         if isinstance(item, AudioFragment):
-            self._metrics.mark("first_audio_out")
+            self._mark_first_audio()
             self._metrics.audio_bytes += len(item.data)
         yield item
 
@@ -316,13 +346,31 @@ class PipelinedScheduler:
         self._metrics.sentences += 1
         yield TtsSentence(seq=seq, text=sentence)
         first_chunk = True
+        tr = self._metrics.tracer
+        synth = (
+            tr.start("tts.synth", (tr.window or tr.root), {"seq": seq, "chars": len(sentence)})
+            if tr
+            else None
+        )
+        head = tr.start("tts.first_chunk", synth) if tr and seq == 1 else None
         async for block in synth_to_fragments(self._tts, sentence, self._chunker):
             if first_chunk:
                 first_chunk = False
                 self._metrics.mark("tts_first_chunk")
-            self._metrics.mark("first_audio_out")
+                if tr and head:
+                    tr.finish(head)
+            self._mark_first_audio()
             self._metrics.audio_bytes += len(block)
             yield AudioFragment(seq=self._chunker.next_seq(), data=block)
+        if tr and synth:
+            tr.finish(synth)
+
+    def _mark_first_audio(self) -> None:
+        """首片出炉：**这里是口径B 的终点**，根 span 在此闭合（两条出境路径都走它）。"""
+        self._metrics.mark("first_audio_out")
+        tr = self._metrics.tracer
+        if tr is not None and tr.window is not None and tr.window.open:
+            tr.finish_window()
 
     # ---- barge-in --------------------------------------------------------
 

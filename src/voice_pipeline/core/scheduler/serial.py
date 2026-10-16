@@ -14,6 +14,7 @@ from collections.abc import AsyncIterator
 from voice_pipeline.audio.chunker import Chunker
 from voice_pipeline.core.sentence_splitter import SentenceSplitter
 from voice_pipeline.metrics.events import TurnMetrics
+from voice_pipeline.metrics.trace import Span
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.server.protocol import AsrFinal, TtsSentence, TurnEnd, TurnStart
 
@@ -55,10 +56,18 @@ class SerialScheduler:
         self._metrics.mark("utterance_end")
         yield TurnStart()
 
+        tracer = self._metrics.tracer
+        root = (tracer.window or tracer.root) if tracer is not None else None
+
+        # ASR finalize 单独一格：过去它混在 "utterance_end → llm_first_token"
+        # 那一格里，被打点差算成 LLM 的账——看不出来就没法定它的优化优先级。
+        fin = tracer.start("asr.finalize", root) if tracer else None
         transcript = await self._asr.finalize()
         # finalize 已终结识别流；立即开新流，EOU 之后到达的音频（用户抢在 AI
         # 开口前继续说、或 barge-in 窗口里的语音）才不会落进死流被丢掉。
         self._asr.reset()
+        if tracer and fin:
+            tracer.finish(fin, {"chars": len(transcript)})
         yield AsrFinal(text=transcript)
 
         if not transcript:
@@ -70,18 +79,39 @@ class SerialScheduler:
 
         sentence_seq = 0
         saw_token = False
-        async for piece in self._llm.astream(
-            transcript, history=list(self._history) if self._history else None
-        ):
-            if not saw_token:
-                self._metrics.mark("llm_first_token")
-                saw_token = True
-            for sentence in self._splitter.feed(piece):
-                sentence_seq += 1
-                if sentence_seq == 1:
-                    self._metrics.mark("first_sentence_done")
-                async for item in self._synthesize(sentence, sentence_seq):
-                    yield item
+        # LLM 一格拆两层：`llm.request`（整段生成）里嵌 `llm.ttft`（首 token）与
+        # `llm.first_sentence`（首 token → 首句成）。嵌套是因为 ttft 是 request 的
+        # 一部分——平铺会把同一段时间记两次，而自有时间（self time）算得出来才不准ाओ
+        req = tracer.start("llm.request", root, {"chars": len(transcript)}) if tracer else None
+        ttft = tracer.start("llm.ttft", req) if tracer else None
+        sent: Span | None = None
+        try:
+            async for piece in self._llm.astream(
+                transcript, history=list(self._history) if self._history else None
+            ):
+                if not saw_token:
+                    self._metrics.mark("llm_first_token")
+                    saw_token = True
+                    if tracer and ttft:
+                        tracer.finish(ttft)  # 首 token：这一格是模型自己的 RTT+prefill
+                    if tracer and req is not None:
+                        sent = tracer.start("llm.first_sentence", req)
+                for sentence in self._splitter.feed(piece):
+                    sentence_seq += 1
+                    if sentence_seq == 1:
+                        self._metrics.mark("first_sentence_done")
+                        if tracer and sent:
+                            tracer.finish(sent, {"chars": len(sentence)})  # 攒到句末标点
+                    async for item in self._synthesize(sentence, sentence_seq):
+                        yield item
+        finally:
+            if tracer:
+                if sent is not None and sent.open:
+                    tracer.finish(sent)
+                if ttft is not None and ttft.open:
+                    tracer.finish(ttft)
+                if req is not None:
+                    tracer.finish(req, {"sentences": sentence_seq})
 
         tail = self._splitter.flush()
         if tail:
@@ -98,12 +128,22 @@ class SerialScheduler:
             self._metrics.tts_first_chars = len(sentence)
         yield TtsSentence(seq=seq, text=sentence)
         first_chunk = True
-        # 流式 provider（tts_streams）在整句合成完之前就开始出片；整句 provider
-        # 合成完再切——分流逻辑与指标语义见 synth_to_fragments。
+        tr = self._metrics.tracer
+        root = (tr.window or tr.root) if tr is not None else None
+        # TTS 单独一格 **且记字数**：本机最强的相关性就在这一格，`chars` 是解释它的唯一自变量
+        synth = tr.start("tts.synth", root, {"seq": seq, "chars": len(sentence)}) if tr else None
+        head = tr.start("tts.first_chunk", synth) if tr and seq == 1 else None
         async for chunk in synth_to_fragments(self._tts, sentence, self._chunker):
             if first_chunk:
                 first_chunk = False
                 self._metrics.mark("tts_first_chunk")
+                if tr is not None and head is not None:
+                    tr.finish(head)
             self._metrics.mark("first_audio_out")
+            if tr is not None and tr.window is not None and tr.window.open:
+                # 口径B 窗口在这里闭合（**不含**传输层那一跳，另记 tx.*）
+                tr.finish_window()
             self._metrics.audio_bytes += len(chunk)
             yield AudioFragment(seq=self._chunker.next_seq(), data=chunk)
+        if tr is not None and synth is not None:
+            tr.finish(synth)

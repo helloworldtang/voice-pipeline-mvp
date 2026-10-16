@@ -27,6 +27,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 
 from voice_pipeline.config import Settings
+from voice_pipeline.core.filler import FillerBank
 from voice_pipeline.core.scheduler.base import AudioFragment, TurnItem
 from voice_pipeline.providers.pool import ProviderLease, ProviderPool
 
@@ -66,6 +67,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     # 用全局池的话一个用例的会话会永久占住另一个用例的名额。
     pool = ProviderPool(max_sessions=cfg.max_sessions, shared=cfg.shared_inference)
     app.state.pool = pool
+    # 预合成 filler（体感优化，默认关；VOICE_FILLER=1 开）：进程内加载一次。
+    # 目录缺 index.json / 文件坏了都不报错——load() 自己 warning 并返回 None。
+    filler_bank = FillerBank.from_env()
+    app.state.filler = filler_bank
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:
@@ -113,6 +118,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     await websocket.send_text(entry.text)
                     if entry.data is not None:
                         await websocket.send_bytes(entry.data)
+                        # 首片真正落到网线上的这一刻：补传输层那一跳的 span
+                        # （outbox 入队 → 发送完成）。只记第一次，之后幂等返回。
+                        session.note_first_audio_send()
                     # join 的完成计数在**发送落地后**才递减：join 返回即代表客户端
                     # 收得到，调用方随后 cancel 本协程不会掐掉在飞的发送
                     # （TestClient 下实测：出队即计数的版本，session.closed 被
@@ -200,6 +208,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         asr=lease.providers.asr,
                         llm=lease.providers.llm,
                         tts=lease.providers.tts,
+                        filler=filler_bank,
                         # 账单落盘走环境变量 VOICE_EVENTS_JSONL（Session 默认
                         # 从 env 读，见 metrics/jsonl.py）：这是运维开关，
                         # 不是每次会话的实验旋钮，所以不上 wire 协议。

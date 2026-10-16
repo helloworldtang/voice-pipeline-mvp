@@ -11,6 +11,8 @@ from dataclasses import dataclass
 from typing import Protocol, Union, runtime_checkable
 
 from voice_pipeline.audio.chunker import Chunker
+from voice_pipeline.core.filler import FillerBank
+from voice_pipeline.metrics.events import TurnMetrics
 from voice_pipeline.providers.base import TtsProvider
 from voice_pipeline.server.protocol import ServerEvent
 
@@ -24,6 +26,31 @@ class AudioFragment:
 
 
 TurnItem = Union[ServerEvent, AudioFragment]  # noqa: UP007 - 运行时别名
+
+
+async def play_filler(
+    filler: FillerBank | None, chunker: Chunker, metrics: TurnMetrics
+) -> AsyncIterator[AudioFragment]:
+    """把一段预合成 filler 切成下行分片先播出去（首片即出声，不等 TTS）。
+
+    计量纪律（见 `core/filler.py`）：这里只打 `first_sound`，**不碰 first_audio_out**——
+    口径B 必须继续只算「真实回答的首片」。filler 没配/库为空时什么都不做（传 None 即关闭）。
+
+    分片序号用 **0 与负数**（0, -1, -2…）：filler 不在调度器的分片序号空间里，用负号把
+    这件事写在数据上，调度器的 `next_seq()` 因此完全不受影响（seq 只出现在诊断事件
+    `AudioChunk`，客户端不消费它）。
+    """
+    if filler is None:
+        return
+    clip = filler.next_clip()
+    if clip is None:
+        return
+    metrics.filler_used = True
+    for i, block in enumerate(chunker.feed_and_flush(clip.pcm)):
+        if i == 0:
+            metrics.mark("first_sound")
+        metrics.audio_bytes += len(block)
+        yield AudioFragment(seq=-i if i else 0, data=block)
 
 
 async def synth_to_fragments(

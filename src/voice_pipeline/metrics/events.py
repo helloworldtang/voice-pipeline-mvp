@@ -11,6 +11,10 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # 避免与 metrics/trace.py 形成 import 环（那边要用 SessionClock）
+    from voice_pipeline.metrics.trace import Tracer
 
 WATERFALL_POINTS: tuple[str, ...] = (
     "vad_onset",
@@ -18,6 +22,9 @@ WATERFALL_POINTS: tuple[str, ...] = (
     "fragment_commit",
     "eou",
     "utterance_end",
+    # 预合成 filler 的首片（体感首音）。**口径B 不用它**——first_audio_out 仍只指
+    # 真实回答的首片，否则 caliber_b_ms 会静默变义（见 core/filler.py 的计量纪律）。
+    "first_sound",
     "llm_first_token",
     "first_sentence_done",
     "tts_first_chunk",
@@ -41,9 +48,15 @@ class TurnMetrics:
     """单轮账单。mark 只写第一次到达的时间（ repeats 不覆盖）。"""
 
     clock: SessionClock = field(default_factory=SessionClock)
+    # 追踪器（metrics/trace.py）：Session 构造后注入，trace_id 与会话一致。
+    # 为什么挂在 TurnMetrics 上：调度器手里已经有 metrics，不必为了埋点改它们的签名。
+    tracer: Tracer | None = None
     marks: dict[str, float] = field(default_factory=dict)
     sentences: int = 0
     audio_bytes: int = 0
+    # 预合成 filler 是否在本轮播过（2026-10-10，体感优化）。**不进口径B**：
+    # caliber_b_ms 永远只算「真实回答的首片」，否则历史账与本轮的账不可比。
+    filler_used: bool = False
     # 送进 TTS 的第一句有多少字。TTS 是端到端最大的一格，而它的耗时几乎线性于
     # 字数（本机实测 melo +37ms/字、kokoro +47ms/字）—— 不知道字数就无法解释
     # 这一格的波动，也无法验证「让 LLM 说短一点」到底值多少 ms。
@@ -72,6 +85,7 @@ class TurnMetrics:
         self.marks.clear()
         self.sentences = 0
         self.audio_bytes = 0
+        self.filler_used = False
         self.tts_first_chars = -1
         self.premature_eou = False
         self.missed_eou = False
@@ -79,6 +93,10 @@ class TurnMetrics:
         self.eou_mode = ""
         self.barge_in_count = 0
         self.barge_in_latency_ms = -1.0
+        # ⚠️ 这里**不清** span 树：树的生命周期归 Session 管（第一帧上行开根、
+        # turn.end 闭根、下一轮第一帧 reset）。在 run_turn 开头清会把**判停前**的
+        # 上行帧/EOU/partial 全部抹掉，trace 只剩"说完之后"那一段——2026-10-17
+        # 实测就是这么丢的：树里 0 个 uplink.frame，而 mic 一直在收音。
 
     def elapsed(self, name: str) -> float | None:
         return self.marks.get(name)
@@ -119,6 +137,15 @@ class TurnMetrics:
         bill["barge_in_latency_ms"] = round(self.barge_in_latency_ms, 3)
         if first_audio is not None and vad_onset is not None:
             bill["caliber_a_ms"] = round(first_audio - vad_onset, 3)
+        # 体感首音（含 filler）：与口径B **分开报**——filler 省的是「用户以为在等」
+        # 的那段，真实回答的首音一分不省。缺失如实 -1，不填 0。
+        first_sound = self.marks.get("first_sound")
+        bill["filler_used"] = 1.0 if self.filler_used else 0.0
+        bill["first_sound_ms"] = (
+            round(first_sound - utterance_end, 3)
+            if first_sound is not None and utterance_end is not None
+            else -1.0
+        )
         for point in WATERFALL_POINTS:
             value = self.marks.get(point)
             if value is not None:

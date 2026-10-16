@@ -1,8 +1,16 @@
 """把落盘的账单 JSONL 汇成验收记录（P4 真人验收的取证工具）。
 
 用法：
-    uv run python scripts/report_turns.py ~/.voice-pilot/turns.jsonl
-    uv run python scripts/report_turns.py turns.jsonl --out docs/验收-真人.md
+    uv run python scripts/report_turns.py ~/.voice-pilot/turns.jsonl --list   # 先看会话清单
+    uv run python scripts/report_turns.py ~/.voice-pilot/turns.jsonl --session last \
+        --out docs/验收-真人.md
+    uv run python scripts/report_turns.py ~/.voice-pilot/turns.jsonl --since 2026-10-10 \
+        --out docs/验收-真人.md       # 一天里连了两段会话时用这个
+
+为什么需要 `--session` / `--since`：账单文件是**累积**的（`VOICE_EVENTS_JSONL` 一直追加），
+而本脚本原先把文件里每一行都当本轮——2026-10-10 真人验收就出过事：拿累积文件出记录，
+得到的是「会话数 5 / 轮次 150」的混合版，本轮的 25 轮被旧轮次稀释（口径B p50 跟着变成混合值）。
+不给过滤条件时，若文件里有多段会话，记录里会写明这一点并在 stderr 提醒。
 
 为什么需要它：JSONL 是**机器可读的原始行**，但验收要回答的是「这一轮快在哪、
 有没有抢话、有没有被截断」——那需要按轮拆账、按分位汇总，并且把每轮的
@@ -19,6 +27,8 @@ from __future__ import annotations
 import argparse
 import json
 import statistics
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +73,66 @@ def load(path: Path) -> list[dict[str, Any]]:
     return records
 
 
+def sessions_of(records: list[dict[str, Any]]) -> list[str]:
+    """会话 id 按**首行时间**排序 —— `--session last` 靠它定义「最新一段」。"""
+    first_ts: dict[str, float] = {}
+    for r in records:
+        first_ts.setdefault(str(r.get("session_id", "?")), float(r.get("ts", 0.0)))
+    return [sid for sid, _ in sorted(first_ts.items(), key=lambda kv: kv[1])]
+
+
+def session_rows(records: list[dict[str, Any]], sid: str) -> list[dict[str, Any]]:
+    return [r for r in records if str(r.get("session_id", "?")) == sid]
+
+
+def session_lines(records: list[dict[str, Any]]) -> list[str]:
+    """每段会话一行（id / 轮次 / 起止 / 模式）—— `--list` 与提醒共用。"""
+    lines: list[str] = []
+    for sid in sessions_of(records):
+        rows = session_rows(records, sid)
+        t0 = time.strftime("%m-%d %H:%M:%S", time.localtime(float(rows[0].get("ts", 0.0))))
+        t1 = time.strftime("%H:%M:%S", time.localtime(float(rows[-1].get("ts", 0.0))))
+        modes = ",".join(sorted({str(r.get("mode", "?")) for r in rows}))
+        lines.append(f"{sid}  {len(rows):>3} 轮  {t0} → {t1}  mode={modes}")
+    return lines
+
+
+def parse_since(value: str) -> float:
+    """`--since` 的解析：接受 YYYY-MM-DD 或 'YYYY-MM-DD HH:MM[:SS]'，按本地时区。"""
+    for fmt in ("%Y-%m-%d", "%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return time.mktime(time.strptime(value, fmt))
+        except ValueError:
+            continue
+    raise SystemExit(f"--since {value!r} 解析不了；用 YYYY-MM-DD 或 'YYYY-MM-DD HH:MM[:SS]'")
+
+
+def pick_session(records: list[dict[str, Any]], value: str) -> list[dict[str, Any]]:
+    """`--session` 的选择器：`last` = 最新一段，其余按 id 精确匹配（认不出就列出可选值）。"""
+    ids = sessions_of(records)
+    if not ids:
+        return records
+    if value == "last":
+        sid = ids[-1]
+    elif value in ids:
+        sid = value
+    else:
+        raise SystemExit(
+            f"--session {value!r} 不在文件里。可选：{', '.join(ids)}（last = 最新一段）"
+        )
+    return session_rows(records, sid)
+
+
+def pick_since(records: list[dict[str, Any]], since: float) -> list[dict[str, Any]]:
+    """只留首行时间 ≥ since 的会话（含整段，不截半个会话）。"""
+    keep = {
+        sid
+        for sid in sessions_of(records)
+        if float(session_rows(records, sid)[0].get("ts", 0.0)) >= since
+    }
+    return [r for r in records if str(r.get("session_id", "?")) in keep]
+
+
 def _pct(values: list[float], q: float) -> float:
     """线性插值分位。样本少时由调用方负责说明 n。"""
     if not values:
@@ -92,7 +162,8 @@ def segment_ms(rec: dict[str, Any], start: str, end: str) -> float | None:
     return float(b) - float(a)
 
 
-def render(records: list[dict[str, Any]], source: str) -> str:
+def render(records: list[dict[str, Any]], source: str, *, filtered: bool = False) -> str:
+    """`filtered`：调用方已按会话/时间切片时不提醒「合并统计」——那是误报（本次就是切出来的）。"""
     if not records:
         return f"# 验收记录\n\n来源 `{source}`：**没有任何账单行**，无法出结论。\n"
 
@@ -110,6 +181,16 @@ def render(records: list[dict[str, Any]], source: str) -> str:
         f"轮次：{len(records)}（完整 {len(complete)} / 被打断 {len(interrupted)}）"
         f"　LLM：{', '.join(llm_names)}",
         "",
+        *(
+            [
+                f"> ⚠️ **源文件里有 {len(sessions)} 段会话，本记录是它们的合并统计**——单轮验收出记录"
+                "请加 `--session last`（或 `--since <日期>`）重跑，否则旧轮次会稀释本轮数字。"
+                "会话清单用 `--list` 看。",
+                "",
+            ]
+            if len(sessions) > 1 and not filtered
+            else []
+        ),
         *(
             [
                 "> ⚠️ **LLM 引擎包含 SimLlm——这些轮次不含真 LLM 延迟，本记录的口径B "
@@ -215,12 +296,44 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="把账单 JSONL 汇成验收记录")
     ap.add_argument("jsonl", help="账单 JSONL 路径（VOICE_EVENTS_JSONL 写出的文件）")
     ap.add_argument("--out", default=None, help="写入文件；不给就打印到 stdout")
+    ap.add_argument(
+        "--session",
+        default=None,
+        help="只统计一段会话：传 session_id，或 last（文件里最新的一那一段）",
+    )
+    ap.add_argument(
+        "--since",
+        default=None,
+        help="只统计首行时间在这之后的会话（YYYY-MM-DD 或 'YYYY-MM-DD HH:MM[:SS]'）",
+    )
+    ap.add_argument("--list", action="store_true", help="只列出文件里的会话清单，不生成记录")
     args = ap.parse_args()
 
     path = Path(args.jsonl).expanduser()
     if not path.exists():
         raise SystemExit(f"找不到账单文件：{path}\n提示：起服务时设 VOICE_EVENTS_JSONL={path}")
-    report = render(load(path), args.jsonl)
+    records = load(path)
+    if args.list:
+        for line in session_lines(records):
+            print(line)
+        return
+    ids = sessions_of(records)
+    if args.session:
+        records = pick_session(records, args.session)
+        if not records:
+            raise SystemExit(f"--session {args.session!r} 过滤后没有行")
+    elif args.since:
+        records = pick_since(records, parse_since(args.since))
+        if not records:
+            raise SystemExit(f"--since {args.since!r} 之后没有会话（--list 看清单）")
+    elif len(ids) > 1:
+        # 静默合并正是 2026-10-10 那次的坑：记录看着正常，数字却是整段历史的。
+        print(
+            f"⚠️ 源文件含 {len(ids)} 段会话，已合并统计；"
+            "单轮验收请加 --session last（--list 看清单）",
+            file=sys.stderr,
+        )
+    report = render(records, args.jsonl, filtered=bool(args.session or args.since))
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)

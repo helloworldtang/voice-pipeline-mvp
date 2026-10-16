@@ -6,11 +6,18 @@
 <title>voice-pilot</title>
 <style>
   :root { color-scheme: light dark; }
+  html, body { height: 100%; }
   body {
     font-family: -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
     max-width: 720px; margin: 0 auto; padding: 16px;
     background: #111318; color: #e6e8ee;
+    /* 验收时最新一轮必须始终可见：改成整页不滚、只有对话区滚，
+       这样状态点（绿/黄/蓝）、耗时账 chips、当前剧本句都常驻视口。 */
+    box-sizing: border-box;
+    display: flex; flex-direction: column;
+    overflow: hidden;
   }
+  header, #script-panel, #howto, #controls, #chips, footer { flex: 0 0 auto; }
   header { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
   header h1 { font-size: 18px; margin: 0; flex: 1; }
   #status { font-size: 12px; opacity: .7; }
@@ -19,13 +26,18 @@
   #dot.thinking { background: #fbbc04; }
   #dot.speaking { background: #8ab4f8; }
   @keyframes pulse { 50% { opacity: .4; } }
+  /* 三式说明看一遍就够，收起给对话区腾高度；需要时点开 */
   #howto { font-size: 12px; color: #9aa3b2; background: #1c2028; border: 1px solid #2a3140;
-           border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; line-height: 1.8; }
+           border-radius: 8px; margin-bottom: 10px; line-height: 1.8; }
+  #howto summary { cursor: pointer; color: #c7cdd8; padding: 6px 12px; user-select: none; }
+  #howto .body { padding: 0 12px 8px; max-height: 26vh; overflow-y: auto; }
   #howto b { color: #c7cdd8; }
   #script-panel { font-size: 13px; background: #171b22; border: 1px solid #2a3140;
                   border-radius: 8px; padding: 8px 12px; margin-bottom: 10px; }
   #script-panel summary { cursor: pointer; color: #c7cdd8; user-select: none; }
-  #script-panel ol { margin: 8px 0 2px; padding-left: 22px; line-height: 2; }
+  /* 剧本 10 句，展开时内部滚动，别把对话区挤没 */
+  #script-panel ol { margin: 8px 0 2px; padding-left: 22px; line-height: 2;
+                     max-height: 26vh; overflow-y: auto; }
   .step { color: #9aa3b2; cursor: pointer; }
   .step .tag { font-size: 11px; border: 1px solid #3a4356; border-radius: 4px;
                padding: 0 5px; margin-right: 6px; }
@@ -44,7 +56,16 @@
   #chips { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; min-height: 22px; }
   .chip { font-size: 11px; background: #232936; border-radius: 10px; padding: 2px 8px; }
   .chip b { color: #8ab4f8; }
+  /* 对话区：整页唯一的滚动容器，吃掉剩余高度 */
+  #log-wrap { flex: 1 1 auto; min-height: 90px; overflow-y: auto;
+              border-top: 1px solid #232936; padding-top: 8px; }
   #log { list-style: none; margin: 0; padding: 0; font-size: 15px; line-height: 1.7; }
+  /* 往上看历史时，最新一轮就不再自动跟随；这个按钮是回来的路 */
+  #to-latest { position: fixed; right: max(20px, calc(50% - 360px + 20px)); bottom: 38px;
+               display: none; z-index: 5; cursor: pointer;
+               background: #2a3140; color: #c7cdd8; border: 1px solid #3a4356;
+               border-radius: 16px; padding: 5px 12px; font-size: 12px; }
+  #to-latest.show { display: block; }
   #log li { padding: 1px 0; word-break: break-all; }
   #log .partial { color: #8a919e; }
   #log .user { color: #e6e8ee; }
@@ -65,15 +86,18 @@
   <ol id="script-steps"></ol>
 </details>
 
-<div id="howto">
-  <b>验收三式</b>：① 正常说完整句后<b>停住别补话</b>，等 AI 接（基准轮）；
-  ② 句中<b>停顿半秒再接着说</b>，看 AI 会不会抢答（抢话测试）；
-  ③ AI 播报中<b>直接插话「等一下」</b>，看它是否立刻停并等你说完（打断测试）。
-  状态点：绿=聆听中 · 黄=思考中 · 蓝=播报中。
-  行尾 ⏱=口径B：从「EOU 判定你说完」到「AI 首音到达」的耗时——不含你实际
-  说话的时间，也不含判停等待（判停另见 chips 的「判停」格）；体感响应
-  ≈ 判停 + 口径B。
-</div>
+<details id="howto">
+  <summary>验收三式 · 状态点 · ⏱ 含义（点开）</summary>
+  <div class="body">
+    <b>验收三式</b>：① 正常说完整句后<b>停住别补话</b>，等 AI 接（基准轮）；
+    ② 句中<b>停顿半秒再接着说</b>，看 AI 会不会抢答（抢话测试）；
+    ③ AI 播报中<b>直接插话「等一下」</b>，看它是否立刻停并等你说完（打断测试）。
+    状态点：绿=聆听中 · 黄=思考中 · 蓝=播报中。
+    行尾 ⏱=口径B：从「EOU 判定你说完」到「AI 首音到达」的耗时——不含你实际
+    说话的时间，也不含判停等待（判停另见 chips 的「判停」格）；体感响应
+    ≈ 判停 + 口径B。
+  </div>
+</details>
 
 <div id="controls">
   <input id="token" type="password" placeholder="token（可空）" style="width:130px">
@@ -90,7 +114,8 @@
 </div>
 
 <div id="chips"></div>
-<ul id="log"></ul>
+<div id="log-wrap"><ul id="log"></ul></div>
+<button id="to-latest" type="button">↓ 回到最新</button>
 
 <footer>Chrome only · 浏览器 AEC 免耳机 · 说话后停顿即判停，AI 播放中可插话打断</footer>
 

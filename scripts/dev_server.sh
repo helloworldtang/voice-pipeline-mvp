@@ -27,7 +27,8 @@ echo "✓ TTS=${VOICE_PIPELINE_TTS_ENGINE}（云流式，与线上同口径；�
 echo "✓ 账单落盘 $VOICE_EVENTS_JSONL"
 echo
 echo "下一步："
-echo "  1. Chrome 打开 http://localhost:8000 —— mode=real-serial、gating=neural、token 留空"
+echo "  1. Chrome 打开 http://localhost:8000 —— mode=real-serial、gating=conservative、token 留空"
+echo "     ⚠ 别选 neural：真人实测抢话 3/3，已退位为实验档（第四次定档）"
 echo "  2. 点「开麦」，按页面顶部「验收三式」说满 10 轮（5 基准 + 3 句中停顿 + 2 插话）"
 echo "  3. 验完出记录：uv run python scripts/report_turns.py \"$VOICE_EVENTS_JSONL\" --out docs/验收-本机真人-\$(date +%Y%m%d).md"
 echo

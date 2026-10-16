@@ -22,13 +22,15 @@ from uuid import uuid4
 from voice_pipeline.audio.chunker import Chunker
 from voice_pipeline.core.barge_in import BargeInDetector
 from voice_pipeline.core.eou import EouDetector, FusedEou, GatingMode
-from voice_pipeline.core.scheduler.base import AudioFragment, Scheduler, TurnItem
+from voice_pipeline.core.filler import FillerBank
+from voice_pipeline.core.scheduler.base import AudioFragment, Scheduler, TurnItem, play_filler
 from voice_pipeline.core.scheduler.pipelined import PipelinedScheduler
 from voice_pipeline.core.scheduler.serial import SerialScheduler
 from voice_pipeline.core.sentence_splitter import SentenceSplitter
 from voice_pipeline.core.turn_fsm import TurnFsm, TurnState
 from voice_pipeline.metrics.events import SessionClock, TurnMetrics
 from voice_pipeline.metrics.jsonl import TurnRecorder
+from voice_pipeline.metrics.trace import Tracer
 from voice_pipeline.providers.asr.sim_asr import SimAsr
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.providers.factory import build_eou, build_providers
@@ -73,6 +75,10 @@ class Session:
         # 缺权重时 build_eou 退回 conservative 并告警 —— 账单 eou_mode 会如实写回。
         gating: GatingMode = GatingMode.CONSERVATIVE,
         recorder: TurnRecorder | None = None,
+        # 预合成 filler（2026-10-10，体感优化）：判停成立后、TTS 首片之前先播一段预合成
+        # 短音频，把那一格 ~650ms 的固定成本盖住。None = 关闭（默认）。
+        # ⚠️ 口径B 一分不省：filler 只打 first_sound，见 core/filler.py 的计量纪律。
+        filler: FillerBank | None = None,
     ) -> None:
         self.session_id = uuid4().hex[:12]
         self.trace_id = uuid4().hex[:16]
@@ -81,6 +87,9 @@ class Session:
         self.interrupted = False
         self._clock = clock or SessionClock()
         self.metrics = TurnMetrics(clock=self._clock)
+        # 链路追踪：会话级 trace_id 贯穿多轮，每轮一棵 span 树（一轮 = 一个根 span）。
+        # 挂在 TurnMetrics 上是为了让调度器不改签名就能埋点。
+        self.metrics.tracer = Tracer(self.trace_id, self._clock)
         self._gating = gating
         self._eou = eou
         # 账单落盘（VOICE_EVENTS_JSONL）：默认关闭，见 metrics/jsonl.py。
@@ -91,12 +100,20 @@ class Session:
         # 内容——被打断的轮次里，用户听到多少就记多少，这是有意为之（听到的才是真的），
         # 不要"修复"成整句入史。
         self._history: list[dict[str, str]] = []
+        # filler 自己一个分片器：它的 seq 用 0/负数编号，不占调度器的分片序号空间
+        self._filler = filler
+        self._filler_chunker = Chunker()
 
         # M3：状态机 + 打断检测器 + 下行队列
         self._fsm = TurnFsm()
         self._barge = BargeInDetector()
         self.outbox: asyncio.Queue[TurnItem | AudioStop] = asyncio.Queue()
         self._turn_running = False
+        # 传输侧那一跳（outbox → 真正下发）：Session 记"入队时刻"，由 transport 在
+        # 真正发出首片时回调 note_first_audio_send() 补齐。**账单里落差记 -1 而不是 0**——
+        # 没量到就是没量到（filler 开启时这一格会成为首音被压后的证据）。
+        self._first_audio_enqueued_ms: float = -1.0
+        self._first_audio_sent = False
         # 本轮判停指标是否已抓进账单（防止被 reset 后的 0 覆盖）
         self._eou_collected = False
         # 空转写门的连续拦截计数（见 pending_end）
@@ -147,12 +164,38 @@ class Session:
             if self._eou is not None:
                 self._eou.push_audio(chunk)
             return [AudioFragment(seq=self.frames_echoed, data=chunk)]
-        await self._scheduler.on_audio(chunk)
+
+        # 上行每帧都埋：这一格过去完全不在视野里，而它的 CPU 是在**同一个事件循环**里
+        # 花掉的——下行 TTS/LLM 在 await 时会被它推迟。要看"尾部的等待是谁造成的"必须有它。
+        tr = self.metrics.tracer
+        if tr is not None:
+            # 上一轮已闭合 → 开新一轮前先清树。**安全性**：上一轮的账在 run_turn 收到
+            # TurnEnd 的那一刻就落完了（收到与落账之间没有 await），而新一轮第一帧
+            # 只可能在那之后被处理——所以这里清不会抹掉任何还没写盘的证据。
+            if tr.root is None or not tr.root.open:
+                tr.reset()
+            if tr.root is None:
+                # 本轮第一帧 = 整轮 trace 的起点。没有它，"用户说话期间链路在干什么"
+                # 这一段在账单里是空白（2026-10-17 实测丢过一整段）。
+                tr.start_root("turn", attrs={"mode": self.mode, "turn": self._turn_index + 1})
+        frame = tr.start("uplink.frame", attrs={"bytes": len(chunk)}) if tr is not None else None
+        if tr is not None:
+            dec = tr.start("asr.push_audio", frame)
+            await self._scheduler.on_audio(chunk)
+            tr.finish(dec)
+        else:  # pragma: no cover - tracer 恒存在，分支只为类型收窄
+            await self._scheduler.on_audio(chunk)
         if self._barge.is_speech(chunk):
             self._await_fresh_speech = False
         if self._eou is not None:
-            self._eou.push_audio(chunk)
-            self._eou.update_text(self._scheduler.text())
+            if tr is not None:
+                upd = tr.start("eou.update", frame)
+                self._eou.push_audio(chunk)
+                self._eou.update_text(self._scheduler.text())
+                tr.finish(upd)
+            else:  # pragma: no cover
+                self._eou.push_audio(chunk)
+                self._eou.update_text(self._scheduler.text())
         # L1：AI 在说/想时用户又开口 → 打断
         if (
             not self.interrupted
@@ -160,6 +203,8 @@ class Session:
             and self._barge.is_speech(chunk)
         ):
             self.barge_in()
+        if tr is not None and frame is not None:
+            tr.finish(frame)
         return []
 
     def pending_end(self) -> bool:
@@ -247,6 +292,15 @@ class Session:
         """
         if self._scheduler is None:
             return
+        # 根 span：整轮（本轮第一帧 → turn.end）。口径B 窗口是它的孩子，
+        # 账就从"一串时刻"变成"一棵可归因的树"，残差（没埋到的部分）会显式浮出来。
+        tracer = self.metrics.tracer
+        if tracer is not None and tracer.root is None:
+            tracer.start_root("turn", attrs={"mode": self.mode, "turn": self._turn_index + 1})
+        if tracer is not None and tracer.window is None:
+            tracer.start_window(
+                "turn.caliber_b", attrs={"mode": self.mode, "turn": self._turn_index}
+            )
         # 把 EOU 判停器的验收指标落进账单（仅 FusedEou 携带抢话/漏判/静音时长）。
         # ⚠️ 只在还没填过时填：run_turn 会在 reset 之前先采一次真值，这里若无条件
         # 覆盖，就会用 reset 之后的 0 把真值抹掉（eou_latency_ms 曾因此恒为 0）。
@@ -266,12 +320,26 @@ class Session:
                     first_audio = True
                     self._fsm.move(TurnState.SPEAKING)
                 yield item
+                # 预合成 filler：判停已成立、这一轮有真文本 → 紧接着把 filler 播出去，
+                # 盖住 TTS 首片那一格固定成本（~650ms）。filler 也是 AI 的声音，所以
+                # 状态机照常进 SPEAKING。计量纪律：只打 first_sound，**口径B 一分不省**
+                # （见 core/filler.py）——关掉时（None）这段是零开销的空循环。
+                if isinstance(item, AsrFinal) and item.text:
+                    async for frag in play_filler(self._filler, self._filler_chunker, self.metrics):
+                        if not first_audio:
+                            first_audio = True
+                            self._fsm.move(TurnState.SPEAKING)
+                        yield frag
         except asyncio.CancelledError:
             # 我们自己 cancel 在飞投机导致的，属预期，吞掉不冒泡
             pass
         finally:
             if not self.interrupted:
                 self._fsm.move(TurnState.LISTENING)
+            # 整轮 trace 在这里闭合。**口径B 窗口由调度器闭合**（首音那一刻），
+            # 这里只收尾外层：turn.end 之后的等待不进口径B，但要留在 trace 里可查。
+            if tracer is not None:
+                tracer.finish_root()
 
     async def run_turn(self) -> None:
         """后台跑一轮：把 finish() 产出的 TurnItem 投进 outbox，传输层统一发送。
@@ -286,6 +354,8 @@ class Session:
         self._eou_collected = False
         self._empty_blocks = 0
         self._recorded_this_turn = False
+        self._first_audio_enqueued_ms = -1.0
+        self._first_audio_sent = False
         # 每轮一本新账：TurnMetrics 的 mark 只记首次到达，跨轮复用不清账的话，
         # 第 2 轮起的账单会复读第 1 轮。必须在 _collect_eou_metrics 之前清——
         # 它要把上一轮的判停指标写进本轮账里。
@@ -299,6 +369,12 @@ class Session:
         assistant_parts: list[str] = []
         try:
             async for item in self.finish():
+                if (
+                    isinstance(item, AudioFragment)
+                    and self._first_audio_enqueued_ms < 0
+                    and item.seq >= 0  # filler 用负序号：它是体感优化，不进口径B 那一跳
+                ):
+                    self._first_audio_enqueued_ms = self._clock.elapsed_ms()
                 self.outbox.put_nowait(item)
                 # 边播边攒多轮上下文：AsrFinal→user，TtsSentence→assistant（拼句）。
                 # 只记流经 outbox 的内容，被 interrupted 截断的部分自然不入史。
@@ -322,6 +398,30 @@ class Session:
                 if assistant_parts:
                     self._history.append({"role": "assistant", "content": "".join(assistant_parts)})
                 self._trim_history()
+
+    def note_first_audio_send(self) -> None:
+        """传输层回调：**真正把首片发下去的那一刻**调一次。
+
+        量的是 outbox 排队 → 落网线那一跳。为什么单独记它：`first_audio_out` 打点发生在
+        **调度器 yield 的瞬间**，从此以后（outbox 排队、JSON 封帧、WS 发送、客户端抖动缓冲）
+        全都不在任何一格账单里——filler 打开后这一格会变成首音被推迟多久的直接证据。
+
+        没能记到（尚未入队 / 尚未发送）就保持 -1，**不填 0**。
+        """
+        if self._first_audio_sent or self._first_audio_enqueued_ms < 0:
+            return
+        tracer = self.metrics.tracer
+        if tracer is None:
+            return
+        now = self._clock.elapsed_ms()
+        self._first_audio_sent = True
+        tracer.record(
+            "tx.first_audio",
+            self._first_audio_enqueued_ms,
+            now,
+            parent=tracer.window or tracer.root,
+            attrs={"wait_ms": round(now - self._first_audio_enqueued_ms, 3)},
+        )
 
     def _record_turn(
         self,
@@ -357,6 +457,9 @@ class Session:
                 "llm": self._llm_name,
                 "user_text": user_text or "",
                 "assistant_text": "".join(assistant_parts),
+                # span 树随账单一起落盘：事后能按 trace_id 重建一棵完整的调用树，
+                # 而不是只有几个打点差。只关心数字的工具可以直接无视这一字段。
+                "spans": self.metrics.tracer.to_list() if self.metrics.tracer is not None else [],
             },
         )
 

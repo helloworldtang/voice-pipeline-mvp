@@ -66,11 +66,37 @@ function setState(kind, text) {
 
 // ---- 转写区 -----------------------------------------------------------------
 
+// 最新一轮常驻可见：对话区是整页唯一的滚动容器（见 index.html 的 #log-wrap），
+// 内容一多就会掉出视口。两条规则：
+//   ① 追加前先量「用户是否贴着底部」，只有贴底才自动跟随——否则用户往上翻看
+//      历史时会被强行拽回底部，回看根本没法用（验收时要回查前几轮的账）。
+//   ② 滚到底要等浏览器排完版（rAF），否则量到的是加内容之前的高度。
+function logWrap() { return $("log-wrap"); }
+
+function nearBottom(el, threshold = 60) {
+  return el.scrollHeight - el.scrollTop - el.clientHeight <= threshold;
+}
+
+function stickToBottom() {
+  const el = logWrap();
+  el.scrollTop = el.scrollHeight;
+  $("to-latest").classList.remove("show");
+}
+
+function followLatest() {
+  const el = logWrap();
+  if (nearBottom(el)) {
+    requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
+  }
+}
+
 function addLine(cls, text) {
+  const stick = nearBottom(logWrap()); // 必须在 appendChild 之前量
   const li = document.createElement("li");
   li.className = cls;
   li.textContent = text;
   $("log").appendChild(li);
+  if (stick) requestAnimationFrame(() => { logWrap().scrollTop = logWrap().scrollHeight; });
   return li;
 }
 
