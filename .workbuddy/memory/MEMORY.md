@@ -49,7 +49,7 @@
   首句 ~120 + 传输 ~30，判停另算在口径B 外）。
   **顺带修真 bug**：`call()` 抛 ConnectionError 时无回调投哨兵 → `queue.get()` 永久挂起
   （旧探针「偶发卡死」根因）→ `fail_sentinel` done callback。
-  ⚠️ **「预合成静音帧」仍未做**（filler 路线，README 差距表在列）——别把 P0.5 说成整个 WarmPool 兑现。
+  ⚠️ **语音 filler（§三①）已于 2026-10-17 落地+实测**（体感首音 p50 6ms、口径B 不变，但片段偏长会推迟真回答起点，需调短）；WarmPool「预合成静音帧」静音缓冲变体仍未做（README 差距表在列）——别把 P0.5 说成整个 WarmPool 兑现。
   测试 16 例（`test_tts_pool.py` 13 + `test_prewarm_wiring.py` 3）；A/B 命令见追踪文档 §八。
 - **🔺 2026-10-17 P1 已落地：ASR 前置能量门**：`core/energy_gate.py`（`AsrEnergyGate`）接在
   `Session.on_audio` 的 ASR 之前——判停后客户端持续喂的静音帧不进 ASR。**门限 0.01
@@ -75,7 +75,7 @@
   未命中时却是纯亏损。完整账在 `docs/实验报告.md`。**对外不要再报 179ms / 81ms / 534ms。**
 - **M3 barge-in 三层 + 状态机 + live 客户端已完成**（本次）：`turn_fsm.py` + `barge_in.py` + `AudioStop` + WS 三路并发（接收/`run_turn`/`pump`，outbox 解耦）+ `scripts/live_client.py`；71 项测试全绿。细节与诚实边界见技术方案 **§14**。
 - **M5 收尾发版已完成**（本地，未 push）：README 补齐「承诺映射表（逐项对齐真实文件）+ 对比定位 + 差距表 + 发版检查单」；LICENSE(MIT) 已在；技术方案 §5 加「设计意图≠实际落盘」差异说明、M5 行标 ✅。
-- **⚠️ M5 诚实盘点发现的重要事实（勿再当"已完成"）**：① **real 模式 LLM 仍是 `SimLlm`**，真 DeepSeek 未接（端到端口径B 只是本机侧下界）；② scripted 客户端未做（§4.5 承诺 live+scripted）；③ JSONL 事件流落盘未做（§4.5 #4）；④ `DualPriorityQueue` 有实现有单测但**未接进 WS 主链路**（用无界 outbox）；⑤ 无 Dockerfile/compose；⑥ barge-in 无回声抑制（仅 L1 能量）、尾音未量化；⑦ ASR 前置 energy gate **已兑现**（2026-10-17 P1，见上）、WarmPool 的「预合成静音帧」仍未做（filler 路线，连接预热已兑现）；⑧ EOU L2/L3 为启发式。以上全部已列入 README 差距表。
+- **⚠️ M5 诚实盘点发现的重要事实（勿再当"已完成"）**：① **real 模式 LLM 仍是 `SimLlm`**，真 DeepSeek 未接（端到端口径B 只是本机侧下界）；② scripted 客户端未做（§4.5 承诺 live+scripted）；③ JSONL 事件流落盘未做（§4.5 #4）；④ `DualPriorityQueue` 有实现有单测但**未接进 WS 主链路**（用无界 outbox）；⑤ 无 Dockerfile/compose；⑥ barge-in 无回声抑制（仅 L1 能量）、尾音未量化；⑦ ASR 前置 energy gate **已兑现**（2026-10-17 P1）、预合成 filler 语音版已落地（2026-10-17 ①）；WarmPool「预合成静音帧」静音缓冲变体仍未做（连接预热已兑现）；⑧ EOU L2/L3 为启发式。以上全部已列入 README 差距表。
 - **全部里程碑（M0–M5）代码与文档完成**，本地 commit，**未 push**（用户要求先本地验收）。
 
 ## ⚠️ 2026-10 后续（本节最新，与上文的滞后部分冲突时以本节为准）

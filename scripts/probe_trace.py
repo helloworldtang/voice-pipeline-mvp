@@ -10,6 +10,7 @@
     uv run python scripts/probe_trace.py --llm sim            # 只看本机侧（无 LLM 那一格）
     uv run python scripts/probe_trace.py --tts dashscope --no-prewarm   # 预热 A/B 对照臂
     uv run python scripts/probe_trace.py --tts dashscope --no-energy-gate  # 能量门 A/B 对照臂
+    uv run python scripts/probe_trace.py --tts dashscope --no-filler  # 预合成 filler A/B 对照臂
     uv run python scripts/probe_trace.py --tree               # 额外打一轮完整 span 树
 
 输出：
@@ -38,6 +39,7 @@ import soxr
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from voice_pipeline.core.eou import GatingMode  # noqa: E402
+from voice_pipeline.core.filler import DEFAULT_FILLER_DIR, FillerBank  # noqa: E402
 from voice_pipeline.core.scheduler.base import AudioFragment  # noqa: E402
 from voice_pipeline.metrics.trace import (  # noqa: E402
     MISSING,
@@ -92,6 +94,7 @@ async def run_turn(
     tail_silence_ms: int,
     prewarm: bool = True,
     energy_gate: bool = True,
+    filler: Any = None,
     max_turn_s: float = 30.0,
 ) -> dict[str, Any]:
     """喂一轮：上行 → EOU 判停 → run_turn → 并行 drain outbox（模拟 pump+sender）。"""
@@ -110,6 +113,7 @@ async def run_turn(
         eou=build_eou(gating),
         prewarm_tts=prewarm,
         energy_gate=energy_gate,
+        filler=filler,
     )
 
     frame = 3200  # 100ms @16k
@@ -252,6 +256,12 @@ def analyse(rows: list[dict[str, Any]]) -> dict[str, Any]:
         for name in t["stages"]:
             if name not in stage_names:
                 stage_names.append(name)
+    first_sound = [
+        r["bill"].get("first_sound_ms", -1.0)
+        for r in rows
+        if r.get("bill", {}).get("first_sound_ms", -1.0) >= 0
+    ]
+    filler_used = [r["bill"].get("filler_used", 0.0) for r in rows]
     return {
         "ok": len(ok),
         "total": len(per_turn),
@@ -262,6 +272,8 @@ def analyse(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "true_gap_ms": [t["true_gap_ms"] for t in ok],
         "identity_error_ms": [t["identity_error_ms"] for t in ok],
         "gated_frames": [t["gated_frames"] for t in ok],
+        "first_sound_ms": first_sound,
+        "filler_used": filler_used,
         "stages": {
             name: [t["stages"][name] for t in ok if name in t["stages"]] for name in stage_names
         },
@@ -332,6 +344,19 @@ def print_report(agg: dict[str, Any], mode: str, engine: str, llm: str) -> None:
             f"| 能量门拦截帧（P1） | p50 {statistics.median(gated):.0f} 帧 | max {max(gated)} 帧 |"
             " — | — | 判停后的静音帧不进 ASR；EOU 仍收全部帧 |"
         )
+    fs = agg.get("first_sound_ms") or []
+    if fs:
+        print(
+            f"| 预合成 filler 体感首音（first_sound） | p50 {statistics.median(fs):.0f}ms | "
+            f"max {max(fs):.0f}ms | — | — | 有 filler：EOU 后首字节那一刻；"
+            "无 filler 此格为空（体感首音回到口径B 起点） |"
+        )
+    fu = agg.get("filler_used") or []
+    if fu:
+        print(
+            f"| filler 命中轮次 | {sum(fu):.0f}/{len(fu)} 轮 | — | — | — | "
+            "filler_used=1 的轮数（空转写轮不播，见 core/filler.py 纪律） |"
+        )
     gap_p50 = statistics.median(agg["true_gap_ms"])
     print(
         f"| 真·未归因 | {gap_p50:.0f}ms | {max(agg['true_gap_ms']):.0f}ms | "
@@ -387,6 +412,11 @@ async def main() -> int:
         action="store_true",
         help="对照臂：关掉 ASR 前置能量门（静音帧照常推 ASR，量的就是循环竞争那一格）",
     )
+    ap.add_argument(
+        "--no-filler",
+        action="store_true",
+        help="对照臂：关掉预合成 filler（不进 FillerBank；体感首音回到口径B 起点）",
+    )
     ap.add_argument("--out", default=None, help="逐轮 span JSONL 输出路径")
     args = ap.parse_args()
 
@@ -402,8 +432,12 @@ async def main() -> int:
         f"ASR=transducer  TTS={args.tts or 'melo'}  LLM={args.llm}({args.llm_model})  "
         f"判停={args.gating}  n={args.repeat}  "
         f"预热={'关' if args.no_prewarm else '开'}  "
-        f"能量门={'关' if args.no_energy_gate else '开'}"
+        f"能量门={'关' if args.no_energy_gate else '开'}  "
+        f"filler={'关' if args.no_filler else '开'}"
     )
+
+    # 预合成 filler 对照臂：开臂直接读默认目录（不依赖 env），关臂传 None。
+    filler = None if args.no_filler else FillerBank.load(DEFAULT_FILLER_DIR)
 
     pcm = build_utterance(args.text)
     print(f"上行语音 {len(pcm) / 16000 * 1000:.0f}ms（{args.text}）")
@@ -419,13 +453,17 @@ async def main() -> int:
             tail_silence_ms=args.silence_ms,
             prewarm=not args.no_prewarm,
             energy_gate=not args.no_energy_gate,
+            filler=filler,
         )
         row["repeat"] = i + 1
         rows.append(row)
         b = row["bill"]
         cal = b.get("caliber_b_ms", MISSING)
+        fs = b.get("first_sound_ms", -1.0)
+        fs_txt = f"{fs:.0f}ms" if fs >= 0 else "—(无)"
         print(
             f"轮 {i + 1}: 口径B={cal:.0f}ms "
+            f"体感首音={fs_txt}(filler={b.get('filler_used', 0.0):.0f}) "
             f"判停等待={row['eou_wait_ms']:.0f}ms 下行音频={row['sent_bytes']}B "
             f"LLM={row['llm']}"
         )
