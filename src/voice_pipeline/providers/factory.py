@@ -72,6 +72,17 @@ def _mlx_available() -> bool:
         return False
 
 
+def _build_mlx() -> LlmProvider:
+    """本地 MLX：`VOICE_LLM_PROCESS=1` 走独立子进程（消 GIL 争用），否则进程内。"""
+    if os.environ.get("VOICE_LLM_PROCESS", "").strip() == "1":
+        from voice_pipeline.providers.llm.mlx_proc_llm import MlxProcLlm
+
+        return MlxProcLlm()
+    from voice_pipeline.providers.llm.mlx_llm import MlxLlm
+
+    return MlxLlm()
+
+
 def build_llm(engine: str = "auto", model: str = DEFAULT_LLM_MODEL) -> LlmProvider:
     """按 engine 组装 LLM。真 LLM 需要 DASHSCOPE_API_KEY；本地需 mlx-lm。"""
     engine = resolve_llm_engine(engine)
@@ -80,20 +91,16 @@ def build_llm(engine: str = "auto", model: str = DEFAULT_LLM_MODEL) -> LlmProvid
     if engine == "qwen":
         return QwenLlm(model=model)
     if engine == "mlx":
-        from voice_pipeline.providers.llm.mlx_llm import MlxLlm
-
-        return MlxLlm()
+        return _build_mlx()
     if engine == "auto":
         if os.environ.get(API_KEY_ENV):
             return QwenLlm(model=model)
         if _mlx_available():
-            from voice_pipeline.providers.llm.mlx_llm import MlxLlm
-
             logger.warning(
                 "没有 %s，LLM 降级到本地 MLX：延迟更低但答案更笼统（账单 llm=MlxLlm）",
                 API_KEY_ENV,
             )
-            return MlxLlm()
+            return _build_mlx()
         logger.warning(
             "real 模式没有 %s，LLM 退回 SimLlm：端到端数字不含 LLM 首 token，"
             "只是本机侧下界，不要对外当真实延迟报",

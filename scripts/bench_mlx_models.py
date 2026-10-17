@@ -31,11 +31,11 @@ def first_sentence_ms(tokens: list[str], stamps: list[float]) -> float:
     return -1.0
 
 
-def bench(model_id: str, repeats: int) -> dict[str, object]:
+def bench(model_id: str, repeats: int, question: str = QUESTION) -> dict[str, object]:
     from mlx_lm import load, stream_generate
 
     model, tokenizer = load(model_id)
-    msgs = build_messages(DEFAULT_SYSTEM, [], QUESTION)
+    msgs = build_messages(DEFAULT_SYSTEM, [], question)
     try:
         # Qwen3.5 默认开「思考链」：对语音助手是灾难（先说 200 token 的推理过程）。
         # 模板不支持这个参数就退回默认。
@@ -79,12 +79,13 @@ def main() -> None:
     ap.add_argument("--models", nargs="+", required=True)
     ap.add_argument("--repeats", type=int, default=3)
     ap.add_argument("--out", type=Path, default=Path("/tmp/vp-ac/mlx-ab.jsonl"))
+    ap.add_argument("--question", default=QUESTION)
     args = ap.parse_args()
 
     rows = []
     for m in args.models:
         try:
-            row = bench(m, args.repeats)
+            row = bench(m, args.repeats, args.question)
         except Exception as exc:  # 下载失败/模型不存在都要留痕，不静默跳过
             row = {"model": m, "error": f"{type(exc).__name__}: {exc}"[:200]}
         rows.append(row)
