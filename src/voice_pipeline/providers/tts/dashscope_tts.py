@@ -19,6 +19,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from collections.abc import AsyncIterator, Callable
 from typing import Protocol
 
@@ -42,17 +43,30 @@ class _Synthesizer(Protocol):
 
 
 class _AsyncQueueCallback:
-    """SDK 线程 → asyncio.Queue 的桥。结束/出错都投 None 哨兵终止迭代。"""
+    """SDK 线程 → asyncio.Queue 的桥。结束/出错都投 None 哨兵终止迭代。
 
-    def __init__(self, loop: asyncio.AbstractEventLoop, queue: asyncio.Queue[bytes | None]) -> None:
+    `marks`：phase 时刻表（perf_counter 原值）。**由 SDK 线程写、事件循环读**：
+    只 `setdefault` 单个 float（GIL 下原子），调度器在首片到达那一刻就能拆
+    「建连 vs 服务端合成」两段，不必等整句合成完。不传就是普通桥（测试替身）。
+    """
+
+    def __init__(
+        self,
+        loop: asyncio.AbstractEventLoop,
+        queue: asyncio.Queue[bytes | None],
+        marks: dict[str, float] | None = None,
+    ) -> None:
         self._loop = loop
         self._queue = queue
+        self.marks = marks if marks is not None else {}
         self.error: str | None = None
 
     def on_data(self, data: bytes) -> None:
+        self.marks.setdefault("first_data", time.perf_counter())
         self._loop.call_soon_threadsafe(self._queue.put_nowait, data)
 
     def on_complete(self) -> None:
+        self.marks.setdefault("complete", time.perf_counter())
         self._loop.call_soon_threadsafe(self._queue.put_nowait, None)
 
     def on_error(self, message: str) -> None:
@@ -62,7 +76,7 @@ class _AsyncQueueCallback:
 
     # SDK 生命周期回调：桥不关心，但接口得齐（缺了会 AttributeError）
     def on_open(self) -> None:
-        pass
+        self.marks.setdefault("open", time.perf_counter())
 
     def on_close(self) -> None:
         pass
@@ -78,15 +92,18 @@ class _ListCallback:
     事后从 SDK 内部线程回调。所以这里带一个 Event，synth_blocking 等它。
     """
 
-    def __init__(self) -> None:
+    def __init__(self, marks: dict[str, float] | None = None) -> None:
         self.chunks: list[bytes] = []
+        self.marks = marks if marks is not None else {}
         self.error: str | None = None
         self.done = threading.Event()
 
     def on_data(self, data: bytes) -> None:
+        self.marks.setdefault("first_data", time.perf_counter())
         self.chunks.append(data)
 
     def on_complete(self) -> None:
+        self.marks.setdefault("complete", time.perf_counter())
         self.done.set()
 
     def on_error(self, message: str) -> None:
@@ -94,7 +111,7 @@ class _ListCallback:
         self.done.set()
 
     def on_open(self) -> None:
-        pass
+        self.marks.setdefault("open", time.perf_counter())
 
     def on_close(self) -> None:
         pass
@@ -124,6 +141,11 @@ class DashScopeTts:
         self.voice = voice
         self.timeout_s = timeout_s
         self._synth_factory = synth_factory or self._make_default_factory(api_key)
+        # phase 时刻表（perf_counter 原值）：`construct`（建合成器前）/ `submit`
+        # （call 提交前）/ `open`（WS 连上并认证完）/ `first_data`（首个音频分片）
+        # / `complete`。**实时可读**——synth() 一进来就挂上，调度器在首片到达
+        # 那一刻即可拆子 span，不必等整句。约定属性名见 metrics/trace.py phases_of。
+        self.last_phases: dict[str, float] = {}
 
     def _make_default_factory(self, api_key: str | None) -> Callable[[_Callback], _Synthesizer]:
         resolved = api_key or os.environ.get(API_KEY_ENV, "")
@@ -147,8 +169,15 @@ class DashScopeTts:
         """流式合成：首片到达即 yield，不等整句。"""
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[bytes | None] = asyncio.Queue()
-        callback = _AsyncQueueCallback(loop, queue)
+        marks: dict[str, float] = {}
+        callback = _AsyncQueueCallback(loop, queue, marks)
+        # 先把表挂上再建合成器：调度器可能在首片到达前的任何一刻来读。
+        # SDK 线程往里 setdefault 写，事件循环只读——跨线程只走这一条路。
+        self.last_phases = marks
+        t_construct = time.perf_counter()
         synthesizer = self._synth_factory(callback)
+        marks["construct"] = t_construct
+        marks["submit"] = time.perf_counter()
         # 合成是阻塞调用（含 WS 收流），放线程里跑；回调持续往 queue 投片，
         # 消费端因此能在合成完成前就开始出片。
         task = asyncio.create_task(asyncio.to_thread(synthesizer.call, sentence))
@@ -167,8 +196,13 @@ class DashScopeTts:
 
         call() 是异步提交（见 _ListCallback 的警告），必须等 done 事件。
         """
-        callback = _ListCallback()
+        marks: dict[str, float] = {}
+        callback = _ListCallback(marks)
+        self.last_phases = marks
+        t_construct = time.perf_counter()
         synthesizer = self._synth_factory(callback)
+        marks["construct"] = t_construct
+        marks["submit"] = time.perf_counter()
         synthesizer.call(sentence)
         if not callback.done.wait(timeout=self.timeout_s):
             msg = f"DashScope TTS {self.timeout_s}s 内未完成（无 complete 也无 error）"

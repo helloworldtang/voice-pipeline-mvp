@@ -42,6 +42,15 @@ class SessionClock:
     def elapsed_ms(self) -> float:
         return (time.perf_counter() - self._t0) * 1000.0
 
+    def ms_at(self, ts: float) -> float:
+        """把 `time.perf_counter()` 的绝对值换算成会话 ms。
+
+        provider 在**另一个线程**里记的时刻（DashScope SDK 的 on_open 之类）
+        只有 perf_counter 原值。换算必须走时钟统一做：两边各自找原点相减的话，
+        span 会整体漂移，而账面上看不出来（2026-10-17 深拆时加）。
+        """
+        return (ts - self._t0) * 1000.0
+
 
 @dataclass(slots=True)
 class TurnMetrics:

@@ -173,6 +173,29 @@ class Tracer:
         if self.root is not None:
             self.finish(self.root, attrs)
 
+    def record_perf(
+        self,
+        name: str,
+        t0_perf: float,
+        t1_perf: float,
+        parent: Span | None = None,
+        attrs: Mapping[str, object] | None = None,
+    ) -> Span:
+        """用 `time.perf_counter()` 原值补记 span。
+
+        与 `record` 的区别只在时间戳的坐标系：这里的入参是 perf_counter 绝对值
+        （provider 在别的线程里记的），内部经**时钟**换算成会话 ms。必须走时钟
+        统一换算——provider 与 tracer 各自找原点相减的话 span 会整体漂移，
+        而账面上看不出来。
+        """
+        return self.record(
+            name,
+            self._clock.ms_at(t0_perf),
+            self._clock.ms_at(t1_perf),
+            parent,
+            attrs,
+        )
+
     def finish_window(self, attrs: Mapping[str, object] | None = None) -> None:
         """闭合口径B 窗口（首音出去的那一刻）。重复调用无效。"""
         if self.window is not None:
@@ -393,3 +416,36 @@ def parse_spans(rows: Iterable[Mapping[str, Any]]) -> tuple[list[Span], dict[str
         if not span.parent_id and span.name.endswith(ROOT_SUFFIX):
             roots[span.span_id] = span
     return out, roots
+
+
+def phases_of(provider: object) -> Mapping[str, float]:
+    """取 provider 的 phase 时刻表（约定属性名 `last_phases`，perf_counter 原值）。
+
+    没有就返回空表：本地引擎（melo/kokoro）没有可分的事件，**空表比编几个键
+    诚实**——调用方据此跳过子 span，而不是记一段 0ms 的假账。
+    """
+    marks = getattr(provider, "last_phases", None)
+    return marks if isinstance(marks, Mapping) else {}
+
+
+def phase_span(
+    tracer: Tracer | None,
+    name: str,
+    phases: Mapping[str, float],
+    lo_key: str,
+    hi_key: str,
+    parent: Span | None = None,
+    attrs: Mapping[str, object] | None = None,
+) -> Span | None:
+    """从 phase 时刻表补记一个子 span；缺任一端点返回 None。
+
+    例：DashScope TTS 的 `on_open` 没 fire 就不记 `tts.connect`，只记有证据的
+    那一段。深拆的原则是**缺证据的格子宁可空着，也不能填 0 假装测过**。
+    """
+    if tracer is None:
+        return None
+    a = phases.get(lo_key)
+    b = phases.get(hi_key)
+    if a is None or b is None or b < a:
+        return None
+    return tracer.record_perf(name, a, b, parent, attrs)

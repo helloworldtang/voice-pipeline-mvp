@@ -17,18 +17,27 @@ from voice_pipeline.providers.tts.dashscope_tts import API_KEY_ENV, DashScopeTts
 
 
 class FakeSynthesizer:
-    """模拟 SDK：.call(text) 在被调用线程上依次触发回调。chunks 控制分几片。"""
+    """模拟 SDK：.call(text) 在被调用线程上依次触发回调。chunks 控制分几片。
 
-    def __init__(self, callback: object, chunks: list[bytes], delay: float = 0.0) -> None:
+    `open_delay`：on_open 之前的休眠——真实 SDK 也是先建连（on_open）再出数据，
+    phase 拆解（建连 vs 服务端合成）要靠这个顺序才能被测出来。
+    """
+
+    def __init__(
+        self, callback: object, chunks: list[bytes], delay: float = 0.0, open_delay: float = 0.0
+    ) -> None:
         self._cb = callback
         self._chunks = chunks
         self._delay = delay
+        self._open_delay = open_delay
         self.calls: list[str] = []
 
     def call(self, text: str) -> bytes:
         import time
 
         self.calls.append(text)
+        time.sleep(self._open_delay)
+        self._cb.on_open()  # type: ignore[attr-defined]
         for chunk in self._chunks:
             time.sleep(self._delay)
             self._cb.on_data(chunk)  # type: ignore[attr-defined]
@@ -37,12 +46,12 @@ class FakeSynthesizer:
 
 
 def _factory(
-    chunks: list[bytes], delay: float = 0.0
+    chunks: list[bytes], delay: float = 0.0, open_delay: float = 0.0
 ) -> tuple[Callable[[object], FakeSynthesizer], list[FakeSynthesizer]]:
     made: list[FakeSynthesizer] = []
 
     def factory(callback: object) -> FakeSynthesizer:
-        synth = FakeSynthesizer(callback, chunks, delay)
+        synth = FakeSynthesizer(callback, chunks, delay, open_delay)
         made.append(synth)
         return synth
 
@@ -57,6 +66,33 @@ async def test_synth_yields_chunks_in_order() -> None:
     got = [c async for c in tts.synth("一句话。")]
     assert got == chunks
     assert made[0].calls == ["一句话。"]
+
+
+async def test_phase_marks_split_connect_from_server_synthesis() -> None:
+    """深拆首片的两段都要有证据：`submit→open`（建连）与 `open→first_data`（合成）。
+
+    假件按真实 SDK 的顺序回调（先 on_open 再出数据）。这两段是 2026-10-17
+    深拆时新加的格子：云 TTS 首片 ~600ms 到底花在建连还是服务端，之前没人知道。
+    """
+    factory, _ = _factory([b"a" * 100], delay=0.05, open_delay=0.03)
+    tts = DashScopeTts(synth_factory=factory)
+
+    got = [c async for c in tts.synth("句")]
+    assert got
+    marks = tts.last_phases
+    assert {"construct", "submit", "open", "first_data", "complete"} <= set(marks)
+    assert marks["construct"] <= marks["submit"] <= marks["open"] <= marks["first_data"]
+    # 假件的休眠就是下界：建连 ≥30ms、出数据前再 ≥50ms
+    assert (marks["open"] - marks["submit"]) * 1000 >= 25
+    assert (marks["first_data"] - marks["open"]) * 1000 >= 45
+
+
+def test_synth_blocking_also_records_phases() -> None:
+    """同步路径同样留 phase 证据（探针走它，调度器走流式那条）。"""
+    factory, _ = _factory([b"ab", b"cd"], open_delay=0.01)
+    tts = DashScopeTts(synth_factory=factory)
+    assert tts.synth_blocking("hi") == b"abcd"
+    assert {"submit", "open", "first_data"} <= set(tts.last_phases)
 
 
 async def test_synth_propagates_sdk_error() -> None:

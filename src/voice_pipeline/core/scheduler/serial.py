@@ -14,7 +14,7 @@ from collections.abc import AsyncIterator
 from voice_pipeline.audio.chunker import Chunker
 from voice_pipeline.core.sentence_splitter import SentenceSplitter
 from voice_pipeline.metrics.events import TurnMetrics
-from voice_pipeline.metrics.trace import Span
+from voice_pipeline.metrics.trace import Span, phase_span, phases_of
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.server.protocol import AsrFinal, TtsSentence, TurnEnd, TurnStart
 
@@ -92,6 +92,13 @@ class SerialScheduler:
                 if not saw_token:
                     self._metrics.mark("llm_first_token")
                     saw_token = True
+                    if tracer:
+                        # 深拆 llm.ttft：`headers`（发包→响应头 = 网络+路由）与
+                        # `prefill`（响应头→首个 content = 服务端排队+prefill）。
+                        # 时刻是 provider 在 astream 里记的 perf 原值，经会话钟换算。
+                        phases = phases_of(self._llm)
+                        phase_span(tracer, "llm.headers", phases, "start", "headers", ttft)
+                        phase_span(tracer, "llm.prefill", phases, "headers", "first_content", ttft)
                     if tracer and ttft:
                         tracer.finish(ttft)  # 首 token：这一格是模型自己的 RTT+prefill
                     if tracer and req is not None:
@@ -137,6 +144,14 @@ class SerialScheduler:
             if first_chunk:
                 first_chunk = False
                 self._metrics.mark("tts_first_chunk")
+                if tr is not None:
+                    # 深拆 tts.first_chunk：`connect`（建连+认证）与 `first_byte`
+                    # （服务端合成首片）。on_open 没 fire 时 connect 不记、first_byte
+                    # 从 submit 起算——缺证据的格子宁空不填 0（phase_span 的纪律）。
+                    phases = phases_of(self._tts)
+                    phase_span(tr, "tts.connect", phases, "submit", "open", synth)
+                    open_key = "open" if "open" in phases else "submit"
+                    phase_span(tr, "tts.first_byte", phases, open_key, "first_data", synth)
                 if tr is not None and head is not None:
                     tr.finish(head)
             self._metrics.mark("first_audio_out")

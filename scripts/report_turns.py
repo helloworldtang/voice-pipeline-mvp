@@ -32,6 +32,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from voice_pipeline.metrics.trace import exclusive_times, parse_spans
+
 # waterfall 各点相对会话钟的顺序（与 metrics/events.py 的 WATERFALL_POINTS 对齐）
 WATERFALL = (
     "vad_onset",
@@ -162,8 +164,14 @@ def segment_ms(rec: dict[str, Any], start: str, end: str) -> float | None:
     return float(b) - float(a)
 
 
-def render(records: list[dict[str, Any]], source: str, *, filtered: bool = False) -> str:
-    """`filtered`：调用方已按会话/时间切片时不提醒「合并统计」——那是误报（本次就是切出来的）。"""
+def render(
+    records: list[dict[str, Any]], source: str, *, filtered: bool = False, spans: bool = False
+) -> str:
+    """`filtered`：调用方已按会话/时间切片时不提醒「合并统计」——那是误报（本次就是切出来的）。
+
+    `spans`：追加 span 分格表（口径B 窗口内每个 span 的自有时间）。账单行里的
+    `spans` 字段是 2026-10-17 链路追踪上线后才有的，历史行没有就如实说明。
+    """
     if not records:
         return f"# 验收记录\n\n来源 `{source}`：**没有任何账单行**，无法出结论。\n"
 
@@ -289,7 +297,61 @@ def render(records: list[dict[str, Any]], source: str, *, filtered: bool = False
             f"{(r.get('user_text') or '')[:24]} | {(r.get('assistant_text') or '')[:24]} |"
         )
     lines.append("")
+
+    if spans:
+        lines += render_span_section(records)
     return "\n".join(lines) + "\n"
+
+
+def render_span_section(records: list[dict[str, Any]]) -> list[str]:
+    """span 分格表：口径B 窗口内每个 span 的**自有时间**（flame graph 口径）。
+
+    为什么不能直接拿 span 时长加总：真实链路是嵌套的（`llm.request` 里包着
+    `tts.synth`）， sibling 时长相加会比口径B 还大。自有时间 = 区间扣掉直接后代
+    的覆盖，每毫秒只归一个 span——`Σ自有 ≤ 口径B`，差额就是没埋到的残差。
+    """
+    per_name: dict[str, list[float]] = {}
+    n_with_spans = 0
+    for r in records:
+        spans, _ = parse_spans(r.get("spans") or [])
+        window = next((s for s in spans if s.name.endswith("caliber_b")), None)
+        if window is None or window.dur_ms < 0:
+            continue
+        n_with_spans += 1
+        own = exclusive_times(spans, window.start_ms, window.end_ms)
+        by_id = {s.span_id: s for s in spans}
+        for sid, ms in own.items():
+            per_name.setdefault(by_id[sid].name, []).append(ms)
+
+    lines = ["## 五、span 分格（口径B 窗口，自有时间）", ""]
+    if not n_with_spans:
+        lines += [
+            "**这些账单行没有 spans 字段**——链路追踪（trace_id + span）是 2026-10-17 上线的，",
+            "更早的轮次只有 waterfall 打点。用 `scripts/probe_trace.py` 重跑即可拿到 span 树。",
+            "",
+        ]
+        return lines
+
+    base = statistics.median(
+        [float(r["caliber_b_ms"]) for r in records if float(r.get("caliber_b_ms", -1)) >= 0]
+    )
+    lines += [
+        f"> 有 span 的轮次：{n_with_spans}/{len(records)}。"
+        "每轮完整 span 树在账单 JSONL 的 `spans` 字段里（按 `trace_id` 取），"
+        "本表是跨轮汇总。",
+        "",
+        "| span | n | p50 | max | 占口径B |",
+        "|---|---|---|---|---|",
+    ]
+    ranked = sorted(per_name.items(), key=lambda kv: -statistics.median(kv[1]))
+    for name, vals in ranked:
+        if name in {"turn", "turn.caliber_b"}:
+            continue  # 根/窗口的自有时间恒 0，列出来只是噪声
+        p50 = statistics.median(vals)
+        share = f"{p50 / base * 100:.0f}%" if base > 0 else "—"
+        lines.append(f"| {name} | {len(vals)} | {p50:.0f}ms | {max(vals):.0f}ms | {share} |")
+    lines.append("")
+    return lines
 
 
 def main() -> None:
@@ -307,6 +369,11 @@ def main() -> None:
         help="只统计首行时间在这之后的会话（YYYY-MM-DD 或 'YYYY-MM-DD HH:MM[:SS]'）",
     )
     ap.add_argument("--list", action="store_true", help="只列出文件里的会话清单，不生成记录")
+    ap.add_argument(
+        "--spans",
+        action="store_true",
+        help="追加 span 分格表（口径B 窗口，trace 上线后的账单才有）",
+    )
     args = ap.parse_args()
 
     path = Path(args.jsonl).expanduser()
@@ -333,7 +400,9 @@ def main() -> None:
             "单轮验收请加 --session last（--list 看清单）",
             file=sys.stderr,
         )
-    report = render(records, args.jsonl, filtered=bool(args.session or args.since))
+    report = render(
+        records, args.jsonl, filtered=bool(args.session or args.since), spans=args.spans
+    )
     if args.out:
         out = Path(args.out)
         out.parent.mkdir(parents=True, exist_ok=True)

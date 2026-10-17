@@ -6,6 +6,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
+from collections.abc import AsyncIterator
+
 from voice_pipeline.core.scheduler.base import AudioFragment
 from voice_pipeline.metrics.events import SessionClock, TurnMetrics
 from voice_pipeline.metrics.trace import (
@@ -15,6 +19,8 @@ from voice_pipeline.metrics.trace import (
     decompose,
     exclusive_times,
     parse_spans,
+    phase_span,
+    phases_of,
     stats,
     union_ms,
 )
@@ -142,6 +148,49 @@ def test_attrs_keyword_is_not_swallowed() -> None:
     assert s.attrs == {"attrs": {"nested": 1}}
 
 
+def test_record_perf_converts_through_the_session_clock() -> None:
+    """perf 原值补记必须走时钟换算：换算误差必须为 0（sleep 的抖动不进断言）。
+
+    反面案例：provider 与 tracer 各自找原点相减，span 会整体漂移，而账面上
+    看不出来——所以这里钉的是**精确相等**，不是"差不多"。
+    """
+    clock = SessionClock()
+    tracer = Tracer("abc", clock)
+    t0 = time.perf_counter()
+    time.sleep(0.02)
+    t1 = time.perf_counter()
+    sp = tracer.record_perf("x", t0, t1)
+    assert sp.start_ms == clock.ms_at(t0)  # 与 elapsed_ms 同一坐标系
+    assert sp.end_ms == clock.ms_at(t1)
+    assert sp.dur_ms == (t1 - t0) * 1000.0  # 换算零误差
+
+
+def test_phase_span_skips_missing_endpoints() -> None:
+    """缺证据的格子宁空不填 0：没有 lo/hi 两端时刻就不记这个 span。"""
+    tracer = Tracer("abc")
+    assert phase_span(tracer, "a", {}, "lo", "hi") is None
+    assert phase_span(tracer, "a", {"lo": 1.0}, "lo", "hi") is None  # 缺 hi
+    assert phase_span(tracer, "a", {"hi": 2.0}, "lo", "hi") is None  # 缺 lo
+    assert phase_span(None, "a", {"lo": 1.0, "hi": 2.0}, "lo", "hi") is None  # 无 tracer
+    t0 = time.perf_counter()
+    time.sleep(0.01)
+    t1 = time.perf_counter()
+    sp = phase_span(tracer, "a", {"lo": t0, "hi": t1}, "lo", "hi")
+    assert sp is not None
+    assert abs(sp.dur_ms - (t1 - t0) * 1000.0) < 1e-6
+
+
+def test_phases_of_returns_empty_for_providers_without_marks() -> None:
+    """本地引擎（melo/kokoro）没有 phase 表：空表比编几个键诚实。"""
+    assert phases_of(object()) == {}
+    assert phases_of(SimTts()) == {}
+
+    class _Phased:
+        last_phases = {"open": 1.0}
+
+    assert phases_of(_Phased()) == {"open": 1.0}
+
+
 def test_reset_turn_keeps_the_tree_until_session_rolls_it_over() -> None:
     """reset_turn **不能**清树：判停前的上行帧证据比"新一轮干净开始"更值钱。
 
@@ -220,3 +269,82 @@ async def test_uplink_frames_are_traced() -> None:
     # 父子关系必须是树，不能是平铺（否则算不出自有时间）
     frame = next(s for s in tracer.spans if s.name == "uplink.frame")
     assert any(s.parent_id == frame.span_id for s in tracer.spans)
+
+
+class _PhasedLlm:
+    """带 phase 时刻的假 LLM：复刻 QwenLlm 的 start/headers/first_content 三段。"""
+
+    last_phases: dict[str, float] = {}
+
+    async def astream(
+        self, prompt: str, history: list[dict[str, str]] | None = None
+    ) -> AsyncIterator[str]:
+        self.last_phases = {"start": time.perf_counter()}
+        await asyncio.sleep(0.01)
+        self.last_phases["headers"] = time.perf_counter()
+        await asyncio.sleep(0.01)
+        self.last_phases["first_content"] = time.perf_counter()
+        yield "你好。"
+
+
+class _PhasedTts:
+    """带 phase 时刻的假流式 TTS：复刻 DashScopeTts 的 submit/open/first_data。"""
+
+    tts_streams = True
+    last_phases: dict[str, float] = {}
+
+    async def synth(self, sentence: str) -> AsyncIterator[bytes]:
+        marks: dict[str, float] = {"submit": time.perf_counter()}
+        self.last_phases = marks
+        await asyncio.sleep(0.01)
+        marks["open"] = time.perf_counter()
+        await asyncio.sleep(0.01)
+        marks["first_data"] = time.perf_counter()
+        yield b"\x00" * 9600
+        marks["complete"] = time.perf_counter()
+
+    def synth_blocking(self, sentence: str) -> bytes:
+        return b""  # 协议要齐；流式假件不走这条路
+
+
+async def test_serial_records_subspans_from_provider_phases() -> None:
+    """深拆接线：provider 露 phase 时刻表时，调度器必须补记子 span 且不越界。
+
+    2026-10-17：`llm.ttft`（~270ms）与 `tts.first_chunk`（~600ms）是两个最大
+    的格子，不拆开就不知道该换网络、换模型还是换服务商。没有 phase 表的
+    provider（SimLlm/SimTts/melo）一个子 span 都不记——宁空不填 0。
+    """
+    session = Session(
+        mode="serial",
+        asr=SimAsr(transcript="上海今天多少度"),
+        llm=_PhasedLlm(),
+        tts=_PhasedTts(),
+    )
+    tracer = session.metrics.tracer
+    assert tracer is not None
+    await session.on_audio(b"\x00" * 3200)
+    async for _ in session.finish():
+        pass
+
+    by_name: dict[str, Span] = {}
+    for s in tracer.spans:
+        by_name.setdefault(s.name, s)
+    assert {"llm.headers", "llm.prefill", "tts.connect", "tts.first_byte"} <= set(by_name)
+
+    ttft = by_name["llm.ttft"]
+    headers, prefill = by_name["llm.headers"], by_name["llm.prefill"]
+    # 子 span 必须待在父 span 的区间里，否则 flame graph 归属是错的
+    assert ttft.start_ms <= headers.start_ms
+    assert headers.end_ms <= prefill.end_ms + 1.0
+    assert prefill.end_ms <= ttft.end_ms + 1.0
+
+    synth = by_name["tts.synth"]
+    connect, first_byte = by_name["tts.connect"], by_name["tts.first_byte"]
+    assert synth.start_ms <= connect.start_ms
+    assert first_byte.end_ms <= synth.end_ms + 1.0
+    assert connect.dur_ms >= 8 and first_byte.dur_ms >= 8  # 假件的两段休眠都 ≥10ms
+
+    window = tracer.window
+    assert window is not None
+    dec = decompose(window, tracer.spans)
+    assert dec.unattributed_ms < max(5.0, dec.total_ms * 0.2)

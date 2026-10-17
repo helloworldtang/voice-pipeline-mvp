@@ -26,6 +26,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from collections.abc import AsyncIterator, Iterable, Iterator
 
 import httpx
@@ -127,10 +128,17 @@ class QwenLlm:
         self._system = _resolve_system(system)
         self._max_tokens = max_tokens
         self._timeout_s = timeout_s
+        # phase 时刻表（`time.perf_counter()` 原值，键见 astream）：把 `llm.ttft`
+        # 那一格拆成「网络+路由」与「服务端 prefill」两段。调度器在首 token 到达
+        # 那一刻读它、经会话钟换算补记子 span（metrics/trace.py 的 phase_span）。
+        # 单调用假设：一个实例同时只有一路 astream 在跑（serial 成立；pipelined
+        # 的投机调用也在同一调度器内串行）。每进 astream 重置，防上一轮残值掺和。
+        self.last_phases: dict[str, float] = {}
 
     async def astream(
         self, prompt: str, history: list[dict[str, str]] | None = None
     ) -> AsyncIterator[str]:
+        self.last_phases = {"start": time.perf_counter()}
         payload = {
             "model": self.model,
             "stream": True,
@@ -148,11 +156,15 @@ class QwenLlm:
             headers=headers,
             json=payload,
         ) as resp:
+            # 进到上下文里 = 请求已发出、响应头已回：这一段是网络+路由。
+            self.last_phases["headers"] = time.perf_counter()
             resp.raise_for_status()
             async for line in resp.aiter_lines():
+                self.last_phases.setdefault("first_line", time.perf_counter())
                 # 走 iter_content 而不是另写一份解析：运行时与测试共用同一条路径，
                 # 「只认 content」这条纪律才不会被两处实现悄悄改掉一边。
                 for piece in iter_content([line]):
+                    self.last_phases.setdefault("first_content", time.perf_counter())
                     yield piece
 
 

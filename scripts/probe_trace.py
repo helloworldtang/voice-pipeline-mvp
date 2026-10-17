@@ -47,7 +47,11 @@ from voice_pipeline.metrics.trace import (  # noqa: E402
     union_ms,
 )
 from voice_pipeline.providers import sherpa as R  # noqa: E402
-from voice_pipeline.providers.factory import build_eou, build_providers  # noqa: E402
+from voice_pipeline.providers.factory import (  # noqa: E402
+    DEFAULT_LLM_MODEL,
+    build_eou,
+    build_providers,
+)
 from voice_pipeline.server.session import Session  # noqa: E402
 
 DEFAULT_TEXT = "我想问一下明天上海天气怎么样，适合出门吗"
@@ -81,13 +85,19 @@ async def run_turn(
     *,
     tts_engine: str | None,
     llm: str,
+    llm_model: str | None = None,
     gating: GatingMode,
     tail_silence_ms: int,
     max_turn_s: float = 30.0,
 ) -> dict[str, Any]:
     """喂一轮：上行 → EOU 判停 → run_turn → 并行 drain outbox（模拟 pump+sender）。"""
     # 每轮取一份新 provider：ASR 的 stream 是会话状态必须新；LLM/TTS 由 factory 缓存
-    providers = build_providers("real", llm_engine=llm, tts_engine=tts_engine or "melo")
+    providers = build_providers(
+        "real",
+        llm_engine=llm,
+        llm_model=llm_model or DEFAULT_LLM_MODEL,
+        tts_engine=tts_engine or "melo",
+    )
     session = Session(
         mode="real",
         asr=providers.asr,
@@ -170,6 +180,7 @@ async def run_turn(
         "eou_wait_ms": eou_wait_ms,
         "sent_bytes": sent_bytes,
         "llm": llm_name,
+        "llm_model": getattr(providers.llm, "model", ""),
         "user_text": bill.get("user_text", ""),
     }
 
@@ -251,7 +262,11 @@ def analyse(rows: list[dict[str, Any]]) -> dict[str, Any]:
 
 STAGE_NOTES = {
     "asr.finalize": "utterance_end → transcript（过去混在 LLM 那一格里）",
-    "llm.ttft": "首 token：模型 RTT + prefill",
+    "llm.ttft": "首 token：模型 RTT + prefill（= headers + prefill）",
+    "llm.headers": "发包→响应头：网络 + 路由（共享连接，TLS 已摊薄）",
+    "llm.prefill": "响应头→首 content：服务端排队 + prefill",
+    "tts.connect": "call 提交→WS on_open：建连 + 认证（每句都新建合成器）",
+    "tts.first_byte": "on_open→首个音频分片：服务端合成首片",
     "llm.first_sentence": "首 token → 首句末标点（分句攒句）",
     "llm.request": "整段生成，扣掉嵌套后剩下的「LLM 自己」的份额",
     "tts.synth": "合成整句（本地 melo/kokoro 无增量流，首片=整句）",
@@ -332,6 +347,11 @@ async def main() -> int:
     ap.add_argument("--tts", default=None, help="被测 TTS：melo/kokoro/dashscope（默认 melo）")
     ap.add_argument("--llm", default="auto", choices=["auto", "qwen", "sim"])
     ap.add_argument(
+        "--llm-model",
+        default=DEFAULT_LLM_MODEL,
+        help=f"LLM 模型（默认 {DEFAULT_LLM_MODEL}；换模型 A/B 用它，清单见 DashScope /models）",
+    )
+    ap.add_argument(
         "--gating",
         default="conservative",
         choices=["conservative", "semantic", "aggressive", "neural"],
@@ -350,7 +370,7 @@ async def main() -> int:
     ).stdout.strip()
     print(f"机器: {machine}")
     print(
-        f"ASR=transducer  TTS={args.tts or 'melo'}  LLM={args.llm}  "
+        f"ASR=transducer  TTS={args.tts or 'melo'}  LLM={args.llm}({args.llm_model})  "
         f"判停={args.gating}  n={args.repeat}"
     )
 
@@ -360,7 +380,12 @@ async def main() -> int:
     rows: list[dict[str, Any]] = []
     for i in range(args.repeat):
         row = await run_turn(
-            pcm, tts_engine=args.tts, llm=args.llm, gating=gating, tail_silence_ms=args.silence_ms
+            pcm,
+            tts_engine=args.tts,
+            llm=args.llm,
+            llm_model=args.llm_model,
+            gating=gating,
+            tail_silence_ms=args.silence_ms,
         )
         row["repeat"] = i + 1
         rows.append(row)

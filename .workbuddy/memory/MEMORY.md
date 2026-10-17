@@ -20,6 +20,23 @@
   云流式 TTS 1029ms、kokoro 2759ms；判停 ~510ms 在口径B 外；未归因残差 0ms（无藏账）。**
   P0：默认 TTS 换云流式（省 ~930ms，抵其余优化之和）。三条踩坑（attrs 吞关键字 /
   reset_turn 清树丢判停前证据 / exclusive_times 边界未夹紧导致高估）见 2026-10-17.md，均有回归测试。
+- **🔺 2026-10-17 晚 深拆（第二层 span：provider 内部时刻）**：`llm.headers`/`llm.prefill`（QwenLlm
+  在 astream 记 perf 原值）+ `tts.connect`/`tts.first_byte`（DashScope SDK 回调里记），
+  调度器用 `Tracer.record_perf`（**必须经 SessionClock.ms_at 时钟换算**）补记；
+  `phase_span` 缺端点返回 None（宁空不填 0）。**口径B 1029ms = 服务端首字节 332 + 建连 257 +
+  LLM 网关 231 + 首句 120 + 传输 31，残差 0。**
+  **① 建连那 257ms 每句白付**（`DashScopeTts.synth()` 每句新建 SpeechSynthesizer，
+  `_close_ws_after_use` 默认 True）：隔离探针首片 604 = 建连 259 + 服务端 338（TCP 握手仅 40ms）；
+  **SDK 自带 `SpeechSynthesizerObjectPool`**（借出即预连）实测首片 340~375ms
+  ⇒ **P0.5 = TTS 连接预热 −230~260ms，当前最大可省一笔**；或判停即预连（不依赖文本，可与 LLM 并行）。
+  **② 换 LLM 模型救不了**：qwen-flash ttft 284ms 全平台最快；qwen3.7-flash 11342ms（2811 字思考链）、
+  qwen3.8-flash 2803ms、deepseek-v4.1-flash 4059ms、step-3.7-flash 400。新"flash"全是推理型，
+  只转发 content 的我们表现为"久不出声"。**llm.prefill 仅 0.1ms**（网关把等待并进响应头；
+  `GET /models` ttfb 就要 208ms）。
+  **③ Jev（TypeSafe 决策模型）顶替不了 LLM**：只出是/否/分类/分值，不生成自然语言；
+  EOU 判停理论对口但 70~500ms + 跨洋 RTT 省不出延迟；唯一 plausible 槽 = barge-in 意图分类（二期）。
+  无 key 未实测。探针：`probe_trace.py --llm-model X` / `probe_tts_firstchunk.py` /
+  `report_turns.py --spans`（线上账单分格）。
 - **M0 骨架已完成**（2026-09-21，commit 1d91f9d）：git + pyproject(uv/ruff/mypy strict/pytest) + CI(py3.10/3.12) + WS echo 服务 + sim 三替身 + 22 项测试全绿。
 - **M1 serial 全链已完成**（commit d4d765f）：分句 + TTS 分片 + waterfall 双口径账单 + `scripts/demo_serial.py`；44 项测试全绿。
 - **M2a real 接入 + 本机校准**（015cfd9）/ **M4 pipelined 投机调度**（33b3705）/ **M2b EOU 四路融合判停**（e07539c）均已完成。

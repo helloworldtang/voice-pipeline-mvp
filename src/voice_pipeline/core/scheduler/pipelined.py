@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from voice_pipeline.audio.chunker import Chunker
 from voice_pipeline.core.sentence_splitter import SentenceSplitter
 from voice_pipeline.metrics.events import TurnMetrics
+from voice_pipeline.metrics.trace import phase_span, phases_of
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.server.protocol import AsrFinal, TtsSentence, TurnEnd, TurnStart
 
@@ -198,6 +199,13 @@ class PipelinedScheduler:
                 first_chunk = False
                 self._metrics.mark("tts_first_chunk")
                 run.ready_ms = self._metrics.clock.elapsed_ms()
+                if tr:
+                    # 深拆（同 serial）：建连 vs 服务端合成首片。speculative 路径也要拆——
+                    # 命中率低时这些合成注定作废，拆开才知道废掉的是哪一段。
+                    phases = phases_of(self._tts)
+                    phase_span(tr, "tts.connect", phases, "submit", "open", synth)
+                    open_key = "open" if "open" in phases else "submit"
+                    phase_span(tr, "tts.first_byte", phases, open_key, "first_data", synth)
                 if tr and head:
                     tr.finish(head)
             items.append(AudioFragment(seq=chunker.next_seq(), data=block))
@@ -327,15 +335,36 @@ class PipelinedScheduler:
         self._metrics.mark("llm_first_token")
         splitter = SentenceSplitter()
         seq = 0
-        async for piece in self._llm.astream(
-            transcript, history=list(self._history) if self._history else None
-        ):
-            for sentence in splitter.feed(piece):
-                seq += 1
-                if seq == 1:
-                    self._metrics.mark("first_sentence_done")
-                async for item in self._emit(sentence, seq):
-                    yield item
+        # 与 serial 同构的 LLM 分格：过去这里一个 llm span 都没有，未命中轮的 LLM
+        # 时间全落进「真·未归因」——而它偏偏是未命中轮最大的一块。补上恒等式才闭合。
+        tr = self._metrics.tracer
+        root = (tr.window or tr.root) if tr is not None else None
+        req = tr.start("llm.request", root, {"chars": len(transcript)}) if tr else None
+        ttft = tr.start("llm.ttft", req) if tr else None
+        saw_token = False
+        try:
+            async for piece in self._llm.astream(
+                transcript, history=list(self._history) if self._history else None
+            ):
+                if not saw_token:
+                    saw_token = True
+                    if tr is not None and ttft is not None:
+                        phases = phases_of(self._llm)
+                        phase_span(tr, "llm.headers", phases, "start", "headers", ttft)
+                        phase_span(tr, "llm.prefill", phases, "headers", "first_content", ttft)
+                        tr.finish(ttft)
+                for sentence in splitter.feed(piece):
+                    seq += 1
+                    if seq == 1:
+                        self._metrics.mark("first_sentence_done")
+                    async for item in self._emit(sentence, seq):
+                        yield item
+        finally:
+            if tr:
+                if ttft is not None and ttft.open:
+                    tr.finish(ttft)
+                if req is not None:
+                    tr.finish(req, {"sentences": seq})
         tail = splitter.flush()
         if tail:
             seq += 1
@@ -357,6 +386,12 @@ class PipelinedScheduler:
             if first_chunk:
                 first_chunk = False
                 self._metrics.mark("tts_first_chunk")
+                if tr:
+                    # 深拆（同 serial）：建连 vs 服务端合成首片
+                    phases = phases_of(self._tts)
+                    phase_span(tr, "tts.connect", phases, "submit", "open", synth)
+                    open_key = "open" if "open" in phases else "submit"
+                    phase_span(tr, "tts.first_byte", phases, open_key, "first_data", synth)
                 if tr and head:
                     tr.finish(head)
             self._mark_first_audio()

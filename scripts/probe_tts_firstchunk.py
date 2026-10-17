@@ -34,6 +34,7 @@ import json
 import socket
 import statistics
 import time
+from collections.abc import Mapping
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -70,7 +71,28 @@ async def synth_once(tts: DashScopeTts, text: str, timeout_s: float) -> dict[str
         "total_ms": (time.perf_counter() - t0) * 1000.0,
         "chunks": state["chunks"],
         "bytes": state["nbytes"],
+        **phase_split(getattr(tts, "last_phases", {})),
     }
+
+
+def phase_split(phases: Mapping[str, float]) -> dict[str, float]:
+    """把「首片到手」拆成建连+认证与服务端合成两段（缺端点的一段不编）。
+
+    `submit → open` 是建连（每句都新建 SpeechSynthesizer，连接不复用）；
+    `open → first_data` 是服务端合成第一片。on_open 没 fire 就只报合成的
+    那一段——缺证据的格子宁空不填 0。
+    """
+    t_submit = phases.get("submit")
+    t_open = phases.get("open")
+    t_first = phases.get("first_data")
+    if t_submit is None or t_first is None:
+        return {}
+    out: dict[str, float] = {
+        "first_byte_ms": round((t_first - (t_open if t_open is not None else t_submit)) * 1000.0, 1)
+    }
+    if t_open is not None:
+        out["connect_ms"] = round((t_open - t_submit) * 1000.0, 1)
+    return out
 
 
 def stat(values: list[float]) -> dict[str, float]:
@@ -135,6 +157,8 @@ async def phase_repeat(voice: str, text: str, repeat: int, timeout_s: float) -> 
         "warm_excl_first": stat(firsts[1:]),
         "total_ms": stat([float(r["total_ms"]) for r in runs if "total_ms" in r]),
         "bytes": stat([float(r["bytes"]) for r in runs if "bytes" in r]),
+        "connect_ms": stat([float(r["connect_ms"]) for r in runs if "connect_ms" in r]),
+        "first_byte_ms": stat([float(r["first_byte_ms"]) for r in runs if "first_byte_ms" in r]),
     }
 
 
@@ -179,6 +203,10 @@ async def phase_lengths(
                 "text": text,
                 "chars": len(text),
                 "first_chunk_ms": stat(firsts),
+                "connect_ms": stat([float(r["connect_ms"]) for r in runs if "connect_ms" in r]),
+                "first_byte_ms": stat(
+                    [float(r["first_byte_ms"]) for r in runs if "first_byte_ms" in r]
+                ),
                 "n_err": len(errors),
                 "errors": errors,
             }
