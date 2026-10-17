@@ -226,14 +226,10 @@ class DashScopeTts:
         self._warm_ok: bool | None = None
         # 是否已经烧过「连接上第一个任务」的那笔开销（任务级预备，见 _warm_one_task）
         self._task_warm = False
-        # 任务级预热开关（默认关）：它会多跑一次合成、改变池计数口径，
-        # 所以先做成显式开关，等冷启动首轮 A/B 出来再决定是否翻默认。
-        self._task_warm_enabled = os.environ.get("VOICE_TTS_TASK_WARM", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-            "on",
-        )
+        # 任务级预热（默认开，2026-10-17 起）：只烧一次极短合成，对体验零影响，
+        # 换来冷启动首轮 tts.connect 840→37ms。关掉：VOICE_TTS_TASK_WARM=0。
+        _task_warm_env = os.environ.get("VOICE_TTS_TASK_WARM", "1").strip().lower()
+        self._task_warm_enabled = _task_warm_env not in ("0", "false", "no", "off")
         # 计数：探针/账单要能算出「省了几次建连、毁了几条连接」
         self.warm_acquires = 0
         self.cold_acquires = 0

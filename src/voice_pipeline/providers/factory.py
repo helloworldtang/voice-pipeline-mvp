@@ -3,9 +3,11 @@
 加新引擎只改这里，调用方（Session / WS）不动。real 三件套延迟加载——模型
 加起来近 1s，不该在 import 时付费。
 
-real 模式的 LLM 用 `llm_engine` 选：
-  - "auto"（默认）：有 DASHSCOPE_API_KEY 就上真 qwen，没有就退回 SimLlm **并告警**
-  - "qwen"：强制真 LLM，缺 key 直接抛错
+real 模式的 LLM 用 `llm_engine` 选（可用 `VOICE_LLM_ENGINE` 覆盖）：
+  - "auto"（默认）：有 DASHSCOPE_API_KEY 就上真 qwen；缺 key 时若有 mlx-lm 就降级到本地，
+    否则退回 SimLlm **并告警**
+  - "qwen"：强制云 LLM，缺 key 直接抛错
+  - "mlx"：强制本地（MLX，仅 macOS/arm64）；缺依赖直接抛错
   - "sim"：强制替身
 **为什么退回要告警**：端到端账单里 LLM 那一格是 0ms，静默退回会让"本机侧下界"
 被当成真实数字。这条日志是数字可信度的护栏。
@@ -49,15 +51,49 @@ class ProviderSet:
     tts: TtsProvider
 
 
+def resolve_llm_engine(explicit: str | None = None) -> str:
+    """定 LLM 引擎：显式（非 auto）> `VOICE_LLM_ENGINE` > auto。
+
+    与 `resolve_tts_engine` 同一套理由：引擎是部署配置，不上 wire 协议；
+    A/B 与服务端探针要把引擎当旋钮拧，只能走 env。
+    """
+    if explicit and explicit != "auto":
+        return explicit
+    return os.environ.get("VOICE_LLM_ENGINE", explicit or "auto").strip() or "auto"
+
+
+def _mlx_available() -> bool:
+    """本地 MLX 是否可用（仅判断依赖，不加载模型——加载是秒级的）。"""
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("mlx_lm") is not None
+    except (ImportError, ValueError):  # pragma: no cover - 异常环境才走到
+        return False
+
+
 def build_llm(engine: str = "auto", model: str = DEFAULT_LLM_MODEL) -> LlmProvider:
-    """按 engine 组装 LLM。真 LLM 需要 DASHSCOPE_API_KEY。"""
+    """按 engine 组装 LLM。真 LLM 需要 DASHSCOPE_API_KEY；本地需 mlx-lm。"""
+    engine = resolve_llm_engine(engine)
     if engine == "sim":
         return SimLlm()
     if engine == "qwen":
         return QwenLlm(model=model)
+    if engine == "mlx":
+        from voice_pipeline.providers.llm.mlx_llm import MlxLlm
+
+        return MlxLlm()
     if engine == "auto":
         if os.environ.get(API_KEY_ENV):
             return QwenLlm(model=model)
+        if _mlx_available():
+            from voice_pipeline.providers.llm.mlx_llm import MlxLlm
+
+            logger.warning(
+                "没有 %s，LLM 降级到本地 MLX：延迟更低但答案更笼统（账单 llm=MlxLlm）",
+                API_KEY_ENV,
+            )
+            return MlxLlm()
         logger.warning(
             "real 模式没有 %s，LLM 退回 SimLlm：端到端数字不含 LLM 首 token，"
             "只是本机侧下界，不要对外当真实延迟报",

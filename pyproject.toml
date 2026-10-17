@@ -18,6 +18,13 @@ dependencies = [
     "onnxruntime>=1.28.0,<1.29",
 ]
 
+[project.optional-dependencies]
+# 本地 LLM（「极致延迟」档 + 云端降级）。仅 macOS/arm64 有 wheel，所以**不进主依赖**：
+# 装上：`uv sync --extra local`；没装时 VOICE_LLM_ENGINE=mlx 会响亮报错，不静默退回替身。
+local = [
+    "mlx-lm>=0.20",
+]
+
 [dependency-groups]
 dev = [
     "mypy>=1.11",
@@ -52,7 +59,7 @@ warn_unreachable = true
 files = ["src", "tests"]
 # sherpa-onnx 未随 wheel 提供 py.typed / stubs —— 与其假装，不如显式忽略
 [[tool.mypy.overrides]]
-module = ["sherpa_onnx.*", "soxr.*", "onnxruntime.*", "dashscope.*"]
+module = ["sherpa_onnx.*", "soxr.*", "onnxruntime.*", "dashscope.*", "mlx_lm.*"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]

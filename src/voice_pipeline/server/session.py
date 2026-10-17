@@ -16,6 +16,7 @@ TurnItem 投进队列，真正的发送由传输层统一 pump。这样做的唯
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
@@ -41,6 +42,8 @@ from voice_pipeline.server.protocol import AsrFinal, AudioStop, TtsSentence, Tur
 
 # 多轮上下文上限：最近 10 轮（20 条 user/assistant 消息）。语音对话的时效性强，
 # 更早的轮次对当前问题几乎没有贡献，却每轮都要整包发给 LLM 付费。
+logger = logging.getLogger(__name__)
+
 MAX_HISTORY_MESSAGES = 20
 
 # 空转写门的放行上限（次）：100ms 帧节奏下 ≈1s——超过它说明 ASR 不会再出字了
@@ -165,6 +168,7 @@ class Session:
         }
         # 留一份引用：预热/池计数要从 Session 够到 provider（deps 是 dict[str, object]）
         self._tts_provider: TtsProvider | None = deps["tts"]  # type: ignore[assignment]
+        self._llm_provider: LlmProvider | None = deps["llm"]  # type: ignore[assignment]
         if spec_mode == "pipelined":
             self._scheduler = PipelinedScheduler(**deps, grace_ms=grace_ms)  # type: ignore[arg-type]
         else:
@@ -180,6 +184,29 @@ class Session:
         # 不支持预热（sim/本机 TTS）时静默跳过。
         if prewarm_tts:
             self._prewarm_tts()
+        self._preload_llm()
+
+    def _preload_llm(self) -> None:
+        """本地 LLM 的模型加载（1~3s）+ 首次 Metal 编译（~1s）不能在首轮里付。
+
+        本地 provider 暴露 `preload()`；后台线程跑，失败只告警（云端没有这个方法，静默跳过）。
+        与 TTS 的任务级预热同一个道理：把一次性开销挪到用户还在说话/发愣的时候。
+        """
+        preload = getattr(self._llm_provider, "preload", None)
+        if not callable(preload):
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+
+        async def _run() -> None:
+            try:
+                await asyncio.to_thread(preload)
+            except Exception:  # noqa: BLE001 - 预加载失败不能拖垮会话
+                logger.warning("LLM 预加载失败（首轮会变慢）", exc_info=True)
+
+        self._llm_preload_task = loop.create_task(_run())
 
     def _prewarm_tts(self) -> None:
         """provider 有 prewarm() 就调用（DashScope 云 TTS 有；其余没有）。"""
