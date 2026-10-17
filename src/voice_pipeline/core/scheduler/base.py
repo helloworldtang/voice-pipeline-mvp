@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Protocol, Union, runtime_checkable
@@ -15,6 +16,8 @@ from voice_pipeline.core.filler import FillerBank
 from voice_pipeline.metrics.events import TurnMetrics
 from voice_pipeline.providers.base import TtsProvider
 from voice_pipeline.server.protocol import ServerEvent
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -65,15 +68,28 @@ async def synth_to_fragments(
     - 整句 provider（sherpa OfflineTts）：卸到线程池合成完整句再切片，原路径。
 
     两条路径对调用方的分片顺序与尺寸完全一致，指标打点由调用方按需处理。
+
+    **单句失败不炸整轮**（2026-10-17 真人验收 turn 12 的教训）：provider 抛
+    RuntimeError（如 DashScope 判文本 InvalidParameter）时跳过这一句、其余照播。
+    一句念不出来，好过整轮静音 + "Task exception was never retrieved"。
+    CancelledError 不是 Exception，天然穿透——打断语义不受影响。
     """
     if getattr(tts, "tts_streams", False):
-        async for piece in tts.synth(sentence):
-            for block in chunker.feed(piece):
-                yield block
+        try:
+            async for piece in tts.synth(sentence):
+                for block in chunker.feed(piece):
+                    yield block
+        except RuntimeError:
+            logger.warning("TTS 合成失败，跳过该句（其余照播）: %r", sentence[:60], exc_info=True)
+            return
         for block in chunker.flush():
             yield block
     else:
-        pcm = await asyncio.to_thread(tts.synth_blocking, sentence)
+        try:
+            pcm = await asyncio.to_thread(tts.synth_blocking, sentence)
+        except RuntimeError:
+            logger.warning("TTS 合成失败，跳过该句（其余照播）: %r", sentence[:60], exc_info=True)
+            return
         for block in chunker.feed_and_flush(pcm):
             yield block
 

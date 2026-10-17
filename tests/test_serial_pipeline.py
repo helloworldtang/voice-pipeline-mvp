@@ -112,6 +112,49 @@ async def test_short_sentence_tail_is_not_dropped() -> None:
     assert bill["caliber_b_ms"] >= 0
 
 
+async def test_tts_failure_on_one_sentence_does_not_kill_turn() -> None:
+    """单句 TTS 失败只跳该句，不炸整轮（2026-10-17 验收 turn 12：裸标点句被
+    DashScope 拒 → RuntimeError 一路上炸 → "Task exception was never retrieved"，
+    用户一个字听不到）。第二句必须照播、轮次要正常收账。"""
+    from collections.abc import AsyncIterator
+
+    class PickyTts(SimTts):
+        tts_streams = True
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.failed: list[str] = []
+
+        async def synth(self, sentence: str) -> AsyncIterator[bytes]:
+            if "坏句" in sentence:
+                self.failed.append(sentence)
+                msg = f'DashScope TTS 合成失败: InvalidParameter ("{sentence}")'
+                raise RuntimeError(msg)
+            async for chunk in super().synth(sentence):
+                yield chunk
+
+    tts = PickyTts()
+    session = Session(
+        mode="serial",
+        asr=SimAsr(transcript=TRANSCRIPT),
+        llm=SimLlm(reply="坏句。好句，念得出。"),
+        tts=tts,
+    )
+    await session.on_audio(b"\x00" * 3200)
+    sizes: list[int] = []
+    bill: dict[str, float] = {}
+    async for item in session.finish():
+        if isinstance(item, AudioFragment):
+            sizes.append(len(item.data))
+        elif isinstance(item, TurnEnd):
+            bill = item.metrics
+
+    assert tts.failed == ["坏句。"], tts.failed  # 失败句确实试过（而非没送到）
+    assert sizes, "好句必须照播，不能整轮静音"
+    assert bill["audio_bytes"] > 0, bill
+    assert bill["caliber_b_ms"] > 0, "首句坏但第二句出了声，口径B 仍要记账"
+
+
 async def test_echo_mode_still_echoes() -> None:
     """echo 是 M0 的回归基线：立即回发，不走链路。"""
     session = Session(mode="echo")

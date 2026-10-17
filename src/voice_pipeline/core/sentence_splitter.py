@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import logging
 import os
+import unicodedata
 
 logger = logging.getLogger(__name__)
 
@@ -22,6 +23,17 @@ DEFAULT_TERMINATORS = "。！？；!?;\n"
 # 首句护栏的软断点：只在首句超长时退而求其次（逗号/顿号）
 SOFT_BREAKS = "，,、"
 ENV_FIRST_MAX = "VOICE_FIRST_SENTENCE_MAX_CHARS"
+
+
+def _has_speech(text: str) -> bool:
+    """有没有可念的内容：字母/数字/汉字（Unicode L*/N*）之外的都算标点或空白。
+
+    为什么需要它：LLM 流式吐出的第一个 token 可能就是一个裸「。」——
+    2026-10-17 真人验收 turn 12 实锤，纯标点「句子」发给 DashScope 直接
+    InvalidParameter("input text is valid")，异常炸穿整轮，用户一个字听不到。
+    纯标点无声可言，丢弃是对的。
+    """
+    return any(unicodedata.category(ch)[0] in ("L", "N") for ch in text)
 
 
 def _env_first_max() -> int:
@@ -76,13 +88,16 @@ class SentenceSplitter:
         return None
 
     def _scan(self) -> list[str]:
-        """按句末标点切，返回本轮新吐出的句子。"""
+        """按句末标点切，返回本轮新吐出的句子。
+
+        纯标点/空白的 piece 丢弃（无声可言，发给 TTS 只会换来 InvalidParameter）。
+        """
         sentences: list[str] = []
         start = 0
         for i, char in enumerate(self._buffer):
             if char in self._terminators:
                 piece = self._buffer[start : i + 1].strip()
-                if piece:
+                if piece and _has_speech(piece):
                     sentences.append(piece)
                 start = i + 1
         if start:
@@ -115,8 +130,8 @@ class SentenceSplitter:
         return sentences
 
     def flush(self) -> str | None:
-        """取回最后没有句末标点的残留（LLM 结束时调用）。"""
+        """取回最后没有句末标点的残留（LLM 结束时调用）。纯标点残留丢弃。"""
         rest = self._buffer.strip()
         self._buffer = ""
         self._emitted = 0  # 轮末：下一轮重新认「第 1 句」
-        return rest or None
+        return rest if _has_speech(rest) else None
