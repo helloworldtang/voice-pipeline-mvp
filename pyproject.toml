@@ -1,6 +1,6 @@
 [project]
 name = "voice-pipeline"
-version = "0.1.0"
+version = "0.2.0"
 description = "准生产级实时语音对话链路参考实现：ASR+TTS 流水线的延迟账与可靠性工程"
 readme = "README.md"
 requires-python = ">=3.12"

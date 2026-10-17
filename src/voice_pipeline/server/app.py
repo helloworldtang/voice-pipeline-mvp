@@ -60,7 +60,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         yield
 
-    app = FastAPI(title="voice-pipeline", version="0.1.0", lifespan=lifespan)
+    app = FastAPI(title="voice-pipeline", version="0.2.0", lifespan=lifespan)
     app.state.settings = cfg
     # 并发租借池：real 模式的每个会话独占一份本地推理资源（Acceptance 判据 9）。
     # 池挂在 app 上而不是做成模块级全局——测试里每个 create_app() 都是独立的服务实例，
