@@ -130,11 +130,19 @@ class FakeWarmSynthesizer:
             time.sleep(self._chunk_delay)
             if self._cb is not None:
                 self._cb.on_data(chunk)
+        # 真 SDK on_message 的 FINISHED 分支（tts_v2/speech_synthesizer.py:803-805）：
+        # complete_event.set() 在 callback.on_complete() **之前**——消费者收到完成
+        # 信号时 complete_event 已置位。曾把这两行倒过：倒出来的假 race 让旧线程的
+        # 尾声落进下一次 __reset 之后，call() 误炸「complete_event 未清理」，
+        # test_pool_stats_counts_are_honest 偶发冷重试（cold=1/dropped=2，2026-10-17 抓到）。
+        self._complete_pending = True
         if self._cb is not None:
             self._cb.on_complete()
-        # 真 SDK __cleanup_task：_is_started 归位（close_ws_after_use=False 不关 ws）
+        # 真 SDK __cleanup_task（:594-599）：只归位 _is_started/_stopped，
+        # **不碰 complete_event**——所以它晚于我们的 __reset 落地也无妨
+        # （_stopped 的残留窗口由 call() 内部 __start_stream 自己清 + 池的
+        # 「温连接已死且未出片→冷重试一次」兜底，见 synth() docstring）。
         self._started = False
-        self._complete_pending = True
 
 
 def _warm_factory(

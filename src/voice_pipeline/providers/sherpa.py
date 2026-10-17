@@ -143,12 +143,27 @@ class StreamingAsr(ABC):
             self._recognizer.decode_stream(self._stream)
 
     async def finalize(self) -> str:
+        """收尾：冲刷缓冲区并终结识别流。
+
+        **自补 600ms 尾部静音**（2026-10-17 P1 接线时发现）：流式 Paraformer 解尾字
+        需要右侧上下文——客户端在判停那一刻就可能停止上行（ASR 前置能量门也会拦掉
+        确认静音的帧），缓冲区里只剩语音没有静音时，`input_finished` 并不能把尾字
+        解出来：隔离实验（同音频只切换门）19 字句子的尾段「合出门嘛」整段丢失
+        （19→15 字）。补 600ms 静音后完整解出，且对「本来就喂过静音」的路径无影响
+        （转写一字不变）。成本 = 多解 6 个静音窗（~1ms），在口径B 窗口内，
+        相对正确性可忽略。
+        """
+
         def _close() -> None:
             with self._stream_lock:
                 if len(self._buf) > 0:
                     self._stream.accept_waveform(self._sr, self._buf)
                     self._buf = np.empty(0, dtype=np.float32)
                     self._drain()
+                # 尾部静音必须在最后一段语音**之后**进流（顺序反了等于在语音中间
+                # 插空洞）。接在 input_finished 之前，让解码器带着右侧上下文收尾。
+                tail = np.zeros(int(self._sr * 0.6), dtype=np.float32)
+                self._stream.accept_waveform(self._sr, tail)
                 self._stream.input_finished()
                 self._drain()
 

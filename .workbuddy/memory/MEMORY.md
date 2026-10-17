@@ -51,6 +51,21 @@
   （旧探针「偶发卡死」根因）→ `fail_sentinel` done callback。
   ⚠️ **「预合成静音帧」仍未做**（filler 路线，README 差距表在列）——别把 P0.5 说成整个 WarmPool 兑现。
   测试 16 例（`test_tts_pool.py` 13 + `test_prewarm_wiring.py` 3）；A/B 命令见追踪文档 §八。
+- **🔺 2026-10-17 P1 已落地：ASR 前置能量门**：`core/energy_gate.py`（`AsrEnergyGate`）接在
+  `Session.on_audio` 的 ASR 之前——判停后客户端持续喂的静音帧不进 ASR。**门限 0.01
+  （EOU ENERGY_THRESHOLD）而非 L1 的 0.02**（假阴性=丢语音更贵；不变式 gate≤L1 有单测）；
+  滞后：进静音连续 3 帧、出静音任意 1 帧；**只 real 模式装门**（SimAsr 按 push 次数前进，
+  拦帧会毁确定性回放）；**EOU 仍收全部帧**（静音是判停原料）；barge-in 后 reset。
+  被拦帧打 span `a.gated=1`，`report_turns.py --spans` 可数。
+  **实测（同机同时段 A/B n=6，两轮）：口径B p50 −97/−113ms（759 vs 872）**；判停 513ms
+  两臂不变、premature/missed 全 0、残差 0。**归因诚实**：span 可直接指认的只有上行竞争
+  −18~−27ms，其余是二阶调度提前（llm.headers 同向移动），不独占格不计独功。
+  **顺带修两枚真 bug**：① L1 每帧双算 `is_speech`（`_above` 去抖计数翻倍，文档的 3 帧
+  实际 2 帧触发）；② `finalize()` 缺尾部静音上下文丢尾字（隔离实验 19→15 字；门拦掉判停后
+  追加的静音 → 转写 18/19；修法：自补 600ms 全零静音再 `input_finished()`，恢复 19/19）。
+  ⚠️ **流式 ASR 的 `input_finished()` 解不出缺尾部静音的尾段**——任何「少喂静音」的优化
+  （energy gate/早停）都必须配套 finalize 补静音，否则拿精度换延迟。
+  测试 21 例（`test_energy_gate.py` 17 + `test_asr_finalize_tail.py` 4）；A/B 命令见追踪文档 §八。
 - **M0 骨架已完成**（2026-09-21，commit 1d91f9d）：git + pyproject(uv/ruff/mypy strict/pytest) + CI(py3.10/3.12) + WS echo 服务 + sim 三替身 + 22 项测试全绿。
 - **M1 serial 全链已完成**（commit d4d765f）：分句 + TTS 分片 + waterfall 双口径账单 + `scripts/demo_serial.py`；44 项测试全绿。
 - **M2a real 接入 + 本机校准**（015cfd9）/ **M4 pipelined 投机调度**（33b3705）/ **M2b EOU 四路融合判停**（e07539c）均已完成。
@@ -60,7 +75,7 @@
   未命中时却是纯亏损。完整账在 `docs/实验报告.md`。**对外不要再报 179ms / 81ms / 534ms。**
 - **M3 barge-in 三层 + 状态机 + live 客户端已完成**（本次）：`turn_fsm.py` + `barge_in.py` + `AudioStop` + WS 三路并发（接收/`run_turn`/`pump`，outbox 解耦）+ `scripts/live_client.py`；71 项测试全绿。细节与诚实边界见技术方案 **§14**。
 - **M5 收尾发版已完成**（本地，未 push）：README 补齐「承诺映射表（逐项对齐真实文件）+ 对比定位 + 差距表 + 发版检查单」；LICENSE(MIT) 已在；技术方案 §5 加「设计意图≠实际落盘」差异说明、M5 行标 ✅。
-- **⚠️ M5 诚实盘点发现的重要事实（勿再当"已完成"）**：① **real 模式 LLM 仍是 `SimLlm`**，真 DeepSeek 未接（端到端口径B 只是本机侧下界）；② scripted 客户端未做（§4.5 承诺 live+scripted）；③ JSONL 事件流落盘未做（§4.5 #4）；④ `DualPriorityQueue` 有实现有单测但**未接进 WS 主链路**（用无界 outbox）；⑤ 无 Dockerfile/compose；⑥ barge-in 无回声抑制（仅 L1 能量）、尾音未量化；⑦ ASR 前置 energy gate 未做、WarmPool 的「预合成静音帧」未做（**连接预热已于 2026-10-17 兑现**）；⑧ EOU L2/L3 为启发式。以上全部已列入 README 差距表。
+- **⚠️ M5 诚实盘点发现的重要事实（勿再当"已完成"）**：① **real 模式 LLM 仍是 `SimLlm`**，真 DeepSeek 未接（端到端口径B 只是本机侧下界）；② scripted 客户端未做（§4.5 承诺 live+scripted）；③ JSONL 事件流落盘未做（§4.5 #4）；④ `DualPriorityQueue` 有实现有单测但**未接进 WS 主链路**（用无界 outbox）；⑤ 无 Dockerfile/compose；⑥ barge-in 无回声抑制（仅 L1 能量）、尾音未量化；⑦ ASR 前置 energy gate **已兑现**（2026-10-17 P1，见上）、WarmPool 的「预合成静音帧」仍未做（filler 路线，连接预热已兑现）；⑧ EOU L2/L3 为启发式。以上全部已列入 README 差距表。
 - **全部里程碑（M0–M5）代码与文档完成**，本地 commit，**未 push**（用户要求先本地验收）。
 
 ## ⚠️ 2026-10 后续（本节最新，与上文的滞后部分冲突时以本节为准）

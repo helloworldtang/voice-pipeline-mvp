@@ -216,7 +216,7 @@ uv run python scripts/live_client.py --url ws://localhost:8000/ws   # 需 pyaudi
 | 评论区：滑动窗口语义提交 / 预生成 / 纠偏作废 | `core/scheduler/pipelined.py` | `tests/test_pipelined.py` |
 | 质疑方时序模型（A/B 对照组） | `core/scheduler/serial.py` | `tests/test_serial_pipeline.py` |
 | 双口径账单 + waterfall（回应「300ms 怎么得到的」） | `metrics/events.py`（`bill()` / `waterfall()`） | `scripts/demo_serial.py` |
-| 能量门控（评论区「星🎈」） | `core/eou.py` 的 L0 能量 + L1 静音两路 | 见差距表：**ASR 前置** gate 未做 |
+| 能量门控（评论区「星🎈」） | `core/eou.py` 的 L0 能量 + L1 静音两路；**ASR 前置 gate**（P1）：`core/energy_gate.py` + `server/session.py` 接线 | `tests/test_energy_gate.py` + 追踪文档 §四 4.5 A/B |
 | EOU 四路融合判停（声学→VAD→韵律→语义） | `core/eou.py` | `tests/test_eou.py` |
 | WS 会话服务 + 三路并发（收 / 跑一轮 / 发） | `server/app.py` + `server/session.py` | `tests/test_ws.py` |
 | provider 插件层（sim / real 一键切） | `providers/factory.py` + `providers/base.py` | `tests/test_factory.py` |
@@ -227,6 +227,12 @@ uv run python scripts/live_client.py --url ws://localhost:8000/ws   # 需 pyaudi
 自建连接池，判停/建会话即预热、跨句跨轮复用，口径B 1029→724ms
 （追踪文档 §四 4.4 有 A/B 与复现命令）；剩下「预合成静音帧」的 WarmPool
 仍未做——详见差距表。
+
+**ASR 前置能量门也已兑现**（2026-10-17 P1）：`AsrEnergyGate` 把判停后客户端持续
+喂进来的静音帧拦在 ASR 之前（门限 0.01 ≤ barge-in L1，只拦 ASR 不拦 EOU 判停），
+同时段 A/B 口径B p50 759 vs 872ms（−113ms，两轮 −97/−113ms）。顺带修掉两枚真 bug：
+L1 每帧双算 `is_speech`（去抖计数翻倍）、`finalize()` 缺尾部静音上下文丢尾字
+（转写 19→18 字，自补 600ms 静音后恢复 19/19）。
 
 ## 对比定位
 

@@ -21,6 +21,7 @@ from uuid import uuid4
 
 from voice_pipeline.audio.chunker import Chunker
 from voice_pipeline.core.barge_in import BargeInDetector
+from voice_pipeline.core.energy_gate import AsrEnergyGate
 from voice_pipeline.core.eou import EouDetector, FusedEou, GatingMode
 from voice_pipeline.core.filler import FillerBank
 from voice_pipeline.core.scheduler.base import AudioFragment, Scheduler, TurnItem, play_filler
@@ -77,6 +78,9 @@ class Session:
         # TTS 连接预热总闸（P0.5）：默认开。探针用 --no-prewarm 关掉它跑 A/B
         # 对照臂（「不预热」与「预热」的口径B 差就是要量的东西）。
         prewarm_tts: bool = True,
+        # ASR 前置能量门总闸（P1）：默认开，但**只在 real 模式生效**（见下方构造处）。
+        # 探针用 --no-energy-gate 跑 A/B 对照臂。
+        energy_gate: bool = True,
         recorder: TurnRecorder | None = None,
         # 预合成 filler（2026-10-10，体感优化）：判停成立后、TTS 首片之前先播一段预合成
         # 短音频，把那一格 ~650ms 的固定成本盖住。None = 关闭（默认）。
@@ -110,6 +114,9 @@ class Session:
         # M3：状态机 + 打断检测器 + 下行队列
         self._fsm = TurnFsm()
         self._barge = BargeInDetector()
+        # ASR 前置能量门（P1）：声明占位，real 模式才真正装（见下方构造处）——
+        # echo 模式没有 ASR 链路，提前返回前也要有这个属性。
+        self._energy_gate: AsrEnergyGate | None = None
         self.outbox: asyncio.Queue[TurnItem | AudioStop] = asyncio.Queue()
         self._turn_running = False
         # 传输侧那一跳（outbox → 真正下发）：Session 记"入队时刻"，由 transport 在
@@ -130,6 +137,14 @@ class Session:
         if spec_mode == "echo":
             self._scheduler: Scheduler | None = None
             return
+
+        # ASR 前置能量门（P1）装门：确认静音的帧不推 ASR，省口径B 窗口里与下行抢
+        # 事件循环的那一格（实测 p50 41~52ms，追踪文档 §三「上行不是免费的」）。
+        # **只在 real 模式生效**：sim 替身（SimAsr）的 text() 按 push 次数前进，
+        # 拦静音帧会把确定性回放变成非确定性；且 SimAsr.push_audio 只是计数器自增，
+        # 没有可省的 CPU——要省的 np.concatenate + to_thread + ONNX 解码只存在于真 ASR。
+        if real and energy_gate:
+            self._energy_gate = AsrEnergyGate()
 
         if asr is None and llm is None and tts is None:
             providers = build_providers("real" if real else "sim")
@@ -198,14 +213,23 @@ class Session:
                 # 这一段在账单里是空白（2026-10-17 实测丢过一整段）。
                 tr.start_root("turn", attrs={"mode": self.mode, "turn": self._turn_index + 1})
         frame = tr.start("uplink.frame", attrs={"bytes": len(chunk)}) if tr is not None else None
-        if tr is not None:
-            dec = tr.start("asr.push_audio", frame)
-            await self._scheduler.on_audio(chunk)
-            tr.finish(dec)
-        else:  # pragma: no cover - tracer 恒存在，分支只为类型收窄
-            await self._scheduler.on_audio(chunk)
-        if self._barge.is_speech(chunk):
+        # L1 人声判定**每帧只算一次**：is_speech 有内部去抖计数，过去一帧调两次
+        # （_await_fresh_speech 与打断触发各一次）会让超阈帧双倍计数——文档写的
+        # 3 帧去抖实际 2 帧就触发。2026-10-17 P1 接线时修正。
+        speech = self._barge.is_speech(chunk)
+        if speech:
             self._await_fresh_speech = False
+        # ASR 前置能量门（P1）：确认静音的帧不推 ASR，省口径B 窗口里与下行抢循环的
+        # 那一格。门为 None（sim/echo 模式或探针对照臂）时一切照旧。
+        # ⚠️ EOU 仍收全部帧——静音正是它判「说完没有」的原料，门只拦 ASR 一条路。
+        gated = self._energy_gate is not None and not self._energy_gate.allows(chunk)
+        if not gated:
+            if tr is not None:
+                dec = tr.start("asr.push_audio", frame)
+                await self._scheduler.on_audio(chunk)
+                tr.finish(dec)
+            else:  # pragma: no cover - tracer 恒存在，分支只为类型收窄
+                await self._scheduler.on_audio(chunk)
         if self._eou is not None:
             if tr is not None:
                 upd = tr.start("eou.update", frame)
@@ -215,15 +239,16 @@ class Session:
             else:  # pragma: no cover
                 self._eou.push_audio(chunk)
                 self._eou.update_text(self._scheduler.text())
-        # L1：AI 在说/想时用户又开口 → 打断
+        # L1：AI 在说/想时用户又开口 → 打断（用上面算好的 speech，不再重复判定）
         if (
             not self.interrupted
             and self._fsm.state in (TurnState.SPEAKING, TurnState.THINKING)
-            and self._barge.is_speech(chunk)
+            and speech
         ):
             self.barge_in()
         if tr is not None and frame is not None:
-            tr.finish(frame)
+            # gated=1：这一帧被能量门拦在 ASR 之外（A/B 与线上账单都数得出来）
+            tr.finish(frame, {"gated": 1} if gated else None)
         return []
 
     def pending_end(self) -> bool:
@@ -277,6 +302,8 @@ class Session:
         if self._scheduler is not None:
             self._scheduler.cancel()
         self._barge.reset()  # 去抖计数清零，别让上一轮尾音污染下一轮
+        if self._energy_gate is not None:
+            self._energy_gate.reset()  # 静音确认状态同步清零（打断后用户正在说）
         self.metrics.barge_in_count += 1
         self.metrics.barge_in_latency_ms = self._clock.elapsed_ms()
         self.outbox.put_nowait(AudioStop())  # L2：通知播放端停播

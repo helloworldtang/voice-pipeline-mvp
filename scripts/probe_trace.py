@@ -9,6 +9,7 @@
     uv run python scripts/probe_trace.py --repeat 8 --tts kokoro
     uv run python scripts/probe_trace.py --llm sim            # 只看本机侧（无 LLM 那一格）
     uv run python scripts/probe_trace.py --tts dashscope --no-prewarm   # 预热 A/B 对照臂
+    uv run python scripts/probe_trace.py --tts dashscope --no-energy-gate  # 能量门 A/B 对照臂
     uv run python scripts/probe_trace.py --tree               # 额外打一轮完整 span 树
 
 输出：
@@ -90,6 +91,7 @@ async def run_turn(
     gating: GatingMode,
     tail_silence_ms: int,
     prewarm: bool = True,
+    energy_gate: bool = True,
     max_turn_s: float = 30.0,
 ) -> dict[str, Any]:
     """喂一轮：上行 → EOU 判停 → run_turn → 并行 drain outbox（模拟 pump+sender）。"""
@@ -107,6 +109,7 @@ async def run_turn(
         tts=providers.tts,
         eou=build_eou(gating),
         prewarm_tts=prewarm,
+        energy_gate=energy_gate,
     )
 
     frame = 3200  # 100ms @16k
@@ -235,6 +238,10 @@ def analyse(rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "true_gap_ms": max(0.0, root.dur_ms - covered - uplink),
                 "stages": stages,
                 "inclusive": {s.name: s.dur_ms for s in spans if s.parent_id == root.span_id},
+                # 能量门（P1）：这一轮多少上行帧被拦在 ASR 之外（span 上打 gated=1）
+                "gated_frames": sum(
+                    1 for s in spans if s.name == "uplink.frame" and s.attrs.get("gated") == 1
+                ),
             }
         )
     ok = [t for t in per_turn if t["ok"]]
@@ -254,6 +261,7 @@ def analyse(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "uplink_ms": [t["uplink_ms"] for t in ok],
         "true_gap_ms": [t["true_gap_ms"] for t in ok],
         "identity_error_ms": [t["identity_error_ms"] for t in ok],
+        "gated_frames": [t["gated_frames"] for t in ok],
         "stages": {
             name: [t["stages"][name] for t in ok if name in t["stages"]] for name in stage_names
         },
@@ -318,6 +326,12 @@ def print_report(agg: dict[str, Any], mode: str, engine: str, llm: str) -> None:
             f"{up_p50 / p50_total * 100 if p50_total > 0 else 0:.0f}% | — |"
             " 与下行抢同一个事件循环 |"
         )
+    gated = agg.get("gated_frames") or []
+    if gated:
+        print(
+            f"| 能量门拦截帧（P1） | p50 {statistics.median(gated):.0f} 帧 | max {max(gated)} 帧 |"
+            " — | — | 判停后的静音帧不进 ASR；EOU 仍收全部帧 |"
+        )
     gap_p50 = statistics.median(agg["true_gap_ms"])
     print(
         f"| 真·未归因 | {gap_p50:.0f}ms | {max(agg['true_gap_ms']):.0f}ms | "
@@ -368,6 +382,11 @@ async def main() -> int:
         action="store_true",
         help="对照臂：关掉 TTS 连接预热（池仍会跨句复用，量的就是预热那一笔）",
     )
+    ap.add_argument(
+        "--no-energy-gate",
+        action="store_true",
+        help="对照臂：关掉 ASR 前置能量门（静音帧照常推 ASR，量的就是循环竞争那一格）",
+    )
     ap.add_argument("--out", default=None, help="逐轮 span JSONL 输出路径")
     args = ap.parse_args()
 
@@ -381,7 +400,9 @@ async def main() -> int:
     print(f"机器: {machine}")
     print(
         f"ASR=transducer  TTS={args.tts or 'melo'}  LLM={args.llm}({args.llm_model})  "
-        f"判停={args.gating}  n={args.repeat}  预热={'关' if args.no_prewarm else '开'}"
+        f"判停={args.gating}  n={args.repeat}  "
+        f"预热={'关' if args.no_prewarm else '开'}  "
+        f"能量门={'关' if args.no_energy_gate else '开'}"
     )
 
     pcm = build_utterance(args.text)
@@ -397,6 +418,7 @@ async def main() -> int:
             gating=gating,
             tail_silence_ms=args.silence_ms,
             prewarm=not args.no_prewarm,
+            energy_gate=not args.no_energy_gate,
         )
         row["repeat"] = i + 1
         rows.append(row)
