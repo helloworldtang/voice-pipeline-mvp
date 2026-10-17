@@ -23,6 +23,7 @@ from voice_pipeline.metrics.trace import (
     phases_of,
     stats,
     union_ms,
+    window_breakdown,
 )
 from voice_pipeline.providers.asr.sim_asr import SimAsr
 from voice_pipeline.providers.llm.sim_llm import SimLlm
@@ -348,3 +349,40 @@ async def test_serial_records_subspans_from_provider_phases() -> None:
     assert window is not None
     dec = decompose(window, tracer.spans)
     assert dec.unattributed_ms < max(5.0, dec.total_ms * 0.2)
+
+
+async def test_window_breakdown_lists_self_times_and_residual() -> None:
+    """window_breakdown：按名字汇总自有时间、降序，并把"没人埋的一段"如实留成残差。
+
+    这条不变量直接决定页面那张表可不可信：**残差不为 0 就说明页面在说谎**
+    （少画了一格，而用户以为已经看到全部）。
+    """
+    tracer = Tracer("t-breakdown")
+    tracer.start_root("turn")
+    window = tracer.start_window("turn.caliber_b")
+    first = tracer.start("child.a", window)
+    await asyncio.sleep(0.02)
+    tracer.finish(first)
+    await asyncio.sleep(0.01)  # 没人埋的一段 → 必须落进残差
+    second = tracer.start("child.b", window)
+    await asyncio.sleep(0.01)
+    tracer.finish(second)
+    tracer.finish_window()
+    tracer.finish_root()
+
+    bd = window_breakdown(tracer)
+    assert bd is not None
+    assert [i["name"] for i in bd["items"]] == ["child.a", "child.b"], "应按耗时降序"
+    assert bd["total_ms"] >= 35
+    assert bd["unattributed_ms"] >= 5, "中间那段空隙被吃掉了——页面会少画一格"
+    attributed = sum(i["ms"] for i in bd["items"])
+    assert abs(attributed + bd["unattributed_ms"] - bd["total_ms"]) < 1.0
+
+    # 阈值：只留 >= min_ms 的格子（页面要"花在哪"，不是全量噪声）
+    coarse = window_breakdown(tracer, min_ms=1000)
+    assert coarse is not None and coarse["items"] == []
+
+
+async def test_window_breakdown_is_none_without_window() -> None:
+    """没有窗口（echo/异常轮）返回 None —— 页面据此不画表，而不是画一张 0ms 的假表。"""
+    assert window_breakdown(Tracer("t-no-window")) is None

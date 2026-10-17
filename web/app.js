@@ -127,6 +127,9 @@ function setChips(metrics) {
   const chips = [];
   if (metrics.caliber_b_ms >= 0) chips.push(["口径B", Math.round(metrics.caliber_b_ms) + "ms"]);
   else if (metrics.barge_in_count > 0) chips.push(["打断轮", "无首音"]);
+  // 体感首音（含预合成 filler）：与口径B **分开报**——它省的是「以为在等」的那段，
+  // 真实回答的首片一秒没早（见 core/filler.py 的计量纪律）。
+  if (metrics.first_sound_ms >= 0) chips.push(["体感首音", Math.round(metrics.first_sound_ms) + "ms"]);
   if (metrics.eou_latency_ms >= 0) chips.push(["判停", Math.round(metrics.eou_latency_ms) + "ms"]);
   if (metrics.premature_eou === 1.0) chips.push(["抢话", "已记"]);
   if (metrics.barge_in_count > 0) chips.push(["打断", `×${metrics.barge_in_count}`]);
@@ -136,6 +139,46 @@ function setChips(metrics) {
   if (Number.isFinite(tts) && metrics.tts_first_chunk >= 0) chips.push(["TTS首片", Math.round(tts) + "ms"]);
   if (lastTailMs !== null) chips.push(["丢弃队列", lastTailMs + "ms"]);
   $("chips").innerHTML = chips.map(([k, v]) => `<span class="chip">${k} <b>${v}</b></span>`).join("");
+}
+
+// ---- 每轮 span 拆解 ---------------------------------------------------------
+
+// 服务端把口径B 窗口的自有时间摊成 `span.<name>` 键随 turn.end 下发（见
+// server/session.py:_span_metrics）。页面只负责排序与展示——自有时间的口径
+//（每毫秒只归最内层、重叠不重复计）不在前端重算，否则两边一定漂。
+function spanRows(metrics) {
+  return Object.keys(metrics)
+    .filter((k) => k.startsWith("span.") && k !== "span.unattributed")
+    .map((k) => ({ name: k.slice(5), ms: metrics[k] }))
+    .filter((r) => Number.isFinite(r.ms))
+    .sort((a, b) => b.ms - a.ms);
+}
+
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+function appendBreakdown(li, metrics) {
+  const rows = spanRows(metrics);
+  if (!rows.length) return;
+  const total = metrics.caliber_b_ms >= 0 ? metrics.caliber_b_ms : rows.reduce((s, r) => s + r.ms, 0);
+  const body = rows
+    .map((r) => {
+      const pct = total > 0 ? Math.round((r.ms / total) * 100) : 0;
+      return `<tr><td>${esc(r.name)}</td><td class="num">${Math.round(r.ms)}ms</td><td class="num">${pct}%</td></tr>`;
+    })
+    .join("");
+  const unattr = metrics["span.unattributed"];
+  const unattrRow = Number.isFinite(unattr) && unattr >= 0.5
+    ? `<tr class="unattr"><td>未归因</td><td class="num">${Math.round(unattr)}ms</td><td class="num">—</td></tr>`
+    : "";
+  const d = document.createElement("details");
+  d.className = "breakdown";
+  d.innerHTML =
+    `<summary>拆解 ${Math.round(total)}ms · ${rows.length} 格</summary>` +
+    `<table><thead><tr><th>span</th><th>耗时</th><th>占比</th></tr></thead>` +
+    `<tbody>${body}${unattrRow}</tbody></table>`;
+  li.appendChild(d);
 }
 
 // ---- 播放：24k AudioContext 背靠背调度 ---------------------------------------
@@ -260,6 +303,7 @@ function handleEvent(ev) {
           ? `⏱${Math.round(m.caliber_b_ms)}ms`
           : m.barge_in_count > 0 ? "⏱—（被打断）" : "";
         lastAssistantLi.appendChild(lat);
+        appendBreakdown(lastAssistantLi, m);
       }
       setChips(m);
       setState("listening", "聆听中");

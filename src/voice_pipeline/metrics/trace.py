@@ -347,6 +347,41 @@ def self_time_map(spans: Sequence[Span], lo: float, hi: float) -> dict[str, floa
     return out
 
 
+def window_breakdown(tracer: Tracer, *, min_ms: float = 0.5) -> dict[str, Any] | None:
+    """口径B 窗口内的自有时间汇总——服务端算好，页面/账单直接用。
+
+    为什么不在前端算：`exclusive_times` 的口径（每毫秒只归**最内层** span、并发重叠
+    不重复计）是这一层的关键不变量；前端再实现一遍必然漂。这里只把结果交出去：
+    按名字汇总、降序、丢掉 < min_ms 的噪声格子，并给出**未归因残差**（非 0 = 还有
+    东西没埋到）。
+
+    没有窗口（echo / 异常轮）返回 None——页面据此不画表，而不是画一张 0ms 的假表。
+    """
+    window = tracer.window
+    if window is None or window.dur_ms < 0:
+        return None
+    spans = tracer.spans
+    own = exclusive_times(spans, window.start_ms, window.end_ms)
+    by_id = {s.span_id: s for s in spans}
+    per_name: dict[str, float] = {}
+    for sid, ms in own.items():
+        name = by_id[sid].name
+        per_name[name] = per_name.get(name, 0.0) + ms
+    items = [
+        {"name": name, "ms": round(ms, 1)}
+        for name, ms in sorted(per_name.items(), key=lambda kv: -kv[1])
+        if ms >= min_ms and name not in {"turn", "turn.caliber_b"}
+    ]
+    # 未归因 = 窗口 span **自己** 占到的毫秒（没被任何子 span 盖住的那部分）。
+    # 不能用 total − Σ各格：exclusive_times 会把未覆盖的时段归给「覆盖它且最短」的 span，
+    # 也就是窗口自己——减出来永远是 0（2026-10-17 首版就错在这里，单测才发现）。
+    return {
+        "total_ms": round(window.dur_ms, 1),
+        "unattributed_ms": round(own.get(window.span_id, 0.0), 1),
+        "items": items,
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class SpanStats:
     name: str

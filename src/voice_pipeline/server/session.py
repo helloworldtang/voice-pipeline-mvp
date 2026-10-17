@@ -31,7 +31,7 @@ from voice_pipeline.core.sentence_splitter import SentenceSplitter
 from voice_pipeline.core.turn_fsm import TurnFsm, TurnState
 from voice_pipeline.metrics.events import SessionClock, TurnMetrics
 from voice_pipeline.metrics.jsonl import TurnRecorder
-from voice_pipeline.metrics.trace import Tracer
+from voice_pipeline.metrics.trace import Tracer, window_breakdown
 from voice_pipeline.providers.asr.sim_asr import SimAsr
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.providers.factory import build_eou, build_providers
@@ -421,6 +421,12 @@ class Session:
                     and item.seq >= 0  # filler 用负序号：它是体感优化，不进口径B 那一跳
                 ):
                     self._first_audio_enqueued_ms = self._clock.elapsed_ms()
+                if isinstance(item, TurnEnd):
+                    # 每轮 span 拆解随 turn.end 下发：页面要能「边跑边看时间花在哪」。
+                    # 走扁平 metrics 键（span.<name>）而不是新加嵌套字段：wire 契约里
+                    # metrics 就是 dict[str, float]，加字段要改协议；页面只需数字，
+                    # 完整 span 树已经在 JSONL 的 spans 里（记账仍用调度器给的 bill）。
+                    item = TurnEnd(metrics={**item.metrics, **self._span_metrics()})
                 self.outbox.put_nowait(item)
                 # 边播边攒多轮上下文：AsrFinal→user，TtsSentence→assistant（拼句）。
                 # 只记流经 outbox 的内容，被 interrupted 截断的部分自然不入史。
@@ -444,6 +450,20 @@ class Session:
                 if assistant_parts:
                     self._history.append({"role": "assistant", "content": "".join(assistant_parts)})
                 self._trim_history()
+
+    def _span_metrics(self) -> dict[str, float]:
+        """口径B 窗口的 span 自有时间 → 扁平 metrics 键（`span.<name>`）。
+
+        服务端算、页面只负责显示：`exclusive_times` 的口径（每毫秒只归最内层、重叠不
+        重复计）是这一层的不变量，前端再算一遍必然漂。没有窗口的轮返回空表。
+        """
+        tracer = self.metrics.tracer
+        breakdown = window_breakdown(tracer) if tracer is not None else None
+        if breakdown is None:
+            return {}
+        out = {f"span.{item['name']}": float(item["ms"]) for item in breakdown["items"]}
+        out["span.unattributed"] = float(breakdown["unattributed_ms"])
+        return out
 
     def note_first_audio_send(self) -> None:
         """传输层回调：**真正把首片发下去的那一刻**调一次。

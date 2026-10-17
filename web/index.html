@@ -46,6 +46,17 @@
   #log .user::before { content: "我："; color: #9aa3b2; }
   #log .assistant::before { content: "AI："; color: #6f8fd8; }
   #log li .lat { font-size: 11px; color: #8ab4f8; margin-left: 8px; }
+  /* 每轮 span 拆解：默认折叠，展开后是「这一轮花在哪」的表 */
+  #log li details.breakdown { margin: 2px 0 6px; font-size: 12px; }
+  #log li details.breakdown summary { cursor: pointer; color: #9aa3b2; }
+  #log li details.breakdown summary:focus-visible { outline: 1px solid #4a90d9; }
+  #log li details.breakdown table { border-collapse: collapse; margin-top: 4px; max-width: 380px; }
+  #log li details.breakdown th,
+  #log li details.breakdown td { text-align: left; padding: 1px 10px 1px 0; font-weight: normal;
+                                 font-variant-numeric: tabular-nums; }
+  #log li details.breakdown th { color: #7b8494; font-size: 11px; }
+  #log li details.breakdown td.num { text-align: right; color: #c7cdd8; }
+  #log li details.breakdown tr.unattr td { color: #fbbc04; }
   #controls { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 12px; }
   #controls input, #controls select, #controls button {
     background: #1c2028; color: inherit; border: 1px solid #333a46;
