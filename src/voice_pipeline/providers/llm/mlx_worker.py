@@ -71,9 +71,13 @@ def main() -> None:
         cancelled = False
         first_ms = -1.0
         for resp in stream_generate(model, tokenizer, prompt=prompt, max_tokens=max_tokens):
+            out: dict[str, object] = {"id": rid, "text": resp.text}
             if first_ms < 0:
                 first_ms = (time.perf_counter() - t_recv) * 1000
-            print(json.dumps({"id": rid, "text": resp.text}, ensure_ascii=False), flush=True)
+                # 首个 token 的 perf 原值随行发出（父进程侧 perf_counter 与本进程
+                # 同源、可直减）：父侧据此把 prefill 拆成「生成本身」+「唤醒/传输」
+                out["t_first"] = time.perf_counter()
+            print(json.dumps(out, ensure_ascii=False), flush=True)
             if _stdin_pending():
                 cmd = sys.stdin.readline().strip()
                 if cmd:

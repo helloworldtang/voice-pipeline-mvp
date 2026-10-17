@@ -118,6 +118,20 @@ class SerialScheduler:
                         phases = phases_of(self._llm)
                         phase_span(tracer, "llm.headers", phases, "start", "headers", ttft)
                         phase_span(tracer, "llm.prefill", phases, "headers", "first_content", ttft)
+                        # prefill 深拆（本地 MLX 才有 worker_first_token，云端 LLM 无此键
+                        # 自动跳过）：生成本身 vs 线程→事件循环的唤醒——2026-10-17
+                        # 调研 §4.1 的 ~80ms 无主开销靠这两个格子定性
+                        phase_span(
+                            tracer, "llm.worker_ttft", phases, "headers", "worker_first_token", ttft
+                        )
+                        phase_span(
+                            tracer,
+                            "llm.wakeup",
+                            phases,
+                            "worker_first_token",
+                            "first_content",
+                            ttft,
+                        )
                     if tracer and ttft:
                         tracer.finish(ttft)  # 首 token：这一格是模型自己的 RTT+prefill
                     if tracer and req is not None:

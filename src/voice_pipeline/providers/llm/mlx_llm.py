@@ -80,6 +80,8 @@ class MlxLlm:
     # 与 QwenLlm 同一套 phase 约定（调度器按 start/headers/first_content 取）：
     # 本地没有网络那一段，所以 headers == start ⇒ `llm.headers` 记 ~0ms，
     # 整段 TTFT（含首次 Metal 编译）落在 `llm.prefill` 这一格。
+    # 另有 `worker_first_token`（生成线程产出首 token 的时刻）供调度器深拆：
+    # prefill = worker_ttft（生成本身）+ wakeup（线程 → 事件循环的唤醒）。
     last_phases: dict[str, float]
 
     def preload(self) -> None:
@@ -140,6 +142,10 @@ class MlxLlm:
                 for resp in stream_generate(model, tokenizer, chat, max_tokens=self.max_tokens):
                     if stop.is_set():
                         break
+                    # 首个 token 在线程里产出的时刻（perf 原值，直接进 last_phases）：
+                    # 与事件循环侧收到的 first_content 相减，才能分清「生成慢」还是
+                    # 「唤醒慢」——2026-10-17 调研 §4.1 那段 ~80ms 无主开销的判据。
+                    self.last_phases.setdefault("worker_first_token", time.perf_counter())
                     loop.call_soon_threadsafe(queue.put_nowait, resp.text)
             except BaseException as exc:  # noqa: BLE001 - 线程里的异常要带回事件循环
                 errors.append(exc)

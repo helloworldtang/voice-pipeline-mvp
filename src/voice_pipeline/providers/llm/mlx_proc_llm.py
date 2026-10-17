@@ -142,6 +142,12 @@ class MlxProcLlm:
                     if event.get("id") not in (None, rid):
                         continue
                     if "text" in event:
+                        if "t_first" in event:
+                            # worker 产出首 token 的时刻（子进程 perf 原值，同机同源可直接减）：
+                            # 与父侧 first_content 相减 = 唤醒/传输，与 headers 相减 = 生成本身
+                            self.last_phases.setdefault(
+                                "worker_first_token", float(event["t_first"])
+                            )
                         self.last_phases.setdefault("first_content", time.perf_counter())
                         yield str(event["text"])
                         continue

@@ -385,6 +385,13 @@ class PipelinedScheduler:
                         phases = phases_of(self._llm)
                         phase_span(tr, "llm.headers", phases, "start", "headers", ttft)
                         phase_span(tr, "llm.prefill", phases, "headers", "first_content", ttft)
+                        # 深拆（同 serial）：生成本身 vs 线程→事件循环的唤醒
+                        phase_span(
+                            tr, "llm.worker_ttft", phases, "headers", "worker_first_token", ttft
+                        )
+                        phase_span(
+                            tr, "llm.wakeup", phases, "worker_first_token", "first_content", ttft
+                        )
                         tr.finish(ttft)
                 for sentence in splitter.feed(piece):
                     seq += 1
