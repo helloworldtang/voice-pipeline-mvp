@@ -141,6 +141,7 @@ TTS 引擎默认 **melo**（2026-09-22 实测定档，见 `docs/实验报告.md`
 
 ```bash
 uv sync                       # 安装依赖（含 dev 组）
+uv sync --extra local         # 可选：本地 LLM（MLX，仅 macOS/arm64）
 uv run python scripts/demo_serial.py   # sim 全链：waterfall + 双口径账单
 
 ./scripts/download_models.sh  # 拉真实模型（~400MB，不进仓）
@@ -160,6 +161,18 @@ uv run pytest                 # 测试（sim 零模型零网络；real 用例缺
 uv run uvicorn voice_pipeline.server.app:app --port 8000
 curl localhost:8000/healthz
 ```
+
+**推荐启动（当前本机最优：口径B ≈619ms）**——本地 LLM 降级档 + 云 TTS：
+
+```bash
+VOICE_LLM_ENGINE=mlx ./scripts/dev_server.sh   # 需先 uv sync --extra local
+```
+
+- 本地 LLM 热态 TTFT ~45ms（微基准）/ ~100ms（流水线内），首句 ~75ms；比云端省 ~100ms；
+- 依赖 `VOICE_ASR_THREADS` 默认 **1**（ASR RTF 0.008~0.016，1 线程远超实时；
+  多出来的线程会和本地推理抢核，实测把口径B 抬回 741ms）；
+- 缺云 key 时 `auto` 自动降级本地，账单 `llm` 字段如实写 `MlxLlm`——**不静默退回 SimLlm**；
+- 代价：1.5B 答案更笼统（「气温适中」而不是「18 到 25 度」），降级档要明说。
 
 WS 协议：`session.begin{mode, gating, grace_ms}` → 上行 PCM16 音频帧 → `session.end` 触发一轮
 （real 模式由 EOU 自动判停，不必显式 `session.end`）；`interrupt` 触发打断，下行 `audio.stop`
