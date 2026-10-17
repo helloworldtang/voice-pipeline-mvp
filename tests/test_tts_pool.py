@@ -488,3 +488,21 @@ async def test_pool_stats_counts_are_honest() -> None:
         "size": 1,
         "prewarming": 0,
     }
+
+
+async def test_prewarm_burns_first_task_cost() -> None:
+    """预热必须把「连接上第一个任务」也烧掉——只预连不预跑，首轮还要付 840ms（2026-10-17 实测）。
+
+    这是文章 WarmPool「预合成静音帧」那半边：预连只解决 TCP/TLS，真正的任务是 call(text)。
+    """
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setenv("VOICE_TTS_TASK_WARM", "1")
+    try:
+        tts, made = _tts(pool_size=1)
+    finally:
+        monkeypatch.undo()
+    tts.prewarm()
+    await _settle(tts)
+    assert made, "没有构造过合成器"
+    assert "好。" in made[0].calls, f"预热没有跑过任务（calls={made[0].calls}）"
+    assert tts.pool_stats()["idle"] == 1

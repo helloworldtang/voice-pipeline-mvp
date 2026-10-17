@@ -224,6 +224,16 @@ class DashScopeTts:
         self._prewarm_task: asyncio.Task[None] | None = None
         # SDK 是否支持预热协议；None = 还没构造过合成器、待判定（见 _warm_capable）
         self._warm_ok: bool | None = None
+        # 是否已经烧过「连接上第一个任务」的那笔开销（任务级预备，见 _warm_one_task）
+        self._task_warm = False
+        # 任务级预热开关（默认关）：它会多跑一次合成、改变池计数口径，
+        # 所以先做成显式开关，等冷启动首轮 A/B 出来再决定是否翻默认。
+        self._task_warm_enabled = os.environ.get("VOICE_TTS_TASK_WARM", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+            "on",
+        )
         # 计数：探针/账单要能算出「省了几次建连、毁了几条连接」
         self.warm_acquires = 0
         self.cold_acquires = 0
@@ -293,17 +303,44 @@ class DashScopeTts:
     async def _prewarm_async(self) -> None:
         try:
             missing = self._pool_size - len(self._idle)
-            if missing <= 0:
-                return
-            # 并发连：别把 2×260ms 串成 520ms——首轮第一句等不起
-            results = await asyncio.gather(*(self._connect_one() for _ in range(missing)))
-            for synth in results:
-                if synth is not None:
-                    self._idle.append(synth)
+            if missing > 0:
+                # 并发连：别把 2×260ms 串成 520ms——首轮第一句等不起
+                results = await asyncio.gather(*(self._connect_one() for _ in range(missing)))
+                for synth in results:
+                    if synth is not None:
+                        self._idle.append(synth)
+            # 任务级预热：只连上 = 只烧掉 TCP 握手。**连接上第一个任务**还要再付一次
+            # 服务端开销（2026-10-17 实测 840ms，把冷启动首轮直接抬到 1743ms）；
+            # 同一连接跑过一次之后，connect 降到 43~50ms。用一小段合成把它提前烧掉
+            # ——就是文章 WarmPool 里「预合成静音帧」那半边（我们之前只做了预连）。
+            await self._warm_one_task()
         except Exception:
             logger.warning("TTS 连接预热失败（冷路径照常）", exc_info=True)
         finally:
             self._prewarming = False
+
+    async def _warm_one_task(self) -> None:
+        """烧掉「连接上第一个任务」的服务端开销（只做一次）。
+
+        为什么需要：预连只解决 TCP/TLS；真正的任务是 `call(text)`——服务端要建会话、
+        加载音色、跑第一个 chunk。实测同一连接：首任务 `tts.connect` 840ms，之后 43~50ms。
+        做法：在后台用一小段合成（「好。」）跑一遍并丢弃音频，让池里的连接变成"跑过任务"的。
+        代价：一次极短合成的配额 + 后台 ~0.6s（用户还在说话）。
+        """
+        if (
+            not self._task_warm_enabled
+            or self._task_warm
+            or self._warm_ok is False
+            or not self._idle
+        ):
+            return
+        self._task_warm = True
+        try:
+            async for _ in self.synth("好。"):
+                pass
+        except Exception:  # noqa: BLE001 - 预热失败不能拖垮会话
+            self._task_warm = False
+            logger.warning("TTS 任务级预热失败（首轮会多付一次任务开销）", exc_info=True)
 
     async def _connect_one(self, attempts: int = 2) -> Any | None:
         """建一条预连。**失败重试一次**。
