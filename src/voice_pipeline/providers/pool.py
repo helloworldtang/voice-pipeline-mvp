@@ -68,8 +68,12 @@ def _tts_threads() -> int:
     return int(os.environ.get("VOICE_LOCAL_TTS_THREADS", LOCAL_TTS_THREADS))
 
 
+# ASR 线程数默认 1（2026-10-17 实测改默认，原为 2）。
+# 依据：ASR RTF 只有 0.008~0.016，1 线程就远超实时；而多出来的那个线程会和
+# 同进程的 LLM 生成（尤其本地 MLX）抢核——实测把 prefill 140→53~116ms、
+# 首句 120→73~76ms、口径B 741→619ms（本地 LLM 档）。识别结果不受线程数影响。
 def _asr_threads() -> int:
-    return int(os.environ.get("VOICE_ASR_THREADS", 2))
+    return int(os.environ.get("VOICE_ASR_THREADS", 1))
 
 
 def needs_exclusive_slot(mode: str) -> bool:
