@@ -88,10 +88,13 @@ def arm_whole(text: str, timeout_s: float = 20.0) -> dict[str, float]:
     }
 
 
-def arm_incremental(head: str, tail: str, gap_ms: float, timeout_s: float = 20.0) -> dict[str, float]:
+def arm_incremental(
+    head: str, tail: str, gap_ms: float, timeout_s: float = 20.0
+) -> dict[str, float]:
     cb = _Probe()
     synth = _synth(cb)
     cb.mark()
+
     # streaming_call 是阻塞提交（内部建会话/发 run-task），所以放线程里跑
     def run() -> None:
         synth.streaming_call(head)
@@ -127,7 +130,9 @@ def summarize(label: str, runs: list[dict[str, float]]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(description="增量文本 TTS 探针")
     ap.add_argument("--repeat", type=int, default=5)
-    ap.add_argument("--gap-ms", type=float, default=120.0, help="两段文字之间的间隔（模拟生成耗时）")
+    ap.add_argument(
+        "--gap-ms", type=float, default=120.0, help="两段文字之间的间隔（模拟生成耗时）"
+    )
     args = ap.parse_args()
 
     whole: list[dict[str, float]] = []
@@ -135,7 +140,9 @@ def main() -> None:
     for i in range(args.repeat):
         whole.append(arm_whole(HEAD + TAIL))
         incr.append(arm_incremental(HEAD, TAIL, args.gap_ms))
-        print(f"  run{i + 1}: 整句 {whole[-1]['first_ms']:.0f}ms | 增量 {incr[-1]['first_ms']:.0f}ms")
+        print(
+            f"  run{i + 1}: 整句 {whole[-1]['first_ms']:.0f}ms | 增量 {incr[-1]['first_ms']:.0f}ms"
+        )
 
     print(f"\n[{datetime.now():%H:%M:%S}] 同一句「{HEAD}{TAIL}」，重复 {args.repeat} 次")
     summarize("A 整句 call()      ", whole)
