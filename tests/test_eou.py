@@ -257,3 +257,52 @@ def test_take_premature_reads_once_and_clears():
     det.push_audio(_speech(100))
     assert det.take_premature() is True
     assert det.take_premature() is False  # 已清
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# §三③ 判停尾部最差体感：尾音噪声毛刺清零静音窗 → 拖到 max_silence 看门狗
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_intermittent_noise_used_to_trigger_watchdog():
+    """§三③ 根因复现（旧阈值 0.01）：尾音噪声毛刺每帧清零静音 → 500ms 攒不到 →
+    拖到 max_silence 看门狗（真人账 2000/2100ms）。用 silence_reset_threshold=0.01
+    模拟修复前，防回退。"""
+    old = FusedEou(
+        gating=GatingMode.CONSERVATIVE,
+        silence=VadSilenceEou(sample_rate=SR, min_silence_ms=500.0, silence_reset_threshold=0.01),
+        max_silence_ms=2000.0,
+    )
+    for _ in range(3):
+        old.push_audio(_speech(100))
+    for _ in range(5):  # 仅 1s：旧行为下噪声毛刺每帧重置 → 静音永远 <100ms
+        old.push_audio(_frame(100, amp=0.021))  # 噪声毛刺 RMS≈0.015
+        old.push_audio(_silence(100))
+    assert not old.should_end(), "旧阈值下噪声毛刺应使 500ms 窗永远攒不到"
+
+
+def test_intermittent_noise_fixed():
+    """§三③ 修复后（默认 0.02）：噪声毛刺是中性帧，不清零静音 → 500ms 保守阈值正常触发，
+    不拖到看门狗。"""
+    new = FusedEou(gating=GatingMode.CONSERVATIVE, max_silence_ms=2000.0)
+    for _ in range(3):
+        new.push_audio(_speech(100))
+    for _ in range(5):  # 1s：修复后静音稳定累积 → 500ms 即判停
+        new.push_audio(_frame(100, amp=0.021))
+        new.push_audio(_silence(100))
+    assert new.should_end(), "修复后噪声毛刺不应拖住静音窗"
+
+
+def test_silence_reset_threshold_default_respects_invariant():
+    """不动点：清零静音的阈值（0.02）必须 ≥ 标记有人声的阈值（0.01），否则比 L1 barge-in
+    还灵敏，会与打断层判定打架。0.015 的帧是中性帧——标记有人声、但不清零静音；
+    清晰语音（RMS 0.21）仍清零。"""
+    det = VadSilenceEou(sample_rate=SR)
+    assert det.silence_reset_threshold >= det.energy_threshold
+    det.push_audio(_speech(100))  # 真实语音 100ms，清零静音
+    det.push_audio(_frame(100, amp=0.021))  # 噪声毛刺 RMS≈0.015
+    det.push_audio(_silence(100))  # 静音 +100ms
+    assert det.silence_ms() >= 100.0, "噪声毛刺不应清零静音计时"
+    det.push_audio(_silence(100))  # 再 +100 → 200
+    det.push_audio(_speech(100))  # 清晰语音应清零
+    assert det.silence_ms() == 0.0, "清晰语音必须清零静音计时"

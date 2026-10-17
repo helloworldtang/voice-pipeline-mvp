@@ -38,6 +38,7 @@ from typing import Protocol
 # 能量门限（归一化到满幅 [0,1] 的 RMS）。真实语音 RMS 通常 0.05~0.3，静音=0。
 ENERGY_FLOOR = 0.005  # 区分「有声/无声」的下限（韵律与抢话检测用）
 ENERGY_THRESHOLD = 0.01  # L0 能量门控触发「有人声」的阈值
+EOU_SILENCE_RESET_RMS = 0.02  # 清零静音计时所需的「清晰语音」阈值（= barge-in L1，见下）
 
 
 class GatingMode(enum.Enum):
@@ -104,12 +105,16 @@ class VadSilenceEou:
         min_silence_ms: float = 500.0,
         min_speech_ms: float = 150.0,
         energy_threshold: float = ENERGY_THRESHOLD,
+        silence_reset_threshold: float = EOU_SILENCE_RESET_RMS,
         speech_fn: Callable[[bytes], bool] | None = None,
     ) -> None:
         self.sample_rate = sample_rate
         self.min_silence_ms = min_silence_ms
         self.min_speech_ms = min_speech_ms
         self.energy_threshold = energy_threshold
+        # 清零静音计时所需的「清晰语音」阈值。默认 0.02 = barge-in L1：与「什么样算说话」
+        # 保持同一把尺，避免 EOU 与打断层对噪声的判定互相打架。
+        self.silence_reset_threshold = silence_reset_threshold
         self._speech_fn = speech_fn
         self._elapsed = 0.0
         self._silence = 0.0
@@ -120,17 +125,24 @@ class VadSilenceEou:
     def push_audio(self, chunk: bytes) -> None:
         self._elapsed += _frame_ms(chunk, self.sample_rate)
         if self._speech_fn is not None:
-            speech = self._speech_fn(chunk)
+            is_speech = self._speech_fn(chunk)
+            is_clear = is_speech  # Silero 已是很强的「清晰语音」判据
         else:
-            speech = rms_of(chunk) >= self.energy_threshold
-        if speech:
+            rms = rms_of(chunk)
+            is_speech = rms >= self.energy_threshold
+            is_clear = rms >= self.silence_reset_threshold
+        if is_speech:
             self._has_speech = True
             self._speech += _frame_ms(chunk, self.sample_rate)
             self._total_speech += _frame_ms(chunk, self.sample_rate)
-            self._silence = 0.0
         else:
             self._speech = 0.0
             self._silence += _frame_ms(chunk, self.sample_rate)
+        # 只有「清晰语音」才清零静音计时。0.01~0.02 的噪声毛刺（AEC 残余/环境噪声）是
+        # 中性帧：标记有人声、但不增长也不清零静音，避免静音窗被永远重置 → 500ms 保守阈值
+        # 攒不到、一路拖到 max_silence 看门狗（真人账 2000/2100ms）。详见 docs/优化空间 §三③。
+        if is_clear:
+            self._silence = 0.0
 
     def update_text(self, partial: str) -> None:  # L0/L1 不依赖文本
         pass
@@ -148,6 +160,10 @@ class VadSilenceEou:
         self._speech = 0.0
         self._total_speech = 0.0
         self._has_speech = False
+
+    def unlatch(self) -> None:
+        """VadSilenceEou 无内部闩锁（判停决定由上层 FusedEou 持有），unlatch 为空操作。"""
+        pass
 
     @property
     def has_speech(self) -> bool:
@@ -294,6 +310,7 @@ class FusedEou:
         *,
         sample_rate: int = 16000,
         min_silence_ms: float = 500.0,
+        silence_reset_threshold: float = EOU_SILENCE_RESET_RMS,
         min_silence_short_ms: float = 250.0,
         min_silence_aggressive_ms: float = 120.0,
         min_silence_neural_ms: float = 100.0,
@@ -313,13 +330,16 @@ class FusedEou:
     ) -> None:
         self.gating = gating
         self._silence = silence or VadSilenceEou(
-            sample_rate=sample_rate, min_silence_ms=min_silence_ms
+            sample_rate=sample_rate,
+            min_silence_ms=min_silence_ms,
+            silence_reset_threshold=silence_reset_threshold,
         )
         self._prosody = prosody or ProsodyEou(sample_rate=sample_rate)
         self._semantic = semantic or SemanticHeuristicEou(sample_rate=sample_rate)
         self._neural = neural
         self.sample_rate = sample_rate
         self.min_silence_ms = min_silence_ms
+        self.silence_reset_threshold = silence_reset_threshold
         self.min_silence_short_ms = min_silence_short_ms
         self.min_silence_aggressive_ms = min_silence_aggressive_ms
         self.min_silence_neural_ms = min_silence_neural_ms
