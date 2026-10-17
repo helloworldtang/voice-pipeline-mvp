@@ -35,6 +35,7 @@ from urllib.parse import urlencode
 import numpy as np
 import soxr
 import websockets
+from websockets.asyncio.client import ClientConnection
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,7 @@ APP_ID_ENV = "XFYUN_TTS_APPID"
 KEY_ENV = "XFYUN_TTS_API_KEY"
 SECRET_ENV = "XFYUN_TTS_API_SECRET"
 DEFAULT_VCN = "xiaoyan"
+PREWARM_TTL_S = 10.0  # 预建连最多等这么久；超了就重连（也防服务端静默断链）
 SRC_RATE = 16000  # 实测：24k raw 静默返回空音频，16k 正常
 OUT_RATE = 24000
 FIELD_KEY = "api_key"
@@ -63,6 +65,14 @@ def _encode(samples: np.ndarray) -> bytes:
     return pcm
 
 
+async def _safe_close(ws: ClientConnection) -> None:
+    """关闭且吞掉异常：清理路径不该把一次打断变成一次报错。"""
+    try:
+        await ws.close()
+    except Exception:
+        logger.debug("[xfyun] 关连接失败（忽略）", exc_info=True)
+
+
 class XfyunTts:
     """讯飞 v2 流式 TTS。与 DashScopeTts 同契约（`tts_streams = True`）。"""
 
@@ -75,6 +85,11 @@ class XfyunTts:
         self._app_id = os.environ.get(APP_ID_ENV, "").strip()
         self._api_key = os.environ.get(KEY_ENV, "").strip()
         self._api_secret = os.environ.get(SECRET_ENV, "").strip()
+        # 预建连槽位：(建立时刻, 连接)。讯飞一个连接只能做一个任务，所以这是「一次性」的，
+        # 判停时先握上、等首句文本到了直接用 —— 把 114~129ms 的握手藏进 finalize+LLM 窗口。
+        self._pending: tuple[float, ClientConnection] | None = None
+        self._opening = False
+        self._prewarm_on = os.environ.get("VOICE_XFYUN_PREWARM", "1").strip() != "0"
         missing = [
             name
             for name, value in (
@@ -127,6 +142,58 @@ class XfyunTts:
             }
         )
 
+    # ---- 预建连（判停即握手） --------------------------------------------------
+
+    def _fresh(self, pending: tuple[float, ClientConnection]) -> bool:
+        return (time.monotonic() - pending[0]) < PREWARM_TTL_S
+
+    def _usable(self, ws: ClientConnection) -> bool:
+        # websockets 两者都要看：close_code 非空 = 已收关闭帧；close_sent = 我们已经关它了
+        return getattr(ws, "close_code", None) is None and not getattr(ws, "close_sent", False)
+
+    async def _take(self) -> ClientConnection:
+        """取连接：有新鲜预建连就用它，否则现连。"""
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            if self._fresh(pending) and self._usable(pending[1]):
+                return pending[1]
+            await _safe_close(pending[1])
+        return await websockets.connect(self._url(), max_size=None, open_timeout=self.timeout_s)
+
+    def prewarm(self) -> None:
+        """EOU 触发时调用（非阻塞）：把握手提前跑掉。
+
+        讯飞一个连接只服务一个任务，所以这里不是"池"，是"一次性预建连"：
+        握手 114~129ms（uvicorn 里）整段藏进 finalize + LLM 首句的窗口。
+        """
+        if not self._prewarm_on or self._opening:
+            return
+        if (
+            self._pending is not None
+            and self._fresh(self._pending)
+            and self._usable(self._pending[1])
+        ):
+            return
+        self._opening = True
+        task = asyncio.create_task(self._preopen())
+        task.add_done_callback(lambda _: setattr(self, "_opening", False))
+
+    async def _preopen(self) -> None:
+        try:
+            ws = await websockets.connect(self._url(), max_size=None, open_timeout=self.timeout_s)
+        except Exception:  # 预建连失败不影响正确性：synth 会自己重连
+            logger.debug("[xfyun] 预建连失败，synth 时重连", exc_info=True)
+            return
+        stale, self._pending = self._pending, (time.monotonic(), ws)
+        if stale is not None:
+            await _safe_close(stale[1])
+
+    async def aclose(self) -> None:
+        """关闭预建连（会话结束时用；没被用掉不留半开连接）。"""
+        pending, self._pending = self._pending, None
+        if pending is not None:
+            await _safe_close(pending[1])
+
     # ---- 合成 ----------------------------------------------------------------
 
     async def synth(self, sentence: str) -> AsyncIterator[bytes]:
@@ -134,9 +201,8 @@ class XfyunTts:
         # 流式重采样器（带状态）：按块独立重采样会在每 200ms 边界爆音
         resampler = soxr.ResampleStream(SRC_RATE, OUT_RATE, 1, dtype="float32")
         _t0 = time.perf_counter()
-        async with websockets.connect(
-            self._url(), max_size=None, open_timeout=self.timeout_s
-        ) as ws:
+        ws = await self._take()
+        try:
             _conn_ms = (time.perf_counter() - _t0) * 1000
             if os.environ.get("XFYUN_DEBUG"):
                 logger.warning("[xfyun] connect=%.0fms", _conn_ms)
@@ -167,6 +233,10 @@ class XfyunTts:
                     if tail.size:
                         yield _encode(tail)
                     return
+
+        finally:
+            # 讯飞一条连接只做一个任务，用完就关，不留半开连接
+            await _safe_close(ws)
 
     def synth_blocking(self, sentence: str) -> bytes:
         """协议兼容（整句）：走同一路径收齐。流水线本身用 `synth()`。"""
