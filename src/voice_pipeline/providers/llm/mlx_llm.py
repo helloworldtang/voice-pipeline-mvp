@@ -42,6 +42,22 @@ def _resolve_model(model: str | None) -> str:
     return model or os.environ.get(MODEL_ENV) or DEFAULT_MODEL
 
 
+def _apply_template(tokenizer: Any, messages: list[dict[str, str]]) -> Any:
+    """套聊天模板，并**关掉思考链**。
+
+    Qwen3.5 这一代默认先输出一段 "Thinking Process:" 再作答（实测同一句问话，
+    60 token 内一句人话都没有）。语音助手的首句延迟直接翻倍到不可用，
+    所以必须传 `enable_thinking=False`；老模型（Qwen2.5）的模板不认这个参数，
+    会抛 TypeError，这时退回默认行为。
+    """
+    try:
+        return tokenizer.apply_chat_template(
+            messages, add_generation_prompt=True, enable_thinking=False
+        )
+    except TypeError:
+        return tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+
+
 def _resolve_system(system: str | None) -> str:
     return system or os.environ.get(SYSTEM_ENV) or DEFAULT_SYSTEM
 
@@ -108,9 +124,7 @@ class MlxLlm:
         self.last_phases = {"start": time.perf_counter()}
         model, tokenizer = await asyncio.to_thread(self._ensure)
         self.last_phases["headers"] = time.perf_counter()
-        chat = tokenizer.apply_chat_template(
-            build_messages(self._system, history, prompt), add_generation_prompt=True
-        )
+        chat = _apply_template(tokenizer, build_messages(self._system, history, prompt))
 
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[str | None] = asyncio.Queue()
