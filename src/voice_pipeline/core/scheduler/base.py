@@ -36,9 +36,10 @@ async def play_filler(
     计量纪律（见 `core/filler.py`）：这里只打 `first_sound`，**不碰 first_audio_out**——
     口径B 必须继续只算「真实回答的首片」。filler 没配/库为空时什么都不做（传 None 即关闭）。
 
-    分片序号用 **0 与负数**（0, -1, -2…）：filler 不在调度器的分片序号空间里，用负号把
-    这件事写在数据上，调度器的 `next_seq()` 因此完全不受影响（seq 只出现在诊断事件
-    `AudioChunk`，客户端不消费它）。
+    分片序号全部为**负数**（−1, −2, −3…）：filler 不在调度器的分片序号空间里（调度器从 1 起）。
+    这一条不只是命名——`Session.run_turn` 用 `seq >= 0` 识别「真实回答的首片」来记
+    `tx.first_audio` 那根 span；filler 的首片若用 0，就会被误认成真实首片（2026-10-17 修正：
+    原先写的是「0 与负数」，首个 filler 分片恰好是 0，正好撞上那个条件）。
     """
     if filler is None:
         return
@@ -50,7 +51,7 @@ async def play_filler(
         if i == 0:
             metrics.mark("first_sound")
         metrics.audio_bytes += len(block)
-        yield AudioFragment(seq=-i if i else 0, data=block)
+        yield AudioFragment(seq=-(i + 1), data=block)
 
 
 async def synth_to_fragments(

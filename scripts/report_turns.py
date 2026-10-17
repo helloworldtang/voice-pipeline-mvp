@@ -222,6 +222,20 @@ def render(
         if len(b_values) < 5:
             lines.append("")
             lines.append(f"⚠️ **样本仅 n={len(b_values)}，不足 5 轮**，分位数无统计意义，仅供参考。")
+    # 体感首音（含 filler）：与口径B **分开报**——filler 是预合成音频，它让「第一个声音」
+    # 更早，但真实回答的首片一秒没早（`core/filler.py` 的计量纪律）。两个数必须同时在场，
+    # 否则单看任何一个都会误读：只看体感会以为链路变快了，只看口径B 会以为 filler 白做。
+    fs_values = [
+        float(r["first_sound_ms"]) for r in complete if float(r.get("first_sound_ms", -1)) >= 0
+    ]
+    if fs_values:
+        used = sum(1 for r in complete if float(r.get("filler_used", 0)) >= 1)
+        lines.append("")
+        lines.append(f"`体感首音（说完→第一个声音，含 filler）`：{summarize(fs_values)}")
+        lines.append(
+            f"> ⚠️ {used}/{len(fs_values)} 轮播了预合成 filler。**口径B 不含 filler**——"
+            "它仍只算真实回答的首片；对外两个数一起报。"
+        )
     lines.append("")
 
     if interrupted:
@@ -282,16 +296,18 @@ def render(
     lines += [
         "## 四、逐轮明细",
         "",
-        "| 轮 | 口径B | 判停 | 首句字数 | 用户说 | AI 说 |",
-        "|---|---|---|---|---|---|",
+        "| 轮 | 口径B | 体感 | 判停 | 首句字数 | 用户说 | AI 说 |",
+        "|---|---|---|---|---|---|---|",
     ]
     for r in records:
         flag = " ⚠️打断" if r.get("interrupted") else ""
         b = float(r.get("caliber_b_ms", -1))
         b_txt = f"{b:.0f}ms" if b >= 0 else "—（未测到）"
+        fs = float(r.get("first_sound_ms", -1))
+        fs_txt = f"{fs:.0f}ms" if fs >= 0 else "—"
         lat_v = float(r.get("eou_latency_ms", -1))
         lines.append(
-            f"| {r.get('turn', '?')}{flag} | {b_txt} | "
+            f"| {r.get('turn', '?')}{flag} | {b_txt} | {fs_txt} | "
             f"{f'{lat_v:.0f}ms' if lat_v >= 0 else '—'} | "
             f"{r.get('tts_first_chars', '?')} | "
             f"{(r.get('user_text') or '')[:24]} | {(r.get('assistant_text') or '')[:24]} |"

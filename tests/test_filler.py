@@ -149,3 +149,21 @@ async def test_empty_transcript_gets_no_filler(tmp_path: Path) -> None:
     assert frags == []
     assert bill["filler_used"] == 0.0
     assert "first_sound" not in bill
+
+
+async def test_filler_fragments_use_negative_seq(tmp_path: Path) -> None:
+    """filler 分片必须全为负序号。
+
+    `Session.run_turn` 用 `seq >= 0` 识别「真实回答的首片」来记 `tx.first_audio` 那根
+    span；filler 若占到 0 号，诊断那一格就挂到了 filler 上（2026-10-17 修正）。
+    """
+    bank = make_bank(tmp_path, {"a": CLIP_A})
+    session = build_session(bank)
+    await session.on_audio(b"\x00" * 3200)
+    seqs: list[int] = []
+    async for item in session.finish():
+        if isinstance(item, AudioFragment):
+            seqs.append(item.seq)
+    assert seqs, "没有下行音频，用例本身失效"
+    assert seqs[0] < 0, f"首个 filler 分片的 seq 必须为负，实际 {seqs[0]}"
+    assert all(s > 0 for s in seqs[1:]), f"真实回答分片必须为正序号：{seqs}"

@@ -16,7 +16,8 @@
 
 哪些资源**不**占槽（把它们算进上限是自欺）：
 - LLM：`QwenLlm` 共用一份 httpx.AsyncClient，网络 IO 天然并发；
-- 云端 TTS：`DashScopeTts` 每次调用新建 synthesizer，无共享推理状态；
+- 云端 TTS：`DashScopeTts` 不跑 ONNX，不占本地推理槽——它自持一个小型**连接池**
+  （P0.5，2026-10-17；预热一条 WS 供后续句子复用），池大小与并发上限无关；
 - sim 三替身：没有重量资源，不设上限（CI 与结构压测要开任意多路）。
 
 计的是 ONNX 推理，不是连接数：一个 WebSocket 连接很便宜，真正被独占的是 ort session。

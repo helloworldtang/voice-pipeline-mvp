@@ -30,8 +30,14 @@ from pathlib import Path
 from voice_pipeline.core.filler import DEFAULT_FILLER_DIR
 from voice_pipeline.providers.tts.dashscope_tts import DEFAULT_MODEL, DEFAULT_VOICE, DashScopeTts
 
-# 三条中性、短、互相不同：轮转着用，避免每条都是同一句
-DEFAULT_TEXTS = ("嗯，我看一下。", "好的，稍等。", "让我想想。")
+# 三条中性、短、互相不同：轮转着用，避免每条都是同一句。
+# ⚠️ 必须短：filler 与真回答走同一条 FIFO 下行，**比 TTS 首片（~650ms）长的 filler 会把
+# 真回答的「被听见起点」往后推**（2026-10-17 实测：1190ms 的片段把回答推后约 400ms）。
+# 目标是「搭话不占位」：片段结束前，真回答的首片已经就绪。
+DEFAULT_TEXTS = ("嗯。", "好的。", "我看看。")
+# 片段时长上限（ms）：超过它 warning 并以非 0 退出（除非 --allow-long）——
+# 这不是美学约束，是上面那条 FIFO 的硬边界。
+DEFAULT_MAX_MS = 600.0
 SAMPLE_RATE = 24000
 
 
@@ -67,7 +73,9 @@ def duration_ms(pcm: bytes) -> float:
     return len(pcm) / 2 / SAMPLE_RATE * 1000.0
 
 
-async def synth_all(texts: list[str], out: Path) -> list[dict[str, str]]:
+async def synth_all(
+    texts: list[str], out: Path, *, max_ms: float, allow_long: bool
+) -> list[dict[str, str]]:
     """在**同一个事件循环**里依次合成（SDK 的连接/回调绑 loop，见 probe_tts_firstchunk）。"""
     tts = DashScopeTts()
     clips: list[dict[str, str]] = []
@@ -78,12 +86,18 @@ async def synth_all(texts: list[str], out: Path) -> list[dict[str, str]]:
             continue
         pcm = trim_silence(pcm_raw)
         name = hashlib.sha1(text.encode()).hexdigest()[:12] + ".pcm"
+        ms = duration_ms(pcm)
+        if ms > max_ms and not allow_long:
+            print(
+                f"✗ {text!r} 裁后 {ms:.0f}ms > 上限 {max_ms:.0f}ms——"
+                "这段 filler 会比 TTS 首片长，把真回答的「被听见起点」推后。"
+                "换更短的文本（或确认后加 --allow-long）",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
         (out / name).write_bytes(pcm)
         clips.append({"text": text, "file": name})
-        print(
-            f"✓ {text!r} → {name}（原生 {duration_ms(pcm_raw):.0f}ms → "
-            f"裁静音后 {duration_ms(pcm):.0f}ms）"
-        )
+        print(f"✓ {text!r} → {name}（原生 {duration_ms(pcm_raw):.0f}ms → 裁静音后 {ms:.0f}ms）")
     return clips
 
 
@@ -91,12 +105,19 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="预合成 filler 音频")
     ap.add_argument("--out", default=str(DEFAULT_FILLER_DIR), help="输出目录")
     ap.add_argument("--texts", nargs="*", default=list(DEFAULT_TEXTS), help="要合成的文本")
+    ap.add_argument(
+        "--max-ms",
+        type=float,
+        default=DEFAULT_MAX_MS,
+        help="单条片段时长上限（默认 600ms；超过就失败，因为会推后真回答起点）",
+    )
+    ap.add_argument("--allow-long", action="store_true", help="明知片段过长仍要写入")
     args = ap.parse_args()
 
     out = Path(args.out).expanduser()
     out.mkdir(parents=True, exist_ok=True)
     texts = list(args.texts) or list(DEFAULT_TEXTS)
-    clips = asyncio.run(synth_all(texts, out))
+    clips = asyncio.run(synth_all(texts, out, max_ms=args.max_ms, allow_long=args.allow_long))
     if not clips:
         raise SystemExit("没有一条合成成功，index.json 未写（服务端会当 filler 关闭处理）")
 
