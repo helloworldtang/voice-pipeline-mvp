@@ -140,10 +140,19 @@ def build_providers(
         tts: TtsProvider
         if tts_name == "dashscope":
             tts = _cached_tts_cloud()
+        elif tts_name == "xfyun":
+            # 讯飞 v2 流式：实测服务端首包 p50 137ms（DashScope 344~421），
+            # 但连接不可复用，每条句子各自建连（握手 ~38ms）。见 providers/tts/xfyun_tts.py。
+            from voice_pipeline.providers.tts.xfyun_tts import XfyunTts
+
+            tts = XfyunTts()
         else:
             tts_cls = real.TTS_ENGINES.get(tts_name)
             if tts_cls is None:
-                msg = f"unknown tts engine: {tts_name} (可选 {list(real.TTS_ENGINES)}、dashscope)"
+                msg = (
+                    f"unknown tts engine: {tts_name} "
+                    f"(可选 {list(real.TTS_ENGINES)}、dashscope、xfyun)"
+                )
                 raise ValueError(msg)
             # TTS 4 线程是本机实测最优点（2 线程 665ms → 4 线程 624ms，8 线程反而退步）
             tts = _cached_tts_local(tts_cls)

@@ -116,6 +116,11 @@ class _Slot:
             from voice_pipeline.providers.tts.dashscope_tts import DashScopeTts
 
             self._tts = DashScopeTts()
+        elif tts_name == "xfyun":
+            from voice_pipeline.providers.tts.xfyun_tts import XfyunTts
+
+            # 讯飞 v2：不跑 ONNX（不占推理核），但仍走这个槽，保持「一份 provider 一套会话」
+            self._tts = XfyunTts()
         else:
             tts_cls = real.TTS_ENGINES.get(tts_name)
             if tts_cls is None:

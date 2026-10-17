@@ -27,9 +27,21 @@ class Chunker:
     因此「已下发 / 未下发」必须以分片为界，已播出不可撤回。
     """
 
-    def __init__(self, params: AudioParams | None = None) -> None:
+    def __init__(self, params: AudioParams | None = None, *, first_min_ms: int = 0) -> None:
+        """`first_min_ms`：**首片**只要求这么多音频即可下发（0 = 与常规片同长）。
+
+        为什么要有这个：分片尺寸固定 200ms，而流式 TTS 的首包往往只有 40~90ms
+        （讯飞实测）。等凑满 200ms 才发首片，等于把 TTS 省下的时间又原样吐回去——
+        首片 89ms 被拖成 ~290ms。首片短一点，客户端按到达顺序播，听感无差别。
+        """
         self._params = params or AudioParams()
         self._size = self._params.chunk_bytes
+        self._first_size = (
+            max(1, self._params.sample_rate * first_min_ms // 1000 * self._params.sample_width)
+            if first_min_ms > 0
+            else self._size
+        )
+        self._first_pending = True
         self._buffer = bytearray()
         self._seq = 0
 
@@ -42,10 +54,13 @@ class Chunker:
             return []
         self._buffer.extend(data)
         chunks: list[bytes] = []
-        while len(self._buffer) >= self._size:
-            chunks.append(bytes(self._buffer[: self._size]))
-            del self._buffer[: self._size]
-        return chunks
+        while True:
+            take = self._first_size if self._first_pending else self._size
+            if len(self._buffer) < take:
+                return chunks
+            chunks.append(bytes(self._buffer[:take]))
+            del self._buffer[:take]
+            self._first_pending = False
 
     def next_seq(self) -> int:
         self._seq += 1

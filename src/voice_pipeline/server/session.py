@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import AsyncIterator
 from uuid import uuid4
 
@@ -43,6 +44,20 @@ from voice_pipeline.server.protocol import AsrFinal, AudioStop, TtsSentence, Tur
 # 多轮上下文上限：最近 10 轮（20 条 user/assistant 消息）。语音对话的时效性强，
 # 更早的轮次对当前问题几乎没有贡献，却每轮都要整包发给 LLM 付费。
 logger = logging.getLogger(__name__)
+
+
+# 首片缩短（`VOICE_FIRST_CHUNK_MIN_MS`，默认 0=关）：流式 TTS 首包常只有 40~90ms，
+# 等凑满 200ms 才发首片会把 TTS 省下的时间原样吐回去（讯飞实测 89ms → 口径B 多 ~150ms）。
+# 默认关是因为它破坏了「所有分片等长」这条既有约定，而守这条约定的
+# `tests/test_ws.py` / `test_serial_pipeline.py` 当前不可改（凭据判据误拦），
+# 所以先在流式小包 provider 的实验里用 env 打开，全量启用待测试可写后再议。
+def _first_chunk_min_ms() -> int:
+    raw = os.environ.get("VOICE_FIRST_CHUNK_MIN_MS", "0").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
 
 MAX_HISTORY_MESSAGES = 20
 
@@ -161,7 +176,7 @@ class Session:
             "tts": tts or SimTts(),
             "metrics": self.metrics,
             "splitter": SentenceSplitter(),
-            "chunker": Chunker(),
+            "chunker": Chunker(first_min_ms=_first_chunk_min_ms()),
             "history": self._history,
             # 预热总闸一路传到调度器：判停时那次预热也归这个开关管（A/B 要能整个关掉）
             "prewarm_tts": prewarm_tts,
