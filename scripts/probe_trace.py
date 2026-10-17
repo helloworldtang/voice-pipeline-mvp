@@ -8,6 +8,7 @@
     uv run python scripts/probe_trace.py                      # real-serial + melo + qwen，6 轮
     uv run python scripts/probe_trace.py --repeat 8 --tts kokoro
     uv run python scripts/probe_trace.py --llm sim            # 只看本机侧（无 LLM 那一格）
+    uv run python scripts/probe_trace.py --tts dashscope --no-prewarm   # 预热 A/B 对照臂
     uv run python scripts/probe_trace.py --tree               # 额外打一轮完整 span 树
 
 输出：
@@ -88,6 +89,7 @@ async def run_turn(
     llm_model: str | None = None,
     gating: GatingMode,
     tail_silence_ms: int,
+    prewarm: bool = True,
     max_turn_s: float = 30.0,
 ) -> dict[str, Any]:
     """喂一轮：上行 → EOU 判停 → run_turn → 并行 drain outbox（模拟 pump+sender）。"""
@@ -104,6 +106,7 @@ async def run_turn(
         llm=providers.llm,
         tts=providers.tts,
         eou=build_eou(gating),
+        prewarm_tts=prewarm,
     )
 
     frame = 3200  # 100ms @16k
@@ -173,6 +176,7 @@ async def run_turn(
     tracer = session.metrics.tracer
     spans = tracer.to_list() if tracer else []
     llm_name = type(providers.llm).__name__
+    pool = providers.tts.pool_stats() if hasattr(providers.tts, "pool_stats") else {}
     return {
         "bill": bill,
         "spans": spans,
@@ -182,6 +186,7 @@ async def run_turn(
         "llm": llm_name,
         "llm_model": getattr(providers.llm, "model", ""),
         "user_text": bill.get("user_text", ""),
+        "pool": pool,
     }
 
 
@@ -265,7 +270,7 @@ STAGE_NOTES = {
     "llm.ttft": "首 token：模型 RTT + prefill（= headers + prefill）",
     "llm.headers": "发包→响应头：网络 + 路由（共享连接，TLS 已摊薄）",
     "llm.prefill": "响应头→首 content：服务端排队 + prefill",
-    "tts.connect": "call 提交→WS on_open：建连 + 认证（每句都新建合成器）",
+    "tts.connect": "call 提交→WS on_open：建连 + 认证（P0.5 后热连接只剩一个往返）",
     "tts.first_byte": "on_open→首个音频分片：服务端合成首片",
     "llm.first_sentence": "首 token → 首句末标点（分句攒句）",
     "llm.request": "整段生成，扣掉嵌套后剩下的「LLM 自己」的份额",
@@ -358,6 +363,11 @@ async def main() -> int:
     )
     ap.add_argument("--silence-ms", type=int, default=300, help="判停前追加的静音")
     ap.add_argument("--tree", action="store_true", help="打印第一轮完整 span 树")
+    ap.add_argument(
+        "--no-prewarm",
+        action="store_true",
+        help="对照臂：关掉 TTS 连接预热（池仍会跨句复用，量的就是预热那一笔）",
+    )
     ap.add_argument("--out", default=None, help="逐轮 span JSONL 输出路径")
     args = ap.parse_args()
 
@@ -371,7 +381,7 @@ async def main() -> int:
     print(f"机器: {machine}")
     print(
         f"ASR=transducer  TTS={args.tts or 'melo'}  LLM={args.llm}({args.llm_model})  "
-        f"判停={args.gating}  n={args.repeat}"
+        f"判停={args.gating}  n={args.repeat}  预热={'关' if args.no_prewarm else '开'}"
     )
 
     pcm = build_utterance(args.text)
@@ -386,6 +396,7 @@ async def main() -> int:
             llm_model=args.llm_model,
             gating=gating,
             tail_silence_ms=args.silence_ms,
+            prewarm=not args.no_prewarm,
         )
         row["repeat"] = i + 1
         rows.append(row)
@@ -399,6 +410,8 @@ async def main() -> int:
 
     agg = analyse(rows)
     print_report(agg, "real", args.tts or "melo", args.llm)
+    if rows and rows[-1].get("pool"):
+        print(f"TTS 连接池（末轮快照）：{rows[-1]['pool']}")
     if args.tree:
         print_tree(rows)
 

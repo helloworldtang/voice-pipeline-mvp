@@ -117,12 +117,18 @@ def stat(values: list[float]) -> dict[str, float]:
 
 
 class Runner:
-    """连发 N 次合成；失败即换一个 provider（连带换掉那条卡住的连接）。"""
+    """连发 N 次合成；失败即换一个 provider（连带换掉那条卡住的连接）。
 
-    def __init__(self, voice: str, timeout_s: float) -> None:
+    `prewarm=True`（默认）：开跑前先在后台把池连上——量的就是**线上真实路径**
+    （判停即预热，首句也走热连接）。`--no-prewarm` 关掉它跑冷启动对照臂。
+    """
+
+    def __init__(self, voice: str, timeout_s: float, prewarm: bool = True) -> None:
         self.voice = voice
         self.timeout_s = timeout_s
         self._tts = DashScopeTts(voice=voice)
+        if prewarm:
+            self._tts.prewarm()
 
     async def once(self, text: str, idx: int) -> dict[str, Any]:
         result = await synth_once(self._tts, text, self.timeout_s)
@@ -138,8 +144,10 @@ def split_runs(runs: list[dict[str, Any]]) -> tuple[list[float], list[dict[str, 
     return firsts, errors
 
 
-async def phase_repeat(voice: str, text: str, repeat: int, timeout_s: float) -> dict[str, Any]:
-    runner = Runner(voice, timeout_s)
+async def phase_repeat(
+    voice: str, text: str, repeat: int, timeout_s: float, prewarm: bool = True
+) -> dict[str, Any]:
+    runner = Runner(voice, timeout_s, prewarm)
     runs: list[dict[str, Any]] = []
     for i in range(repeat):
         runs.append(await runner.once(text, i))
@@ -163,12 +171,12 @@ async def phase_repeat(voice: str, text: str, repeat: int, timeout_s: float) -> 
 
 
 async def phase_voices(
-    voices: list[str], text: str, repeat: int, timeout_s: float
+    voices: list[str], text: str, repeat: int, timeout_s: float, prewarm: bool = True
 ) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for voice in voices:
         try:
-            runner = Runner(voice, timeout_s)
+            runner = Runner(voice, timeout_s, prewarm)
             runs = []
             for i in range(repeat):
                 runs.append(await runner.once(text, i))
@@ -188,9 +196,9 @@ async def phase_voices(
 
 
 async def phase_lengths(
-    voice: str, texts: list[str], repeat: int, timeout_s: float
+    voice: str, texts: list[str], repeat: int, timeout_s: float, prewarm: bool = True
 ) -> list[dict[str, Any]]:
-    runner = Runner(voice, timeout_s)
+    runner = Runner(voice, timeout_s, prewarm)
     out: list[dict[str, Any]] = []
     for text in texts:
         runs = []
@@ -232,16 +240,21 @@ async def run_probe(args: argparse.Namespace) -> dict[str, Any]:
         "voice": args.voice,
         "repeat": args.repeat,
         "call_timeout_s": args.call_timeout,
+        "prewarm": not args.no_prewarm,
     }
     print("[1/4] 同句重复…", flush=True)
     report["same_sentence"] = await phase_repeat(
-        args.voice, args.text, args.repeat, args.call_timeout
+        args.voice, args.text, args.repeat, args.call_timeout, not args.no_prewarm
     )
     print("[2/4] 音色对照…", flush=True)
     voices = [v.strip() for v in args.voices.split(",") if v.strip()]
-    report["voices"] = await phase_voices(voices, args.text, 3, args.call_timeout)
+    report["voices"] = await phase_voices(
+        voices, args.text, 3, args.call_timeout, not args.no_prewarm
+    )
     print("[3/4] 长度对照…", flush=True)
-    report["lengths"] = await phase_lengths(args.voice, ["好", args.text], 3, args.call_timeout)
+    report["lengths"] = await phase_lengths(
+        args.voice, ["好", args.text], 3, args.call_timeout, not args.no_prewarm
+    )
     print("[4/4] 网络握手…", flush=True)
     report["network"] = phase_network()
     return report
@@ -260,6 +273,11 @@ def main() -> None:
         "--text", default="今天上海天气怎么样，多云转晴，气温十八到二十五度。", help="基准句"
     )
     ap.add_argument("--call-timeout", type=float, default=20.0, help="单次合成超时（秒）")
+    ap.add_argument(
+        "--no-prewarm",
+        action="store_true",
+        help="对照臂：不预热，首句付完整冷建连（默认预热=线上真实路径）",
+    )
     ap.add_argument(
         "--out", default=None, help="结果 JSON 路径（默认 bench/tts-firstchunk-<ts>.json）"
     )
@@ -281,6 +299,10 @@ def main() -> None:
         warm = s["warm_excl_first"]["p50"]
         print(f"  冷启动第 1 次={s['cold_first_ms']:.0f}ms；去掉它后 p50={warm:.0f}ms")
         print(f"  整句合成 total p50={s['total_ms']['p50']:.0f}ms")
+        print(
+            f"  建连 connect p50={s['connect_ms']['p50']:.0f}ms"
+            f"（预热臂应收敛到一个 WS 往返；冷臂才是完整建连+认证）"
+        )
     for err in s["errors"]:
         print(f"  ⚠️ 第 {err['index']} 次：{err['error']}（等了 {err['waited_ms']}ms）")
     print("音色对照:")

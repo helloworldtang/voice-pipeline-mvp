@@ -52,6 +52,12 @@ class TtsProvider(Protocol):
     支持句内增量合成的 provider 在类上置 `tts_streams = True`，调度器经
     `synth_to_fragments` 探测后走 synth() 异步迭代器路径（边合成边出片）；
     未声明则走整句 synth_blocking 路径。参见 core/scheduler/base.py。
+
+    预热能力约定（同样是可选非成员，2026-10-17 P0.5）：有连接可预热的
+    provider（云流式 TTS）提供 `prewarm() -> None`——**非阻塞**，池不满就在
+    后台补预连。调度器在判停/投机开跑时调用它：建连那几百毫秒必须发生在
+    用户还在说话的窗口里，等它再跑 LLM 等于把账加进口径B。没有该方法的
+    provider（sim/本机 TTS）经 getattr 探测后静默跳过。
     """
 
     def synth(self, sentence: str) -> AsyncIterator[bytes]: ...

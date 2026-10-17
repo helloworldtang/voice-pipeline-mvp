@@ -28,7 +28,8 @@
   **① 建连那 257ms 每句白付**（`DashScopeTts.synth()` 每句新建 SpeechSynthesizer，
   `_close_ws_after_use` 默认 True）：隔离探针首片 604 = 建连 259 + 服务端 338（TCP 握手仅 40ms）；
   **SDK 自带 `SpeechSynthesizerObjectPool`**（借出即预连）实测首片 340~375ms
-  ⇒ **P0.5 = TTS 连接预热 −230~260ms，当前最大可省一笔**；或判停即预连（不依赖文本，可与 LLM 并行）。
+  ⇒ **P0.5 = TTS 连接预热 −230~260ms，当时账面最大可省一笔**；或判停即预连（不依赖文本，可与 LLM 并行）。
+  **✅ 2026-10-17 夜已落地（自建池，见下条）**。
   **② 换 LLM 模型救不了**：qwen-flash ttft 284ms 全平台最快；qwen3.7-flash 11342ms（2811 字思考链）、
   qwen3.8-flash 2803ms、deepseek-v4.1-flash 4059ms、step-3.7-flash 400。新"flash"全是推理型，
   只转发 content 的我们表现为"久不出声"。**llm.prefill 仅 0.1ms**（网关把等待并进响应头；
@@ -37,6 +38,19 @@
   EOU 判停理论对口但 70~500ms + 跨洋 RTT 省不出延迟；唯一 plausible 槽 = barge-in 意图分类（二期）。
   无 key 未实测。探针：`probe_trace.py --llm-model X` / `probe_tts_firstchunk.py` /
   `report_turns.py --spans`（线上账单分格）。
+- **🔺 2026-10-17 夜 P0.5 已落地：TTS 连接预热（自建池）**：`dashscope_tts.py` 重写为连接池
+  （不用 SDK 的 `SpeechSynthesizerObjectPool`——cosyvoice-v1 硬编码、replenish 不受控），
+  沿用其改名私有方法 `__connect/__reset/__update_params/__is_connected`，关键 `close_ws_after_use=False`。
+  预热三处均非阻塞：建会话 / 判停 / 投机开跑（LLM headers ~230ms 即窗口）。
+  池纪律：温连接已死且未出片→冷路径重试一次；出过片绝不重试；barge-in 事后回收轮询
+  `callback.finished`（防 InvalidTask）；能力探测失败整条预热关闭退回冷路径。
+  **实测（真 SDK A/B，n=6）：口径B p50 1029→724ms（−305ms），tts.connect 257→38ms，warm 6/cold 0，残差 0**；
+  对照臂仅第 1 轮 1317ms（池跨轮复用）。地板 ≈**700ms**（服务端首字节 ~330 + LLM 网关 ~230 +
+  首句 ~120 + 传输 ~30，判停另算在口径B 外）。
+  **顺带修真 bug**：`call()` 抛 ConnectionError 时无回调投哨兵 → `queue.get()` 永久挂起
+  （旧探针「偶发卡死」根因）→ `fail_sentinel` done callback。
+  ⚠️ **「预合成静音帧」仍未做**（filler 路线，README 差距表在列）——别把 P0.5 说成整个 WarmPool 兑现。
+  测试 16 例（`test_tts_pool.py` 13 + `test_prewarm_wiring.py` 3）；A/B 命令见追踪文档 §八。
 - **M0 骨架已完成**（2026-09-21，commit 1d91f9d）：git + pyproject(uv/ruff/mypy strict/pytest) + CI(py3.10/3.12) + WS echo 服务 + sim 三替身 + 22 项测试全绿。
 - **M1 serial 全链已完成**（commit d4d765f）：分句 + TTS 分片 + waterfall 双口径账单 + `scripts/demo_serial.py`；44 项测试全绿。
 - **M2a real 接入 + 本机校准**（015cfd9）/ **M4 pipelined 投机调度**（33b3705）/ **M2b EOU 四路融合判停**（e07539c）均已完成。
@@ -46,7 +60,7 @@
   未命中时却是纯亏损。完整账在 `docs/实验报告.md`。**对外不要再报 179ms / 81ms / 534ms。**
 - **M3 barge-in 三层 + 状态机 + live 客户端已完成**（本次）：`turn_fsm.py` + `barge_in.py` + `AudioStop` + WS 三路并发（接收/`run_turn`/`pump`，outbox 解耦）+ `scripts/live_client.py`；71 项测试全绿。细节与诚实边界见技术方案 **§14**。
 - **M5 收尾发版已完成**（本地，未 push）：README 补齐「承诺映射表（逐项对齐真实文件）+ 对比定位 + 差距表 + 发版检查单」；LICENSE(MIT) 已在；技术方案 §5 加「设计意图≠实际落盘」差异说明、M5 行标 ✅。
-- **⚠️ M5 诚实盘点发现的重要事实（勿再当"已完成"）**：① **real 模式 LLM 仍是 `SimLlm`**，真 DeepSeek 未接（端到端口径B 只是本机侧下界）；② scripted 客户端未做（§4.5 承诺 live+scripted）；③ JSONL 事件流落盘未做（§4.5 #4）；④ `DualPriorityQueue` 有实现有单测但**未接进 WS 主链路**（用无界 outbox）；⑤ 无 Dockerfile/compose；⑥ barge-in 无回声抑制（仅 L1 能量）、尾音未量化；⑦ ASR 前置 energy gate 未做、WarmPool 未做；⑧ EOU L2/L3 为启发式。以上全部已列入 README 差距表。
+- **⚠️ M5 诚实盘点发现的重要事实（勿再当"已完成"）**：① **real 模式 LLM 仍是 `SimLlm`**，真 DeepSeek 未接（端到端口径B 只是本机侧下界）；② scripted 客户端未做（§4.5 承诺 live+scripted）；③ JSONL 事件流落盘未做（§4.5 #4）；④ `DualPriorityQueue` 有实现有单测但**未接进 WS 主链路**（用无界 outbox）；⑤ 无 Dockerfile/compose；⑥ barge-in 无回声抑制（仅 L1 能量）、尾音未量化；⑦ ASR 前置 energy gate 未做、WarmPool 的「预合成静音帧」未做（**连接预热已于 2026-10-17 兑现**）；⑧ EOU L2/L3 为启发式。以上全部已列入 README 差距表。
 - **全部里程碑（M0–M5）代码与文档完成**，本地 commit，**未 push**（用户要求先本地验收）。
 
 ## ⚠️ 2026-10 后续（本节最新，与上文的滞后部分冲突时以本节为准）

@@ -31,9 +31,13 @@ class SerialScheduler:
         splitter: SentenceSplitter | None = None,
         chunker: Chunker | None = None,
         history: list[dict[str, str]] | None = None,
+        prewarm_tts: bool = True,
     ) -> None:
         """history：Session 持有的多轮上下文（可变引用）。调用 LLM 时取快照传入，
-        传引用的列表本身绝不在这里被改写。"""
+        传引用的列表本身绝不在这里被改写。
+
+        prewarm_tts：判停时是否触发 TTS 连接预热（P0.5）。探针的对照臂关掉它。
+        """
         self._asr = asr
         self._llm = llm
         self._tts = tts
@@ -41,6 +45,7 @@ class SerialScheduler:
         self._splitter = splitter or SentenceSplitter()
         self._chunker = chunker or Chunker()
         self._history = history
+        self._prewarm_tts_on = prewarm_tts
 
     async def on_audio(self, chunk: bytes) -> None:
         await self._asr.push_audio(chunk)
@@ -52,7 +57,21 @@ class SerialScheduler:
         """barge-in：本类没有后台 speculative 工作，仅需复位由 EOU 驱动的状态。"""
         self._splitter = SentenceSplitter()
 
+    def _prewarm_tts(self) -> None:
+        """TTS 连接预热（P0.5）：判停一刻就在后台连上，非阻塞。
+
+        建连 ~260ms 必须发生在**用户话音刚落之后、LLM 回来之前**的窗口里
+        （headers 一个往返 ~230ms 就是它的一生），等它再跑 LLM 等于把账加进
+        口径B。provider 没有 prewarm()（sim/本机 TTS）时静默跳过。
+        """
+        if not self._prewarm_tts_on:
+            return
+        prewarm = getattr(self._tts, "prewarm", None)
+        if callable(prewarm):
+            prewarm()
+
     async def on_end_of_utterance(self) -> AsyncIterator[TurnItem]:
+        self._prewarm_tts()
         self._metrics.mark("utterance_end")
         yield TurnStart()
 
@@ -135,6 +154,7 @@ class SerialScheduler:
             self._metrics.tts_first_chars = len(sentence)
         yield TtsSentence(seq=seq, text=sentence)
         first_chunk = True
+        warm = False
         tr = self._metrics.tracer
         root = (tr.window or tr.root) if tr is not None else None
         # TTS 单独一格 **且记字数**：本机最强的相关性就在这一格，`chars` 是解释它的唯一自变量
@@ -143,6 +163,7 @@ class SerialScheduler:
         async for chunk in synth_to_fragments(self._tts, sentence, self._chunker):
             if first_chunk:
                 first_chunk = False
+                warm = bool(getattr(self._tts, "last_warm", False))
                 self._metrics.mark("tts_first_chunk")
                 if tr is not None:
                     # 深拆 tts.first_chunk：`connect`（建连+认证）与 `first_byte`
@@ -161,4 +182,5 @@ class SerialScheduler:
             self._metrics.audio_bytes += len(chunk)
             yield AudioFragment(seq=self._chunker.next_seq(), data=chunk)
         if tr is not None and synth is not None:
-            tr.finish(synth)
+            # warm：这一句借到的是不是预热连接（P0.5 生效的直接证据）
+            tr.finish(synth, {"warm": 1 if warm else 0})

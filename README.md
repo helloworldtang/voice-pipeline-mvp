@@ -110,6 +110,13 @@ TTS 引擎默认 **melo**（2026-09-22 实测定档，见 `docs/实验报告.md`
 > ② **换 LLM 模型救不了**：qwen-flash 已是全平台最快，新"flash"全是推理型
 > （ttft 2.8~11.3s）；决策模型 Jev 不生成自然语言，顶替不了回复槽位。
 
+> ✅ **2026-10-17 P0.5 已落地（连接预热，追踪文档 §四 4.4）**：建连那一格已去掉——
+> `DashScopeTts` 自建连接池（预热走 SDK `__connect`，复用走 `__reset`+
+> `__update_params` 换 task_id），判停/建会话即非阻塞预热，温连接已死且未出片时
+> 冷路径重试一次。同机同时段 A/B（`--no-prewarm` 对照）：口径B **1029→724ms**
+> （预热开 p50 724ms、`tts.connect` 257→38ms；预热关的第 1 轮 1317ms），
+> 恒等式残差仍 0ms，2 会话并发共享池验证通过（834/810ms）。
+
 > 历史判断更正：这里原先写「瓶颈是 LLM」，那是推断不是实测，已按格拆账推翻。
 > 详见报告第六节开头。
 
@@ -203,6 +210,7 @@ uv run python scripts/live_client.py --url ws://localhost:8000/ws   # 需 pyaudi
 | 承诺（出处） | 兑现它的代码 | 复现证据 |
 |---|---|---|
 | 文章第一板：句末标点切句，不切逗号 | `core/sentence_splitter.py` | `tests/test_sentence_splitter.py` |
+| 文章第二板（连接那一半）：TTS 连接预热 / 复用 | `providers/tts/dashscope_tts.py` 连接池 + `Session`/调度器判停即预热 | `tests/test_tts_pool.py` + 追踪文档 §四 4.4 A/B |
 | 文章第三板：24kHz / 200ms / PCM16 可配置 | `audio/chunker.py`（`AudioParams`） | `tests/test_chunker.py` |
 | 文章 barge-in 三层 | L1 `core/barge_in.py`、L2/L3 `server/session.py`、状态机 `core/turn_fsm.py` | `tests/test_bargein.py` |
 | 评论区：滑动窗口语义提交 / 预生成 / 纠偏作废 | `core/scheduler/pipelined.py` | `tests/test_pipelined.py` |
@@ -215,8 +223,10 @@ uv run python scripts/live_client.py --url ws://localhost:8000/ws   # 需 pyaudi
 | live 麦克风客户端（真人对讲） | `scripts/live_client.py` | 见差距表：scripted 客户端未做 |
 | 本机（Apple M5）延迟校准 | `scripts/calibrate.py` | 技术方案 §13（`bench/*.json`） |
 
-文章第二板「连接预热」是**部分兑现**：模型构造即加载、进程内常驻（省去每次调用重载），
-但「预建连接 + 预合成静音帧」的 WarmPool 没做——详见差距表。
+文章第二板「连接预热」的**连接那一半已兑现**（2026-10-17 P0.5）：`DashScopeTts`
+自建连接池，判停/建会话即预热、跨句跨轮复用，口径B 1029→724ms
+（追踪文档 §四 4.4 有 A/B 与复现命令）；剩下「预合成静音帧」的 WarmPool
+仍未做——详见差距表。
 
 ## 对比定位
 
@@ -259,7 +269,7 @@ uv run python scripts/live_client.py --url ws://localhost:8000/ws   # 需 pyaudi
 | 无 Docker / compose | 本机 `uvicorn` 可跑 | 没有容器化部署形态 | ✅ 已补（2026-10-03）：`deploy/Dockerfile` + `compose.yml`，linux/amd64 构建并起容器实测 healthz/页面通过 |
 | ~~EOU L2/L3 是启发式~~ → **L2 已换神经版** | L2 用 Smart Turn v3.2，L3 仍是启发式 | ① 中文样本全是 chirp3（TTS 合成），抢话率 4.6% 是乐观下界，D5 真人集未建；② L3 文本路（turn-detector INT8）未接；③ 短轮次（<2s）判停未测 | D5 中文真人集；必要时接 L3 |
 | ~~JSONL 事件流落盘未做~~ → **已落地**（2026-09-27） | `metrics/jsonl.py`：每轮一行，含 waterfall 各点 + 双份文本；`VOICE_EVENTS_JSONL` 启用（默认关，零副作用） | 单进程内串行写；多 worker 部署需换集中式收集 | 真人验收与线上排查共用这条证据链 |
-| **WarmPool「预合成静音帧」未做** | 仅模型常驻 | 首音前少一档可优化的常量延迟 | 见技术方案 §13.4 |
+| **WarmPool「预合成静音帧」未做**（连接预热已兑现，见上） | 仅模型常驻 + **TTS 连接池**（P0.5，2026-10-17） | 首音前少一档可优化的常量延迟 | 见技术方案 §13.4 |
 | **媒体面 / 音色克隆未做** | 无 FreeSWITCH / WebRTC / 唇形；无 zipvoice 克隆 | 接入电话网与自定义音色不在本仓 | **范围外**，见下 |
 
 **明确的范围外**（不要悄悄做进去）：商用抗噪与人声干扰、硬件 AEC、媒体面（FreeSWITCH / WebRTC / 唇形）、音色克隆（zipvoice）。

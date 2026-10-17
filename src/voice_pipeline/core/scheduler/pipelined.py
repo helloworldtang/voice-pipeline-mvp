@@ -67,6 +67,7 @@ class PipelinedScheduler:
         tail_timeout_ms: float = 5000.0,
         debounce_ms: float = 0.0,
         history: list[dict[str, str]] | None = None,
+        prewarm_tts: bool = True,
     ) -> None:
         """grace_ms：EOU 后最多再等多少毫秒让投机落地（0 = 不等，没好就走串行）。
 
@@ -97,6 +98,7 @@ class PipelinedScheduler:
         self._history = history
         # EOU 已经触发后，partial 前缀校验失效（final 才是权威）——见 _invalidate_if_stale。
         self._eou_done = False
+        self._prewarm_tts_on = prewarm_tts
         self.spec_hits = 0
         self.spec_misses = 0
         self.spec_aborts = 0
@@ -131,6 +133,9 @@ class PipelinedScheduler:
 
     def _start_speculation(self, text: str) -> None:
         self._timer = None
+        # 用户还在说：此刻预热 TTS 连接，建连那 ~260ms 藏在说话窗口里，
+        # 不进口径B（与判停时那次预热互为兜底，幂等）。
+        self._prewarm_tts()
         task = self._task
         if task is not None and not task.done():
             # 在飞的投机答的是上一版问题，留着只是白烧 CPU
@@ -138,6 +143,14 @@ class PipelinedScheduler:
             self.spec_aborts += 1
         self._run = SpecRun(text=text)
         self._task = asyncio.create_task(self._run_speculation(self._run))
+
+    def _prewarm_tts(self) -> None:
+        """TTS 连接预热（P0.5）：非阻塞，后台补预连。语义同 SerialScheduler。"""
+        if not self._prewarm_tts_on:
+            return
+        prewarm = getattr(self._tts, "prewarm", None)
+        if callable(prewarm):
+            prewarm()
 
     async def _run_speculation(self, run: SpecRun) -> None:
         """后台跑 LLM → 分句 → TTS，产物攒进 run，**一个字节都不外发**。"""
@@ -180,6 +193,7 @@ class PipelinedScheduler:
         if run.sentences == 1:
             self._metrics.tts_first_chars = len(sentence)
         first_chunk = True
+        warm = False
         tr = self._metrics.tracer
         # 投机合成与正品合成同名（tts.synth），靠 speculative 属性区分：
         # 命中率低的时候要能一眼看出"CPU 花在注定作废的东西上"有多少。
@@ -197,6 +211,7 @@ class PipelinedScheduler:
         async for block in synth_to_fragments(self._tts, sentence, chunker):
             if first_chunk and run.sentences == 1:
                 first_chunk = False
+                warm = bool(getattr(self._tts, "last_warm", False))
                 self._metrics.mark("tts_first_chunk")
                 run.ready_ms = self._metrics.clock.elapsed_ms()
                 if tr:
@@ -210,7 +225,7 @@ class PipelinedScheduler:
                     tr.finish(head)
             items.append(AudioFragment(seq=chunker.next_seq(), data=block))
         if tr and synth:
-            tr.finish(synth)
+            tr.finish(synth, {"warm": 1 if warm else 0})
         if run.sentences == 1:
             run.head = items
         else:
@@ -219,6 +234,8 @@ class PipelinedScheduler:
     # ---- EOU：校验 → 命中即刻播 / 未命中走串行 ---------------------------
 
     async def on_end_of_utterance(self) -> AsyncIterator[TurnItem]:
+        # 判停即预热：没走过投机路径（partial 太短/被取消）时这是唯一一次预热机会
+        self._prewarm_tts()
         self._metrics.mark("utterance_end")
         yield TurnStart()
 
@@ -375,6 +392,7 @@ class PipelinedScheduler:
         self._metrics.sentences += 1
         yield TtsSentence(seq=seq, text=sentence)
         first_chunk = True
+        warm = False
         tr = self._metrics.tracer
         synth = (
             tr.start("tts.synth", (tr.window or tr.root), {"seq": seq, "chars": len(sentence)})
@@ -385,6 +403,7 @@ class PipelinedScheduler:
         async for block in synth_to_fragments(self._tts, sentence, self._chunker):
             if first_chunk:
                 first_chunk = False
+                warm = bool(getattr(self._tts, "last_warm", False))
                 self._metrics.mark("tts_first_chunk")
                 if tr:
                     # 深拆（同 serial）：建连 vs 服务端合成首片
@@ -398,7 +417,7 @@ class PipelinedScheduler:
             self._metrics.audio_bytes += len(block)
             yield AudioFragment(seq=self._chunker.next_seq(), data=block)
         if tr and synth:
-            tr.finish(synth)
+            tr.finish(synth, {"warm": 1 if warm else 0})
 
     def _mark_first_audio(self) -> None:
         """首片出炉：**这里是口径B 的终点**，根 span 在此闭合（两条出境路径都走它）。"""

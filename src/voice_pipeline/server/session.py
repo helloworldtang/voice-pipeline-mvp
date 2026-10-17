@@ -74,6 +74,9 @@ class Session:
         # 神经档 70% 的轮次 ~100ms 就判停，剩下 30% 走 800ms 兜底（期望 ≈310ms）。
         # 缺权重时 build_eou 退回 conservative 并告警 —— 账单 eou_mode 会如实写回。
         gating: GatingMode = GatingMode.CONSERVATIVE,
+        # TTS 连接预热总闸（P0.5）：默认开。探针用 --no-prewarm 关掉它跑 A/B
+        # 对照臂（「不预热」与「预热」的口径B 差就是要量的东西）。
+        prewarm_tts: bool = True,
         recorder: TurnRecorder | None = None,
         # 预合成 filler（2026-10-10，体感优化）：判停成立后、TTS 首片之前先播一段预合成
         # 短音频，把那一格 ~650ms 的固定成本盖住。None = 关闭（默认）。
@@ -142,7 +145,11 @@ class Session:
             "splitter": SentenceSplitter(),
             "chunker": Chunker(),
             "history": self._history,
+            # 预热总闸一路传到调度器：判停时那次预热也归这个开关管（A/B 要能整个关掉）
+            "prewarm_tts": prewarm_tts,
         }
+        # 留一份引用：预热/池计数要从 Session 够到 provider（deps 是 dict[str, object]）
+        self._tts_provider: TtsProvider | None = deps["tts"]  # type: ignore[assignment]
         if spec_mode == "pipelined":
             self._scheduler = PipelinedScheduler(**deps, grace_ms=grace_ms)  # type: ignore[arg-type]
         else:
@@ -152,6 +159,18 @@ class Session:
         # 仍由显式 session.end 驱动——保持原有链路测试语义不变。
         if real and self._eou is None:
             self._eou = build_eou(gating)
+
+        # TTS 连接预热（P0.5）：建连 ~260ms 不在口径B 里付——会话一建立就在
+        # 后台连上，首轮第一句直接走热连接。非阻塞（不等建连完），provider
+        # 不支持预热（sim/本机 TTS）时静默跳过。
+        if prewarm_tts:
+            self._prewarm_tts()
+
+    def _prewarm_tts(self) -> None:
+        """provider 有 prewarm() 就调用（DashScope 云 TTS 有；其余没有）。"""
+        prewarm = getattr(self._tts_provider, "prewarm", None)
+        if callable(prewarm):
+            prewarm()
 
     async def on_audio(self, chunk: bytes) -> list[AudioFragment]:
         """上行音频帧。echo 模式立即回发；链路模式攒给 ASR，并喂给 EOU 判停器。
