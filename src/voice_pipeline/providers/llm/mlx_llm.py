@@ -125,7 +125,13 @@ class MlxLlm:
             raise RuntimeError(msg) from exc
 
         self.last_phases = {"start": time.perf_counter()}
-        model, tokenizer = await asyncio.to_thread(self._ensure)
+        # 缓存命中走内联（一次 dict 查找），省一次 loop↔executor 往返；未命中
+        # （首轮）才值得为 1~3s 的 load 付线程派发——每轮请求都白付一跳不划算
+        cached = _MODEL_CACHE.get(self.model)
+        if cached is not None:
+            model, tokenizer = cached
+        else:
+            model, tokenizer = await asyncio.to_thread(self._ensure)
         self.last_phases["headers"] = time.perf_counter()
         chat = _apply_template(tokenizer, build_messages(self._system, history, prompt))
 
