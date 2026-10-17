@@ -1,0 +1,45 @@
+{
+  "ts": "2026-10-17T18:0x",
+  "machine": "Apple M5 / 32GB",
+  "model": "mlx-community/Qwen2.5-1.5B-Instruct-4bit",
+  "runtime": "mlx-lm (Metal)",
+  "prompt": "今天上海天气怎么样",
+  "system": "你是语音助手。回答要短，一句话说完，不要 markdown，不要用列表。直接给结论。",
+  "load_s": 705.1,
+  "runs": [
+    {
+      "run": 1,
+      "ttft_ms": 970,
+      "first_sentence_ms": 1045,
+      "chars_per_s": 14.3,
+      "note": "冷启动（含 Metal 首编译）"
+    },
+    {
+      "run": 2,
+      "ttft_ms": 45,
+      "first_sentence_ms": 119,
+      "chars_per_s": 119.5
+    },
+    {
+      "run": 3,
+      "ttft_ms": 45,
+      "first_sentence_ms": 119,
+      "chars_per_s": 119.5
+    },
+    {
+      "run": 4,
+      "ttft_ms": 45,
+      "first_sentence_ms": 118,
+      "chars_per_s": 120.8
+    },
+    {
+      "run": 5,
+      "ttft_ms": 45,
+      "first_sentence_ms": 120,
+      "chars_per_s": 118.9
+    }
+  ],
+  "warm_ttft_ms": 45,
+  "warm_first_sentence_ms": 119,
+  "output_sample": "上海今天的天气晴朗，气温适中。"
+}
