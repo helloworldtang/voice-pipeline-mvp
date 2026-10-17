@@ -42,6 +42,32 @@ class EchoLlm:
         return producer()
 
 
+class GatedLlm(EchoLlm):
+    """第一次调用（投机）卡在门口，直到放行——制造「EOU 已到、投机还在飞」。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.gate = asyncio.Event()
+        self.cancelled_in_flight = False
+
+    def astream(
+        self, prompt: str, history: list[dict[str, str]] | None = None
+    ) -> AsyncIterator[str]:
+        first = not self.prompts  # 只有第一次调用（投机）卡门，fallback 直通
+        self.prompts.append(prompt)
+
+        async def producer() -> AsyncIterator[str]:
+            try:
+                if first:
+                    await self.gate.wait()  # 投机：永远等不到（除非测试放行）
+                yield prompt + "。"
+            except asyncio.CancelledError:
+                self.cancelled_in_flight = True
+                raise
+
+        return producer()
+
+
 def _tts(cpu_ms: float = 150.0) -> SimTts:
     return SimTts(cpu_ms=cpu_ms)
 
@@ -187,6 +213,41 @@ async def test_interrupt_cancels_inflight_speculation():
     await asyncio.sleep(0)
     assert task.cancelled() or task.done()
     assert sched._task is None
+
+
+async def test_miss_cancels_inflight_speculation():
+    """miss 时在飞的投机任务必须被取消，不能继续烧 CPU/占住模型。
+
+    2026-10-17 复盘发现的缺口：cancel 只有「新 partial 顶旧 / replay 尾部超时 /
+    barge-in」三处调用，miss → fallback 路径漏了。后果是作废的生成继续跑到
+    max_tokens，并和 fallback 的重新生成抢同一个模型（子进程模式下 _lock 串行，
+    fallback 首 token 直接排队等它）。用「投机永远不产出」的 LLM 制造在飞场景。
+    """
+    llm = GatedLlm()
+    asr = SimAsr(TRANSCRIPT, partials=["今天天色", "今天天色", "今天天色"])
+    sched = PipelinedScheduler(
+        asr=asr,
+        llm=llm,
+        tts=_tts(cpu_ms=50.0),
+        metrics=TurnMetrics(clock=SessionClock()),
+        grace_ms=0.0,  # 没就绪立刻判 miss，不等
+    )
+    await sched.on_audio(FRAME)  # 起投机（基于错误前缀），卡在 gate 上
+    await asyncio.sleep(0.05)
+    task = sched._task
+    assert task is not None and not task.done()
+
+    items, bill = await _drain(sched)
+    await asyncio.sleep(0)  # 让 CancelledError 送达投机任务
+    said = [s for s in (getattr(i, "text", "") for i in items) if s]
+
+    assert bill["spec_hit"] == 0.0, bill
+    # 在飞的投机被砍掉了（而不是留它烧到 max_tokens）
+    assert task.cancelled() or llm.cancelled_in_flight
+    assert sched.spec_aborts == 1, sched.spec_aborts
+    # fallback 仍然用正确全文作答
+    assert llm.prompts[-1] == TRANSCRIPT
+    assert said[-1] == TRANSCRIPT + "。"
 
 
 async def test_grace_window_trades_wait_for_hit_rate():

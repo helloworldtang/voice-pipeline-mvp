@@ -262,6 +262,7 @@ class PipelinedScheduler:
         run = await self._settle(transcript)
         if run is None:
             self.spec_misses += 1
+            self._abort_inflight_spec()
             if tr and root is not None:
                 tr.record(
                     "spec.miss",
@@ -288,6 +289,21 @@ class PipelinedScheduler:
                 "spec_ready_ms": round(run.ready_ms or -1.0, 3) if run else -1.0,
             }
         )
+
+    def _abort_inflight_spec(self) -> None:
+        """miss 时砍掉还在飞的投机任务。
+
+        它答的已经是错问题（text_differs / stale_partial / grace 没赶上），
+        留着只会：一、白烧 CPU/GPU 直到 max_tokens；二、跟 fallback 的重新生成
+        抢同一个模型——进程内是两条 stream_generate 线程在 Metal 队列上交错，
+        子进程模式（`mlx_proc_llm._lock` 串行）更是让 fallback 的首 token
+        排队等它生成完。这是 2026-10-17 复盘发现的缺口：cancel 只有三处调用
+        （新 partial 顶旧、replay 尾部超时、barge-in），唯独 miss 路径漏了。
+        """
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+            self.spec_aborts += 1
 
     async def _settle(self, transcript: str) -> SpecRun | None:
         """等到能判定「用还是不用」为止：第一句就绪 + 文本没被修正。"""

@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import threading
 import time
 from collections.abc import AsyncIterator
 from typing import Any
@@ -129,10 +130,16 @@ class MlxLlm:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         errors: list[BaseException] = []
+        # 消费端取消（投机作废/barge-in）要能传进线程：cancel to_thread 的任务
+        # 并不会停掉线程本身，没有这个旗标，注定作废的生成会继续占住模型到
+        # max_tokens——与紧接着的重新生成抢 Metal 队列（2026-10-17 miss 路径复盘）。
+        stop = threading.Event()
 
         def _run() -> None:
             try:
                 for resp in stream_generate(model, tokenizer, chat, max_tokens=self.max_tokens):
+                    if stop.is_set():
+                        break
                     loop.call_soon_threadsafe(queue.put_nowait, resp.text)
             except BaseException as exc:  # noqa: BLE001 - 线程里的异常要带回事件循环
                 errors.append(exc)
@@ -140,13 +147,16 @@ class MlxLlm:
                 loop.call_soon_threadsafe(queue.put_nowait, None)
 
         task = asyncio.create_task(asyncio.to_thread(_run))
-        while True:
-            chunk = await queue.get()
-            if chunk is None:
-                break
-            self.last_phases.setdefault("first_content", time.perf_counter())
-            yield chunk
-        await task
+        try:
+            while True:
+                chunk = await queue.get()
+                if chunk is None:
+                    break
+                self.last_phases.setdefault("first_content", time.perf_counter())
+                yield chunk
+            await task
+        finally:
+            stop.set()
         if errors:
             raise errors[0]
 
