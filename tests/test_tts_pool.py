@@ -396,6 +396,30 @@ async def test_prewarm_failure_does_not_raise() -> None:
     assert got  # 冷路径照常工作
 
 
+async def test_prewarm_retries_once_after_transient_failure() -> None:
+    """预热建连单次失败要重试一次。
+
+    一次失败会让整轮走冷路径（实测 +213ms：connect 263ms，口径B 775→1204）；
+    重试的代价只是到位晚 150ms，而那时用户还在说话。
+    """
+    attempts = {"n": 0}
+
+    def flaky_factory(callback: object) -> FakeWarmSynthesizer:
+        synth = FakeWarmSynthesizer(callback, [b"x" * 4800])
+        if callback is None:  # 只坏预热件；冷路径的懒连不受影响
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                synth.fail_connect = True
+        return synth
+
+    tts = DashScopeTts(synth_factory=flaky_factory, audio_format=FakeFormat(), pool_size=1)
+    tts.prewarm()
+    await _settle(tts)
+    assert attempts["n"] == 2, "第一次失败后应重试一次"
+    assert tts.prewarm_failures == 0, "重试成功就不该记失败"
+    assert tts.pool_stats()["idle"] == 1, "重试成功应落进池里"
+
+
 async def test_sdk_without_private_methods_disables_warm_entirely() -> None:
     """SDK 版本变了（取不到改名私有方法）：整条预热路径关闭，退回 2026-10-17 前的冷路径。"""
     made: list[Any] = []

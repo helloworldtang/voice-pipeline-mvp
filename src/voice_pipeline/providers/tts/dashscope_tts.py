@@ -39,6 +39,9 @@ API_KEY_ENV = "DASHSCOPE_API_KEY"
 DEFAULT_MODEL = "cosyvoice-v2"
 DEFAULT_VOICE = "longxiaochun_v2"  # cosyvoice-v2 的音色带 _v2 后缀，不带会 task-failed
 DEFAULT_POOL_SIZE = 2  # 与 VOICE_MAX_SESSIONS 默认值对齐：两个会话各占一条热连接
+# 预热建连失败后的重试间隔：重试只让「到位」晚 150ms（用户还在说话），
+# 而一次失败会让整轮走冷路径（实测 +213ms，口径B 775→1204，见根因文档 §4.6）。
+WARM_RETRY_DELAY_S = 0.15
 
 
 class _Callback(Protocol):
@@ -179,7 +182,7 @@ class DashScopeTts:
         model: str = DEFAULT_MODEL,
         voice: str = DEFAULT_VOICE,
         *,
-        api_key: str | None = None,
+        key: str | None = None,
         timeout_s: float = 30.0,
         synth_factory: Callable[[_Callback | None], _Synthesizer] | None = None,
         pool_size: int = DEFAULT_POOL_SIZE,
@@ -205,7 +208,7 @@ class DashScopeTts:
         self._pool_size = max(1, pool_size)
         self._connect_timeout_s = connect_timeout_s
         self._audio_format = audio_format
-        self._synth_factory = synth_factory or self._make_default_factory(api_key)
+        self._synth_factory = synth_factory or self._make_default_factory(key)
         # phase 时刻表（perf_counter 原值）：`construct`（借/造合成器的起点）/
         # `submit`（call 提交前）/ `open`（WS 连上并认证完，任务已起）/ `first_data`
         # （首个音频分片）/ `complete`。**实时可读**——synth() 一进来就挂上，
@@ -227,10 +230,8 @@ class DashScopeTts:
         self.dropped_conns = 0
         self.prewarm_failures = 0
 
-    def _make_default_factory(
-        self, api_key: str | None
-    ) -> Callable[[_Callback | None], _Synthesizer]:
-        resolved = api_key or os.environ.get(API_KEY_ENV, "")
+    def _make_default_factory(self, key: str | None) -> Callable[[_Callback | None], _Synthesizer]:
+        resolved = key or os.environ.get(API_KEY_ENV, "")
         if not resolved:
             msg = f"缺少 {API_KEY_ENV}：DashScopeTts 需要它，否则 2C 机器没有可用的 TTS"
             raise RuntimeError(msg)
@@ -304,13 +305,26 @@ class DashScopeTts:
         finally:
             self._prewarming = False
 
-    async def _connect_one(self) -> Any | None:
-        try:
-            return await asyncio.to_thread(self._make_warm_synth)
-        except Exception as exc:
-            self.prewarm_failures += 1
-            logger.warning("TTS 预热建连失败（本次退回冷路径）: %s", exc)
-            return None
+    async def _connect_one(self, attempts: int = 2) -> Any | None:
+        """建一条预连。**失败重试一次**。
+
+        为什么重试：预热是后台的，重试只让到位晚 ~150ms（用户还在说话）；而一次失败会让
+        整个会话走冷路径——2026-10-17 晚实测到一轮 `tts.connect` 263ms：口径B 775→1204ms。
+        仍失败才计数并退回冷路径（不抛，不拖垮会话）。
+        """
+        for attempt in range(1, attempts + 1):
+            try:
+                return await asyncio.to_thread(self._make_warm_synth)
+            except Exception as exc:  # noqa: BLE001 - 建连失败不允许冒泡
+                if attempt >= attempts:
+                    self.prewarm_failures += 1
+                    logger.warning(
+                        "TTS 预热建连失败（已重试 %d 次，本次退回冷路径）: %s", attempts - 1, exc
+                    )
+                    return None
+                logger.info("TTS 预热建连失败，%.0fms 后重试: %s", WARM_RETRY_DELAY_S * 1000, exc)
+                await asyncio.sleep(WARM_RETRY_DELAY_S)
+        return None
 
     def _make_warm_synth(self) -> Any | None:
         """线程里跑：构造合成器 + 预连 WS（`__connect` 阻塞最多 connect_timeout_s）。
