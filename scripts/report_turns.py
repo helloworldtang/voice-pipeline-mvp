@@ -149,11 +149,19 @@ def _pct(values: list[float], q: float) -> float:
 
 
 def summarize(values: list[float]) -> str:
+    """n / min / p50 / p90 / p99 / max。
+
+    为什么一定要带 p90/p99：延迟优化最容易骗人的是均值与中位数——长尾（冷启动、网络抖动）
+    恰恰是用户喊"卡"的那些轮。样本 <20 时 p99 只能当"最差值附近"看，不具统计意义，
+    所以同时留 max 作交叉核对。
+    """
     if not values:
         return "—"
     return (
         f"n={len(values)} min={min(values):.0f} "
-        f"p50={statistics.median(values):.0f} max={max(values):.0f}"
+        f"p50={statistics.median(values):.0f} "
+        f"p90={_pct(values, 0.9):.0f} p99={_pct(values, 0.99):.0f} "
+        f"max={max(values):.0f}"
     )
 
 
@@ -219,6 +227,9 @@ def render(
         lines.append("**无完整轮次**——所有轮次都被打断或未出账，无法给出延迟结论。")
     else:
         lines.append(f"`口径B（说完→AI首音）`：{summarize(b_values)}")
+        if 5 <= len(b_values) < 20:
+            lines.append("")
+            lines.append("⚠️ 样本 <20：p99 只能当「最差值附近」看，不具统计意义（max 作交叉核对）。")
         if len(b_values) < 5:
             lines.append("")
             lines.append(f"⚠️ **样本仅 n={len(b_values)}，不足 5 轮**，分位数无统计意义，仅供参考。")
@@ -367,8 +378,8 @@ def render_span_section(records: list[dict[str, Any]]) -> list[str]:
         "> 父子嵌套只算自有时间。`llm.request` / `tts.synth` 接近 0 是正常的——它们被下游背压",
         "> 拉长（见 `docs/链路追踪-根因分析.md` §4.6），不代表 provider 快。",
         "",
-        "| span | 轮数 | 每轮 p50 | max | 占口径B |",
-        "|---|---|---|---|---|",
+        "| span | 轮数 | 每轮 p50 | p90 | max | 占口径B |",
+        "|---|---|---|---|---|---|",
     ]
     ranked = sorted(per_name.items(), key=lambda kv: -statistics.median(kv[1]))
     for name, vals in ranked:
@@ -376,7 +387,10 @@ def render_span_section(records: list[dict[str, Any]]) -> list[str]:
             continue  # 根/窗口的自有时间恒 0，列出来只是噪声
         p50 = statistics.median(vals)
         share = f"{p50 / base * 100:.0f}%" if base > 0 else "—"
-        lines.append(f"| {name} | {len(vals)} | {p50:.0f}ms | {max(vals):.0f}ms | {share} |")
+        lines.append(
+            f"| {name} | {len(vals)} | {p50:.0f}ms | {_pct(vals, 0.9):.0f}ms | "
+            f"{max(vals):.0f}ms | {share} |"
+        )
     lines.append("")
     return lines
 
