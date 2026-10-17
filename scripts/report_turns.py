@@ -322,9 +322,14 @@ def render(
 def render_span_section(records: list[dict[str, Any]]) -> list[str]:
     """span 分格表：口径B 窗口内每个 span 的**自有时间**（flame graph 口径）。
 
-    为什么不能直接拿 span 时长加总：真实链路是嵌套的（`llm.request` 里包着
-    `tts.synth`）， sibling 时长相加会比口径B 还大。自有时间 = 区间扣掉直接后代
-    的覆盖，每毫秒只归一个 span——`Σ自有 ≤ 口径B`，差额就是没埋到的残差。
+    两条口径必须写在代码里，否则读表会读反：
+
+    1. **每轮求和再取 p50**。同一 span 一轮会出现多次（`uplink.frame` 一轮 80 帧、
+       `eou.update` 同理），逐帧取 p50 会得到 0ms——把「上行 CPU 那一格」读成免费，
+       而它每窗口实际 10~15ms（2026-10-17 验收前自查发现）。
+    2. **自有时间**（区间扣掉直接后代的覆盖），每毫秒只归一个 span：`Σ自有 ≤ 口径B`，
+       差额就是没埋到的残差。直接拿 span 时长加总不行——真实链路是嵌套的
+       （`llm.request` 里包着 `tts.synth`），相加会比口径B 还大。
     """
     per_name: dict[str, list[float]] = {}
     n_with_spans = 0
@@ -336,8 +341,12 @@ def render_span_section(records: list[dict[str, Any]]) -> list[str]:
         n_with_spans += 1
         own = exclusive_times(spans, window.start_ms, window.end_ms)
         by_id = {s.span_id: s for s in spans}
+        round_sum: dict[str, float] = {}
         for sid, ms in own.items():
-            per_name.setdefault(by_id[sid].name, []).append(ms)
+            name = by_id[sid].name
+            round_sum[name] = round_sum.get(name, 0.0) + ms
+        for name, ms in round_sum.items():
+            per_name.setdefault(name, []).append(ms)
 
     lines = ["## 五、span 分格（口径B 窗口，自有时间）", ""]
     if not n_with_spans:
@@ -353,10 +362,12 @@ def render_span_section(records: list[dict[str, Any]]) -> list[str]:
     )
     lines += [
         f"> 有 span 的轮次：{n_with_spans}/{len(records)}。"
-        "每轮完整 span 树在账单 JSONL 的 `spans` 字段里（按 `trace_id` 取），"
-        "本表是跨轮汇总。",
+        "每轮完整 span 树在账单 JSONL 的 `spans` 字段里（按 `trace_id` 取）。",
+        "> 口径：**每轮窗口内先求和、再取 p50**（同一 span 一轮可能多次，如 `uplink.frame`）；",
+        "> 父子嵌套只算自有时间。`llm.request` / `tts.synth` 接近 0 是正常的——它们被下游背压",
+        "> 拉长（见 `docs/链路追踪-根因分析.md` §4.6），不代表 provider 快。",
         "",
-        "| span | n | p50 | max | 占口径B |",
+        "| span | 轮数 | 每轮 p50 | max | 占口径B |",
         "|---|---|---|---|---|",
     ]
     ranked = sorted(per_name.items(), key=lambda kv: -statistics.median(kv[1]))
