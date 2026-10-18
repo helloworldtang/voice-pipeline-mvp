@@ -336,7 +336,8 @@ function handleEvent(ev) {
 
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  state.ws = new WebSocket(`${proto}://${location.host}/ws`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  state.ws = ws;
   state.ws.binaryType = "arraybuffer";
   state.beginSent = false;
 
@@ -352,6 +353,8 @@ function connect() {
     }
   };
   state.ws.onclose = () => {
+    // 换 mode/gating 主动重连时，旧 socket 的 close 不能砸掉新连接的状态
+    if (state.ws !== ws) return;
     setState("", "连接断开");
     $("mic").disabled = true;
     stopPlayback();
@@ -377,6 +380,22 @@ $("mic").addEventListener("click", async () => {
     addLine("err", `开麦失败: ${err.message}`);
   }
 });
+
+// mode/gating 是 session.begin 的一次性参数：连接建立后再改下拉，对已建会话无效
+// （2026-10-18 验收实锤：用户切到 real-pipelined，账单里三段会话仍全是 real-serial，
+// 切换被静默吞掉）。未开麦时改选 → 重连换会话；开麦中改选 → 明说本轮仍用旧值。
+for (const id of ["mode", "gating"]) {
+  $(id).addEventListener("change", () => {
+    if (state.micOn) {
+      addLine("partial", `（${id === "mode" ? "模式" : "判停档"}已锁定本轮，关麦后再切换）`).className = "user";
+      return;
+    }
+    state.reconnectAttempt = 0;
+    state.ws?.close(1000, "mode-change");
+    connect();
+    $("status").textContent = `切换中… 目标 ${$("mode").value} / ${$("gating").value}`;
+  });
+}
 
 renderScript();
 connect();
