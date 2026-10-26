@@ -347,21 +347,18 @@ def self_time_map(spans: Sequence[Span], lo: float, hi: float) -> dict[str, floa
     return out
 
 
-def window_breakdown(tracer: Tracer, *, min_ms: float = 0.5) -> dict[str, Any] | None:
-    """口径B 窗口内的自有时间汇总——服务端算好，页面/账单直接用。
-
-    为什么不在前端算：`exclusive_times` 的口径（每毫秒只归**最内层** span、并发重叠
-    不重复计）是这一层的关键不变量；前端再实现一遍必然漂。这里只把结果交出去：
-    按名字汇总、降序、丢掉 < min_ms 的噪声格子，并给出**未归因残差**（非 0 = 还有
-    东西没埋到）。
-
-    没有窗口（echo / 异常轮）返回 None——页面据此不画表，而不是画一张 0ms 的假表。
-    """
-    window = tracer.window
-    if window is None or window.dur_ms < 0:
+def _breakdown(
+    tracer: Tracer,
+    span: Span | None,
+    *,
+    skip: frozenset[str],
+    min_ms: float,
+) -> dict[str, Any] | None:
+    """一个 span 窗口内的自有时间汇总（服务端算好，页面/账单直接用）。"""
+    if span is None or span.dur_ms < 0:
         return None
     spans = tracer.spans
-    own = exclusive_times(spans, window.start_ms, window.end_ms)
+    own = exclusive_times(spans, span.start_ms, span.end_ms)
     by_id = {s.span_id: s for s in spans}
     per_name: dict[str, float] = {}
     for sid, ms in own.items():
@@ -370,16 +367,45 @@ def window_breakdown(tracer: Tracer, *, min_ms: float = 0.5) -> dict[str, Any] |
     items = [
         {"name": name, "ms": round(ms, 1)}
         for name, ms in sorted(per_name.items(), key=lambda kv: -kv[1])
-        if ms >= min_ms and name not in {"turn", "turn.caliber_b"}
+        if ms >= min_ms and name not in skip
     ]
     # 未归因 = 窗口 span **自己** 占到的毫秒（没被任何子 span 盖住的那部分）。
     # 不能用 total − Σ各格：exclusive_times 会把未覆盖的时段归给「覆盖它且最短」的 span，
     # 也就是窗口自己——减出来永远是 0（2026-10-17 首版就错在这里，单测才发现）。
     return {
-        "total_ms": round(window.dur_ms, 1),
-        "unattributed_ms": round(own.get(window.span_id, 0.0), 1),
+        "total_ms": round(span.dur_ms, 1),
+        "unattributed_ms": round(own.get(span.span_id, 0.0), 1),
         "items": items,
     }
+
+
+def window_breakdown(tracer: Tracer, *, min_ms: float = 0.5) -> dict[str, Any] | None:
+    """口径B 窗口内的自有时间汇总——**残差非 0 = 还有东西没埋到**。
+
+    为什么不在前端算：`exclusive_times` 的口径（每毫秒只归**最内层** span、并发重叠
+    不重复计）是这一层的关键不变量；前端再实现一遍必然漂。这里只把结果交出去：
+    按名字汇总、降序、丢掉 < min_ms 的噪声格子，并给出**未归因残差**。
+
+    没有窗口（echo / 异常轮）返回 None——页面据此不画表，而不是画一张 0ms 的假表。
+    """
+    return _breakdown(
+        tracer, tracer.window, skip=frozenset({"turn", "turn.caliber_b"}), min_ms=min_ms
+    )
+
+
+def root_breakdown(tracer: Tracer, *, min_ms: float = 0.5) -> dict[str, Any] | None:
+    """整轮 root span（本轮第一帧 → turn.end）的自有时间汇总。
+
+    ⚠️ **这里的"未归因"不等于漏埋**——这一点与 `window_breakdown` 相反，别混着读：
+    root 覆盖的时段里天然包含「等用户说话」「等上行帧到达」的空闲，那几秒没有任何
+    span 盖住，是**应该**空着的。所以它是**看判停前那一段构成**用的（上行帧 CPU、
+    EOU 决策、判停前的等待各占多少），不是「有没有漏埋」的判据——那条纪律只成立于
+    口径B 窗口内（实测残差 0ms）。
+
+    只随 JSONL 落盘、不上 wire：整轮的格子比窗口多，打进 `span.*` 会让每轮的
+    metrics 键翻倍，而页面只需要窗口那一版。
+    """
+    return _breakdown(tracer, tracer.root, skip=frozenset({"turn"}), min_ms=min_ms)
 
 
 @dataclass(frozen=True, slots=True)

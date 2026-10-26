@@ -21,6 +21,7 @@ from voice_pipeline.metrics.trace import (
     parse_spans,
     phase_span,
     phases_of,
+    root_breakdown,
     stats,
     union_ms,
     window_breakdown,
@@ -386,3 +387,88 @@ async def test_window_breakdown_lists_self_times_and_residual() -> None:
 async def test_window_breakdown_is_none_without_window() -> None:
     """没有窗口（echo/异常轮）返回 None —— 页面据此不画表，而不是画一张 0ms 的假表。"""
     assert window_breakdown(Tracer("t-no-window")) is None
+
+
+class _StubEou:
+    """最小判停器：`should_end()` 恒定，用来驱动 pending_end 的埋点分支。"""
+
+    def __init__(self, ends: bool) -> None:
+        self.ends = ends
+        self.text = ""
+
+    def push_audio(self, chunk: bytes) -> None:
+        return None
+
+    def update_text(self, partial: str) -> None:
+        self.text = partial
+
+    def should_end(self) -> bool:
+        return self.ends
+
+    def unlatch(self) -> None:
+        return None
+
+    def reset(self) -> None:
+        return None
+
+
+async def test_pending_end_records_eou_decide_span_on_root() -> None:
+    """判停决策这一格过去完全没埋：它跑在接收循环里、uplink.frame 闭合**之后**。
+
+    钉两件事：① span 真的记了（带上 ended 属性）；② 挂在 root 下而不是窗口下——
+    判停发生在口径B 窗口开始之前，挂进窗口会把窗口左边界往前拖，口径B 就不再是
+    「说完 → 首音」。
+    """
+    sess = Session(
+        mode="serial",
+        asr=SimAsr("今天天气怎么样"),
+        llm=SimLlm(reply="今天晴。"),
+        tts=SimTts(chunk_per_sentence=2),
+        eou=_StubEou(True),  # type: ignore[arg-type]
+    )
+    await sess.on_audio(b"\x00" * 3200)  # 开根 span，并让 ASR 出字（过空转写门）
+    tracer = sess.metrics.tracer
+    assert tracer is not None and tracer.root is not None
+
+    assert sess.pending_end() is True
+    decide = [s for s in tracer.spans if s.name == "eou.decide"]
+    assert len(decide) == 1
+    assert decide[0].parent_id == tracer.root.span_id, "挂错父节点会让口径B 左边界前漂"
+    assert decide[0].attrs["ended"] == 1
+    assert decide[0].dur_ms >= 0
+
+
+async def test_root_breakdown_covers_pre_eou_and_keeps_idle_as_residual() -> None:
+    """整轮 breakdown：判停前那一段（上行帧 / EOU 决策）要能看见。
+
+    ⚠️ 与窗口那条纪律**相反**：这里的 `unattributed_ms` **不该**被断言成 0——root
+    覆盖的时段里天然有「等上行帧到达」的空闲，那几毫秒没有任何 span 盖住是对的。
+    所以它只用于看构成，不用于判「有没有漏埋」。
+    """
+    sess = Session(
+        mode="serial",
+        asr=SimAsr("上海今天多少度"),
+        llm=SimLlm(reply="22 度。"),
+        tts=SimTts(chunk_per_sentence=2),
+        eou=_StubEou(False),  # type: ignore[arg-type]
+    )
+    for _ in range(5):
+        await sess.on_audio(b"\x00" * 3200)
+        sess.pending_end()  # 每帧问一次判停，才会在 root 下留下 eou.decide
+    task = asyncio.create_task(sess.run_turn())
+    await asyncio.wait_for(task, timeout=5)
+
+    tracer = sess.metrics.tracer
+    assert tracer is not None
+    bd = root_breakdown(tracer)
+    assert bd is not None
+    names = {i["name"] for i in bd["items"]}
+    assert "uplink.frame" in names, "判停前的上行帧必须出现在整轮账里"
+    assert "turn" not in names, "根自己不进自己的格子列表"
+    assert bd["total_ms"] > 0
+    assert bd["unattributed_ms"] >= 0  # 等上行帧的空闲：允许大，不许被当成漏埋
+    # 判停决策每帧只有几十微秒，默认 min_ms=0.5 会当噪声滤掉（这是有意的）；
+    # 要看它就显式把阈值给 0——neural 档真跑推理的几次（~6ms）在默认阈值下也看得见。
+    fine = root_breakdown(tracer, min_ms=0.0)
+    assert fine is not None
+    assert "eou.decide" in {i["name"] for i in fine["items"]}

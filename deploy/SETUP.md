@@ -54,6 +54,9 @@ EOF
 sudo chmod 600 /etc/voice-pilot.env
 ```
 
+（`VOICE_EVENTS_JSONL` 不走这里——它在 `voice-pipeline.service` 里已经写死，
+改路径要改 service 并 `daemon-reload`。）
+
 ## 5. systemd + caddy
 
 ```bash
@@ -65,7 +68,38 @@ sudo tee /etc/caddy/Caddyfile >/dev/null < ~/voice-pipeline-mvp/deploy/Caddyfile
 sudo systemctl reload caddy
 ```
 
-## 6. 验收
+## 6. 账单日志（可观测性，判据 6）
+
+`VOICE_EVENTS_JSONL` 不在 service 里设的话**一行都不落**——判据 6 就只是纸面达标。
+service 里已写死 `/home/ubuntu/voice-pipeline-mvp/logs/turns.jsonl`，落盘侧要配轮转：
+
+```bash
+sudo tee /etc/logrotate.d/voice-pilot >/dev/null <<'EOF'
+/home/ubuntu/voice-pipeline-mvp/logs/turns.jsonl {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    copytruncate
+    su ubuntu ubuntu
+}
+EOF
+sudo logrotate -f /etc/logrotate.d/voice-pilot   # 立刻验证一次，别等明天
+```
+
+为什么必须轮转：一轮一行，行内含完整 span 树（每个上行帧 3~4 个 span × 250~300 帧），
+单行可达百 KB；真人连续对讲一天能写几百 MB，`copytruncate` 是因为进程只做追加写、
+不重开文件（切走 inode 会继续写旧文件）。
+
+验它真的在落：
+
+```bash
+# 跑一轮之后
+jq -c '{turn, caliber_b_ms, eou_latency_ms, spans: (.spans|length)}' \
+  ~/voice-pipeline-mvp/logs/turns.jsonl | tail -3
+```
+
+## 7. 验收
 
 ```bash
 curl -s http://127.0.0.1:8000/healthz          # {"status":"ok"}

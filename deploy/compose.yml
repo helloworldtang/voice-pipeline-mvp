@@ -12,6 +12,8 @@ services:
     env_file: voice-pilot.env
     volumes:
       - ../models:/models:ro
+      # 每轮账单落盘（VOICE_EVENTS_JSONL）：挂在宿主上才不会随容器消失
+      - ../logs:/var/log/voice-pipeline
     ports:
       # 只绑本机：公网出口交给反代（caddy/nginx），与 systemd 部署同边界
       - "127.0.0.1:8000:8000"

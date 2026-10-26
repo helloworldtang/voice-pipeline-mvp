@@ -33,7 +33,7 @@ from voice_pipeline.core.sentence_splitter import SentenceSplitter
 from voice_pipeline.core.turn_fsm import TurnFsm, TurnState
 from voice_pipeline.metrics.events import SessionClock, TurnMetrics
 from voice_pipeline.metrics.jsonl import TurnRecorder
-from voice_pipeline.metrics.trace import Tracer, window_breakdown
+from voice_pipeline.metrics.trace import Tracer, root_breakdown, window_breakdown
 from voice_pipeline.providers.asr.sim_asr import SimAsr
 from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.providers.factory import build_eou, build_providers
@@ -58,6 +58,11 @@ def _first_chunk_min_ms() -> int:
     except ValueError:
         return 0
 
+
+# 跨轮清账时要抢救的打点：口径A 的两个锚点打在**判停之前**（用户开口 / ASR 首次出字），
+# 而 `reset_turn()` 发生在判停之后——不保留就会被自己清掉，caliber_a_ms 恒缺
+# （2026-10-27 实测：与 eou_latency_ms 曾是同一个失效模式）。
+CARRY_OVER_MARKS: tuple[str, ...] = ("vad_onset", "asr_first_char")
 
 MAX_HISTORY_MESSAGES = 20
 
@@ -261,6 +266,14 @@ class Session:
         speech = self._barge.is_speech(chunk)
         if speech:
             self._await_fresh_speech = False
+            # 口径A 的起点（2026-10-27 补）：本轮**判停之前**第一次检出人声的那一帧。
+            # 为什么限定在 utterance_end 之前：AI 播放/思考期间上行帧里也有能量
+            # （回声残余、用户插话），那不是「这一句用户开口」。
+            # ⚠️ 已知系统性偏差：`speech` 来自 barge-in L1 的 3 帧去抖，100ms 帧节奏下
+            # 它比真实开口晚 ~300ms；且是能量判定，不是 VAD onset。所以 caliber_a_ms
+            # 是**偏小**的估计，不可与口径B 横比，也不该拿去对外宣称。
+            if self.metrics.elapsed("utterance_end") is None:
+                self.metrics.mark("vad_onset")
         # ASR 前置能量门（P1）：确认静音的帧不推 ASR，省口径B 窗口里与下行抢循环的
         # 那一格。门为 None（sim/echo 模式或探针对照臂）时一切照旧。
         # ⚠️ EOU 仍收全部帧——静音正是它判「说完没有」的原料，门只拦 ASR 一条路。
@@ -276,11 +289,21 @@ class Session:
             if tr is not None:
                 upd = tr.start("eou.update", frame)
                 self._eou.push_audio(chunk)
-                self._eou.update_text(self._scheduler.text())
+                # 复用这一次 text() 给 asr_first_char 打点：真 ASR 的 text() 要抢
+                # stream 锁、与 decode 线程竞争，不为了打点再调一次（2026-10-27）。
+                partial = self._scheduler.text()
+                self._eou.update_text(partial)
                 tr.finish(upd)
+                if partial:
+                    self.metrics.mark("asr_first_char")
             else:  # pragma: no cover
                 self._eou.push_audio(chunk)
-                self._eou.update_text(self._scheduler.text())
+                partial = self._scheduler.text()
+                self._eou.update_text(partial)
+                if partial:
+                    self.metrics.mark("asr_first_char")
+        else:
+            self._note_first_char()
         # L1：AI 在说/想时用户又开口 → 打断（用上面算好的 speech，不再重复判定）
         if (
             not self.interrupted
@@ -293,7 +316,39 @@ class Session:
             tr.finish(frame, {"gated": 1} if gated else None)
         return []
 
+    def _note_first_char(self) -> None:
+        """sim 链路（没挂 EOU）的首次出字打点。
+
+        real 链路在 on_audio 里复用 `eou.update_text` 那一次 text() 打点，不走这里。
+        只在还没打过时读一次，避免每帧多一次 text()（`SimAsr.text()` 便宜，但真
+        ASR 的 text() 要抢 stream 锁，这条路径不该被真链路碰到）。
+        """
+        if self.metrics.elapsed("asr_first_char") is not None:
+            return
+        if self._scheduler is not None and self._scheduler.text():
+            self.metrics.mark("asr_first_char")
+
     def pending_end(self) -> bool:
+        """外层包装：给判停决策那一格留痕，判定本体在 `_decide_eou`。
+
+        为什么单独埋这一格：它跑在 `app.py` 的接收循环里、`on_audio` 返回**之后**
+        （`uplink.frame` 已经闭合），过去它的 CPU 不落在任何 span 里——neural 档
+        每帧可能在这里跑一次 mel+ONNX（~6ms），账单上完全看不见。
+        挂在 root 下而不是 window 下：判停发生在口径B 窗口开始**之前**，挂进窗口
+        会把窗口左边界往前拖，口径B 就不再是「说完 → 首音」。
+        """
+        tr = self.metrics.tracer
+        dec = (
+            tr.start("eou.decide", tr.root)
+            if tr is not None and tr.root is not None and self._eou is not None
+            else None
+        )
+        ended = self._decide_eou()
+        if tr is not None and dec is not None:
+            tr.finish(dec, {"ended": 1 if ended else 0})
+        return ended
+
+    def _decide_eou(self) -> bool:
         """EOU 判停器是否已判定用户说完。real 模式下由传输层轮询以自动收尾。
 
         **空转写门（2026-10-04 真人验收抓到的回声自激回环）**：外放回声/噪声
@@ -447,7 +502,7 @@ class Session:
         # 每轮一本新账：TurnMetrics 的 mark 只记首次到达，跨轮复用不清账的话，
         # 第 2 轮起的账单会复读第 1 轮。必须在 _collect_eou_metrics 之前清——
         # 它要把上一轮的判停指标写进本轮账里。
-        self.metrics.reset_turn()
+        self.metrics.reset_turn(CARRY_OVER_MARKS)
         # 必须在 reset 之前采：reset 会清掉静音计时与抢话/漏判标志，
         # 采晚了 eou_latency_ms 就恒为 0（这个指标曾因此整整失效一整个里程碑）。
         self._collect_eou_metrics()
@@ -568,6 +623,13 @@ class Session:
                 # span 树随账单一起落盘：事后能按 trace_id 重建一棵完整的调用树，
                 # 而不是只有几个打点差。只关心数字的工具可以直接无视这一字段。
                 "spans": self.metrics.tracer.to_list() if self.metrics.tracer is not None else [],
+                # 整轮（含判停前那一段）的构成：上行帧 CPU / EOU 决策 / 等待空闲。
+                # ⚠️ 它的 `unattributed_ms` **不等于漏埋**（里面天然有等上行帧的
+                # 空闲），与窗口残差那条纪律不是一回事，见 `trace.root_breakdown`。
+                # 只落盘不上 wire：格子比窗口多，打进 span.* 会让每轮键数翻倍。
+                "root_breakdown": (
+                    root_breakdown(self.metrics.tracer) if self.metrics.tracer is not None else None
+                ),
             },
         )
 

@@ -15,6 +15,9 @@ EnvironmentFile=/etc/voice-pilot.env
 Environment=VOICE_MODEL_ROOT=/home/ubuntu/voice-pipeline-mvp/models
 Environment=VOICE_ESPEAK_DATA=/usr/lib/x86_64-linux-gnu/espeak-ng-data
 Environment=VOICE_PIPELINE_TTS_ENGINE=dashscope
+# 每轮账单落盘（不设=不落盘）。目录不存在时进程会自建，但**不会**自动轮转：
+# 一轮一行、单行可达百 KB（含 span 树），2G 机器上要配 logrotate（deploy/SETUP.md 第 6 节）。
+Environment=VOICE_EVENTS_JSONL=/home/ubuntu/voice-pipeline-mvp/logs/turns.jsonl
 # 绑 127.0.0.1：唯一公网出口是 caddy 反代（deploy/Caddyfile）
 ExecStart=/home/ubuntu/.local/bin/uv run uvicorn voice_pipeline.server.app:app --host 127.0.0.1 --port 8000
 Restart=always

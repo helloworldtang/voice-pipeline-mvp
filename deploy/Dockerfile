@@ -45,7 +45,9 @@ RUN pip install --index-url "$PIP_INDEX_URL" uv \
 
 ENV PATH="/app/.venv/bin:$PATH" \
     VOICE_MODEL_ROOT=/models \
-    VOICE_PIPELINE_TTS_ENGINE=dashscope
+    VOICE_PIPELINE_TTS_ENGINE=dashscope \
+    VOICE_EVENTS_JSONL=/var/log/voice-pipeline/turns.jsonl
+# 账单写在容器层会被 `docker rm` 带走：compose.yml 把 ../logs 挂进来做持久化。
 
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \

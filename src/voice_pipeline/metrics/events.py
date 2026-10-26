@@ -5,17 +5,28 @@
 - 口径B（质疑方口径）= first_audio_out − utterance_end  —— 用户说完 → AI 首音
 
 M1 只有 sim 链路，vad_onset 缺位时口径A 如实留空，不做填补。
+2026-10-27 补：vad_onset / asr_first_char 已在 `Session.on_audio` 埋上，口径A 现在
+可测；但它带已知系统性偏差（见下方 WATERFALL_POINTS 的注释），只作参考，不与口径B 横比。
 """
 
 from __future__ import annotations
 
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # 避免与 metrics/trace.py 形成 import 环（那边要用 SessionClock）
     from voice_pipeline.metrics.trace import Tracer
 
+# 口径A 的两个锚点（2026-10-27 补，都埋在 `Session.on_audio`）：
+#   vad_onset      = 本轮**判停之前**第一次被 barge-in L1 判定「有人声」的那一帧。
+#                    ⚠️ 已知系统性偏差：L1 是「连续 3 帧超阈」，100ms 帧节奏下它比
+#                    真实开口晚 ~300ms；且是能量判定不是 VAD onset。所以 caliber_a_ms
+#                    是**偏小**的估计——只作参考，不拿去对外宣称。
+#   asr_first_char = ASR 第一次吐出非空 partial（real 链路复用 eou.update_text 那次读）。
+# `fragment_commit` **仍未埋**：仓内没有与它对应的时刻，留在表里是预留位，账单里
+# 不会出现。宁可空着，也不拿别的时刻冒领它（与「缺失写 -1 不写 0」同一条纪律）。
 WATERFALL_POINTS: tuple[str, ...] = (
     "vad_onset",
     "asr_first_char",
@@ -83,15 +94,23 @@ class TurnMetrics:
         if name not in self.marks:
             self.marks[name] = self.clock.elapsed_ms()
 
-    def reset_turn(self) -> None:
+    def reset_turn(self, keep: Sequence[str] = ()) -> None:
         """开新轮：清空上一轮的打点与计数。
+
+        `keep`：跨 reset 保留的打点名。**为什么需要它**：口径A 的两个锚点
+        （`vad_onset` / `asr_first_char`）打在「本轮第一帧上行、用户开口」那一侧，
+        而每轮的清账发生在**判停之后**——不保留就会把用户开口那一刻连同上一轮的
+        账一起清掉（2026-10-27 实测：`caliber_a_ms` 因此恒缺，与 `eou_latency_ms`
+        曾是同一个失效模式）。这两个时刻属于**本轮**，不是上一轮的残留。
 
         mark() 只写第一次到达——这是单轮 waterfall 的语义；Session 跨轮复用同一
         实例，不清的话第 2 轮起的账单会永远复读第 1 轮（真链路两轮实测抓到：
         caliber_b_ms 一字不差，probe_multi_turn 可复现）。调用方须在采完上一轮
         EOU 指标之后、本轮任何 mark 之前调用。
         """
+        carried = {name: self.marks[name] for name in keep if name in self.marks}
         self.marks.clear()
+        self.marks.update(carried)
         self.sentences = 0
         self.audio_bytes = 0
         self.filler_used = False
