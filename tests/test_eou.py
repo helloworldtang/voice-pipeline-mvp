@@ -117,12 +117,30 @@ def test_premature_eou_flagged_when_speech_resumes():
 
 
 def test_missed_eou_watchdog():
-    """漏判看门狗：长时间无有效人声也未判停 → missed_eou=True。"""
+    """漏判看门狗：用户**开过口**却始终没判停 → missed_eou=True。
+
+    `min_silence_ms` 故意设成 5s：让静音永远够不到档位阈值，只能由看门狗收尾。
+    """
+    det = FusedEou(gating=GatingMode.CONSERVATIVE, min_silence_ms=5000.0, max_wait_ms=400.0)
+    for _ in range(2):
+        det.push_audio(_speech(100))  # 开过口——漏判以此为门槛
+    for _ in range(6):  # 越过 max_wait 仍未判停
+        det.push_audio(_silence(100))
+    assert not det.should_end(), "没到档位阈值就不该判停"
+    assert det.missed_eou, "说过话却判不出来，靠看门狗收尾 = 漏判"
+
+
+def test_waiting_for_speech_is_not_missed_eou():
+    """反向自测（真人验收 7/10 假漏判的根因）：**等人开口不是漏判**。
+
+    旧语义「一直没等到人声也算漏判」把用户照剧本读数秒的等待全记成漏判，
+    而每一轮的转写其实都拿到了——一个恒定虚高的指标比缺指标更危险。
+    """
     det = FusedEou(gating=GatingMode.CONSERVATIVE, min_silence_ms=500.0, max_wait_ms=400.0)
-    for _ in range(6):  # 只喂静音，越过 max_wait
+    for _ in range(6):  # 只有静音：用户还没开口
         det.push_audio(_silence(100))
     assert not det.should_end(), "无人声不应判停"
-    assert det.missed_eou, "越过看门狗应记漏判"
+    assert not det.missed_eou, "等用户开口的时间不该记成判停器的漏判"
 
 
 def test_session_auto_end_with_eou():

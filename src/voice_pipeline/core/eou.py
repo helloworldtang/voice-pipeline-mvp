@@ -357,6 +357,9 @@ class FusedEou:
         self._premature_watch_ms = 0.0
         self.premature_eou = False
         self.missed_eou = False
+        # 本轮窗口内是否出现过人声。**漏判以此为门槛**：等人开口的时间不该算进
+        # 判停器的账（真人验收 7/10 假漏判的根因，见 should_end 的注释）。
+        self._ever_speech = False
 
     def push_audio(self, chunk: bytes) -> None:
         frame_ms = _frame_ms(chunk, self.sample_rate)
@@ -393,15 +396,23 @@ class FusedEou:
     def should_end(self) -> bool:
         if self._decided:
             return True
-        if self._elapsed > self.max_wait_ms and not (
-            isinstance(self._silence, VadSilenceEou) and self._silence.has_speech
-        ):
-            # 看门狗：长时间无人声也没判定 → 漏判（由上层决定是否强制收尾）
+        # 人声标记必须在看门狗判定**之前**打：否则「本帧才第一次出现人声」时
+        # 看门狗读到的是上一帧的旧值，漏判又记不上（写测试才暴露的顺序坑）。
+        has_speech = isinstance(self._silence, VadSilenceEou) and self._silence.has_speech
+        if has_speech:
+            self._ever_speech = True
+        # 看门狗：用户**开过口**却始终没判停 → 漏判（由上层决定是否强制收尾）。
+        # ⚠️ 旧语义是「一直没等到人声也算漏判」，真人验收里被狠狠误导了一次：
+        # 用户照剧本读数秒才开口，等待时间越过 max_wait 就被记成漏判（7/10），
+        # 而每一轮的转写其实都拿到了——**等说话不是漏判**。故加 _ever_speech 门槛。
+        if self._elapsed > self.max_wait_ms and self._ever_speech:
             self.missed_eou = True
-        if not (isinstance(self._silence, VadSilenceEou) and self._silence.has_speech):
+        if not has_speech:
             return False
         sil = self._silence.silence_ms()
         if sil >= self.max_silence_ms:
+            # 静音拖到兜底上限才判停 = 判晚了（判停器没在档位阈值内判出来）
+            self.missed_eou = True
             self._latch()
             return True
         if self.gating is GatingMode.CONSERVATIVE:
@@ -477,6 +488,7 @@ class FusedEou:
         self._last_terminal_ms = -math.inf
         self._decided = False
         self._decided_at_ms = 0.0
+        self._ever_speech = False
         # ⚠️ premature_eou **不在 reset 清**：它是「刚过去那次判停」的证据，而账单
         # 要到 turn.end（秒级之后）才定型——这里清掉等于取证窗口在定型前被抹
         # （判停后、reset 前开口的那种抢话就丢在缝里）。唯一的清点是 take_premature。
