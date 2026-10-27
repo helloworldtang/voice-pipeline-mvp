@@ -20,3 +20,4 @@ data/
 # 所以整体入仓（每份 4~8K）。仅冒烟用的临时产物忽略。
 bench/tmp-*.json
 deploy/ort/
+.workbuddy/
