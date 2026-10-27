@@ -460,7 +460,11 @@ async def test_root_breakdown_covers_pre_eou_and_keeps_idle_as_residual() -> Non
 
     tracer = sess.metrics.tracer
     assert tracer is not None
-    bd = root_breakdown(tracer)
+    # ⚠️ 结构断言必须用 min_ms=0：默认 0.5 是噪声阈值，机器空闲时
+    # uplink.frame 的 CPU 只有几十微秒，会被当噪声滤掉——全量跑（有负载）
+    # 才过的断言是 flaky 的（2026-10-27 单跑实锤）。默认阈值的语义留给
+    # 下面的 eou.decide 对比断言去钉。
+    bd = root_breakdown(tracer, min_ms=0.0)
     assert bd is not None
     names = {i["name"] for i in bd["items"]}
     assert "uplink.frame" in names, "判停前的上行帧必须出现在整轮账里"

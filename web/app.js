@@ -17,6 +17,8 @@ const state = {
   micCtx: null,
   playCtx: null,
   playSources: [],
+  firstRecvCtx: null, // 本轮首个下行帧到达时刻（AudioContext 时钟；null=已测完/新轮）
+  lastRecvToPlayMs: null, // 本轮已回传的「收到→可听」实测（打断轮复用）
   nextStart: 0,
   recentRms: [],
   interruptArmed: true,
@@ -187,6 +189,9 @@ function playPcm16(arrayBuffer) {
   const pcm = new Int16Array(arrayBuffer);
   if (pcm.length === 0) return;
   const ctx = state.playCtx;
+  // 本轮首个下行帧到达的时刻（AudioContext 时钟，与服务端只对时长不对时刻）：
+  // 排到出声的那一刻就能确定地算出 recv→play，不用等真的响
+  if (state.firstRecvCtx === null) state.firstRecvCtx = ctx.currentTime;
   const buf = ctx.createBuffer(1, pcm.length, OUT_RATE);
   const data = buf.getChannelData(0);
   for (let i = 0; i < pcm.length; i++) data[i] = pcm[i] / 32768;
@@ -195,10 +200,28 @@ function playPcm16(arrayBuffer) {
   src.connect(ctx.destination);
   // 落后（积压清空后重启）就贴着 now 重新起排，否则永远追不上
   if (state.nextStart < ctx.currentTime) state.nextStart = ctx.currentTime + 0.02;
-  src.start(state.nextStart);
+  const startAt = state.nextStart;
+  src.start(startAt);
   state.nextStart += buf.duration;
   state.playSources.push(src);
   src.onended = () => { state.playSources = state.playSources.filter((s) => s !== src); };
+  // 首片的「收到→可听」实测（含 outputLatency）：值在排程那一刻就定了，
+  // 立即回传，不等真响。浏览器不给 outputLatency 就只报排程差（如实偏小）。
+  if (state.firstRecvCtx !== null && state.lastRecvToPlayMs === null) {
+    const outLat = ctx.outputLatency || ctx.baseLatency || 0;
+    const ms = Math.max(0, Math.round((startAt + outLat - state.firstRecvCtx) * 1000));
+    state.lastRecvToPlayMs = ms;
+    sendPlaybackReport(ms);
+  }
+}
+
+function sendPlaybackReport(recvToPlayMs, tailMs) {
+  // 播放侧回传（wire: playback.report）。发完即忘：服务端只是账单里的一格，
+  // 丢了下一轮会重测，不值得为它造重试。
+  if (!state.ws || state.ws.readyState !== WebSocket.OPEN) return;
+  const frame = { type: "playback.report", recv_to_play_ms: recvToPlayMs };
+  if (tailMs !== undefined && tailMs !== null) frame.tail_ms = tailMs;
+  state.ws.send(JSON.stringify(frame));
 }
 
 function stopPlayback() {
@@ -211,6 +234,8 @@ function stopPlayback() {
     const tailMs = Math.round((state.nextStart - ctx.currentTime) * 1000);
     console.info(`[voice-pilot] 停播：队列残余 ${tailMs}ms（未出声即被丢弃）`);
     lastTailMs = tailMs;
+    // 打断轮的完整回传：出声延迟（本轮已测过就复用）+ 被丢弃的排程尾音
+    if (state.lastRecvToPlayMs !== null) sendPlaybackReport(state.lastRecvToPlayMs, tailMs);
   }
   state.playSources.forEach((s) => { try { s.stop(); } catch { /* already ended */ } });
   state.playSources = [];
@@ -285,7 +310,11 @@ function handleEvent(ev) {
         $("mic").disabled = false;
       }
       break;
-    case "turn.start": setState("thinking", "思考中…"); lastAssistantLi = null; break;
+    case "turn.start":
+      setState("thinking", "思考中…"); lastAssistantLi = null;
+      // 播放侧测量按轮清零：上一轮的出声延迟绝不带到下一轮（错配比缺失糟）
+      state.firstRecvCtx = null; state.lastRecvToPlayMs = null;
+      break;
     case "asr.partial": setPartial(ev.text); break;
     case "asr.final":
       settlePartial(ev.text);
