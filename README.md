@@ -176,7 +176,10 @@ VOICE_LLM_ENGINE=mlx ./scripts/dev_server.sh   # 需先 uv sync --extra local
 
 WS 协议：`session.begin{mode, gating, grace_ms}` → 上行 PCM16 音频帧 → `session.end` 触发一轮
 （real 模式由 EOU 自动判停，不必显式 `session.end`）；`interrupt` 触发打断，下行 `audio.stop`
-通知播放端停播。
+通知播放端停播。**上行还有一帧 `playback.report`**：客户端把自己量到的「收到首片→出声」
+时长（含 `AudioContext.outputLatency`）回传，服务端记 `rx.playback` span 与
+`playback_ms` / `playback_tail_ms`——服务端追踪止于落网线，这是对端唯一的证据。
+它只报**时长**不报时刻：两端时钟不同步，报时刻必然漂。
 
 | `mode` | 含义 |
 |---|---|
@@ -293,7 +296,7 @@ L1 每帧双算 `is_speech`（去抖计数翻倍）、`finalize()` 缺尾部静�
 | 单用户、无并发 | 共享 ORT session 上推理串行 | 多人同时用会互相拖慢且无信号 | ✅ 已修（2026-10-08）：`providers/pool.py` 会话独占推理槽 + 满载明确拒绝（session_limit+1013）；ASR decode 搬线程（留在循环里则独占 recognizer 并行不起来，实测每路反慢 190ms）；A/B：每路口径B 基本持平（n=4），总墙钟 9.2→8.8s，价值在**显式背压**而非提速 |
 | **回声抑制未做（降级为已知代价）** | barge-in 仅 L1 能量判定 | 脚本客户端外放会自激误触发；**浏览器端靠 AEC 免耳机，live_client 仍需入耳式耳机物理隔离** | 文本↔ASR 重合抑制 / 软件 AEC（二期） |
 | **JSONL 事件流已落地**（2026-09-27，从缺口转交付；2026-10-27 部署面补齐） | `metrics/jsonl.py`：每轮一行，含 waterfall 各点 + 双份文本 + span 树 + 整轮 `root_breakdown`；`VOICE_EVENTS_JSONL` 启用（默认关，零副作用） | 首日就拦下一个静默错的账单字段（`eou_mode` 漏 `neural` 默认档）；2026-10-27 前 `deploy/` 三个模板都没设这个变量，判据 6 只是纸面达标 | **已修**：service / Dockerfile / env.example 写死路径 + compose 挂卷 + `SETUP.md` 第 6 节 logrotate（一轮一行可达百 KB，必须轮转）；多 worker 部署仍需换集中式收集 |
-| 打断尾音未量化 | `barge_in_latency_ms` 只记服务端检测时刻 | 停播耗时缺客户端证据 | ✅ 已量化（2026-10-03）：web 客户端停播时刻测队列残余（被丢弃的排程音频）；声卡在途毫秒级测不到，留白 |
+| 打断尾音未量化 | `barge_in_latency_ms` 只记服务端检测时刻 | 停播耗时缺客户端证据 | ✅ 已量化（2026-10-03 web 端测队列残余 + 2026-10-27 双向补齐）：服务端 `tx.stop` span 量「检测→停播帧落网线」，客户端 `playback_tail_ms` 把被丢弃的排程音频回传进账单；**OS 音频管线里已在途的毫秒级仍测不到，留白** |
 | `premature_eou` 恒为 0（分析盲区） | `run_turn` 采完指标就 `eou.reset()`，把「判停后又出现人声」的证据擦掉 | 一等验收指标（抢话率）曾不可用 | ✅ 已修（2026-10-03）：观察窗跨 reset 存活 + `take_premature()` 记账时读走；真链路复验切轮账单记 1.0 |
 | **默认档 `neural` 句内停顿切轮** | 受控实验：同音频下 `neural` 把「今天上海天气怎么样」切成 `今` + `海天气怎么样` 两轮，`conservative` 完整 | ⚠️ 样本是 TTS 合成语音（内部静音实测 150~240ms > 100ms 确认窗），**真人是否切轮未验**；若真人也切，默认档要退回 `conservative` | 真人验收现场复现；必要时加「最少说话时长」护栏 |
 | scripted 客户端未做 | 只有 live（`scripts/live_client.py`） | 缺「回放固定音频走 WS」的确定性取证 | ✅ 已补（2026-10-03）：`scripts/scripted_client.py`（不合成不起服务，回放 WAV 出账单） |
