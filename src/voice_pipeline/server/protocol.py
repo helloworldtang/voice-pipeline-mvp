@@ -62,6 +62,27 @@ class Interrupt(BaseModel):
     reason: str | None = None
 
 
+class PlaybackReport(BaseModel):
+    """客户端回传播放侧的两段测量（毫秒）。**全部是时长，不是时刻**。
+
+    为什么必须是时长：客户端与服务端的时钟没有同步（也不必同步），拿客户端
+    的绝对时刻去和服务端打点相减必然漂；而一段纯本地的时长不受时钟影响。
+    服务端把它挂在「首片落网线」那一刻之后——**位置是推算的，数值是实测的**。
+
+    为什么需要它：服务端的追踪止于落网线。之后的网络、抖动缓冲、播放排程、
+    声卡那一段全程是盲区，而用户感知到的延迟恰恰包含它。`recv_to_play_ms`
+    就是这一段的实测上界（含 `AudioContext.outputLatency`），
+    `tail_ms` 是打断停播时播放队列里被丢弃的排程音频（判据 3 的尾音量化）。
+
+    上报失败/浏览器不支持时客户端直接不发——服务端那一格保持 -1（缺失），不填 0。
+    """
+
+    type: Literal["playback.report"] = "playback.report"
+    recv_to_play_ms: float = Field(ge=0)
+    # 打断时才会有：停播那一刻队列里尚未出声的音频时长
+    tail_ms: float | None = Field(default=None, ge=0)
+
+
 class SessionEnd(BaseModel):
     type: Literal["session.end"] = "session.end"
 
@@ -126,7 +147,9 @@ class ErrorEvent(BaseModel):
     message: str
 
 
-ClientFrame = Annotated[SessionBegin | Interrupt | SessionEnd, Field(discriminator="type")]
+ClientFrame = Annotated[
+    SessionBegin | Interrupt | PlaybackReport | SessionEnd, Field(discriminator="type")
+]
 ServerEvent = Annotated[
     SessionReady
     | SessionClosed
@@ -143,7 +166,7 @@ ServerEvent = Annotated[
 _CLIENT_FRAME_ADAPTER: TypeAdapter[ClientFrame] = TypeAdapter(ClientFrame)
 
 
-def parse_client_frame(raw: str) -> SessionBegin | Interrupt | SessionEnd:
+def parse_client_frame(raw: str) -> SessionBegin | Interrupt | PlaybackReport | SessionEnd:
     """解析上行 JSON 控制帧。失败抛 ProtocolError(code="bad_frame")。"""
     try:
         return _CLIENT_FRAME_ADAPTER.validate_json(raw)

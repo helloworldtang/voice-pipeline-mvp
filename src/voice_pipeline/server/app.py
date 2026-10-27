@@ -29,6 +29,7 @@ from fastapi.staticfiles import StaticFiles
 from voice_pipeline.config import Settings
 from voice_pipeline.core.filler import FillerBank
 from voice_pipeline.core.scheduler.base import AudioFragment, TurnItem
+from voice_pipeline.metrics.logging_ctx import bind_trace_id, install_trace_logging
 from voice_pipeline.providers.pool import ProviderLease, ProviderPool
 
 from .protocol import (
@@ -36,6 +37,7 @@ from .protocol import (
     AudioStop,
     ErrorEvent,
     Interrupt,
+    PlaybackReport,
     ProtocolError,
     SessionBegin,
     SessionClosed,
@@ -55,6 +57,8 @@ DEFAULT_WEB_DIR = Path(__file__).resolve().parents[3] / "web"
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     cfg = settings or Settings()
+    # 日志带上 trace_id（判据 2）。幂等 + 只兜底不改别人的配置，见函数 docstring。
+    install_trace_logging()
 
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
@@ -80,6 +84,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def ws_endpoint(websocket: WebSocket) -> None:
         await websocket.accept()
         session = Session()
+        # 绑定后本连接派生的所有协程（pump/sender/run_turn）日志都带 trace_id。
+        # 换模式会重建会话（新 trace_id），那里再绑一次。
+        bind_trace_id(session.trace_id)
         await websocket.send_text(
             dump_event(SessionReady(session_id=session.session_id, trace_id=session.trace_id))
         )
@@ -116,6 +123,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 while True:
                     entry = await tx.get()
                     await websocket.send_text(entry.text)
+                    if entry.kill:
+                        # audio.stop 真正落网线：打断那一跳（检测→停播）的终点
+                        session.note_stop_send()
                     if entry.data is not None:
                         await websocket.send_bytes(entry.data)
                         # 首片真正落到网线上的这一刻：补传输层那一跳的 span
@@ -213,6 +223,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         # 从 env 读，见 metrics/jsonl.py）：这是运维开关，
                         # 不是每次会话的实验旋钮，所以不上 wire 协议。
                     )
+                    bind_trace_id(session.trace_id)
                     pump_task.cancel()
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await pump_task
@@ -249,6 +260,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     )
                     await tx.join()
                     break
+
+                if isinstance(frame, PlaybackReport):
+                    # 客户端回传播放侧实测（首片→出声 / 打断尾音）。无需应答：
+                    # 它只是账单里的一格，客户端发完即忘，丢了就丢（下一轮会重测）。
+                    session.note_playback_report(frame.recv_to_play_ms, frame.tail_ms)
+                    continue
 
                 if isinstance(frame, Interrupt) and not session.barge_in(source="client"):
                     # 客户端本地打断是「快路径」，经常在服务端轮次已结束后由播放

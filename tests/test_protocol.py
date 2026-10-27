@@ -124,3 +124,22 @@ def test_server_events_wire_fields() -> None:
 
     err = json.loads(dump_event(ErrorEvent(code="bad_frame", message="boom")))
     assert err == {"type": "error", "code": "bad_frame", "message": "boom"}
+
+
+def test_playback_report_parses_with_and_without_tail() -> None:
+    """播放侧回传帧：时长不时刻（客户端时钟不同步），tail 只在打断轮出现。"""
+    from voice_pipeline.server.protocol import PlaybackReport
+
+    frame = parse_client_frame(json.dumps({"type": "playback.report", "recv_to_play_ms": 42.5}))
+    assert isinstance(frame, PlaybackReport)
+    assert frame.recv_to_play_ms == 42.5
+    assert frame.tail_ms is None
+
+    with_tail = parse_client_frame(
+        PlaybackReport(recv_to_play_ms=30.0, tail_ms=120.0).model_dump_json()
+    )
+    assert isinstance(with_tail, PlaybackReport)
+    assert with_tail.tail_ms == 120.0
+
+    with pytest.raises(Exception):  # noqa: B017 - pydantic 校验拒绝负时长
+        parse_client_frame(json.dumps({"type": "playback.report", "recv_to_play_ms": -1.0}))

@@ -219,3 +219,47 @@ async def test_premature_eou_lands_in_bill_and_does_not_leak(tmp_path: Path) -> 
     assert len(rows) == 2
     assert rows[0]["premature_eou"] == 1.0, "判停后开口的轮次必须记为抢话"
     assert rows[1]["premature_eou"] == 0.0, "下一轮不得继承上一轮的幽灵标志"
+
+
+async def test_playback_report_lands_in_bill_and_does_not_leak(tmp_path: Path) -> None:
+    """客户端播放侧回传（playback.report）要进账单，且取用即清——
+    第二轮没报就不能带上一轮的出声延迟（错配比缺失更糟）。"""
+    out = tmp_path / "turns.jsonl"
+    session = _session(TurnRecorder(str(out)))
+
+    # 第一轮：出音频后客户端回传实测（时长，不时刻）
+    await session.on_audio(b"\x00\x00" * 160)
+    session.note_playback_report(42.5, 120.0)
+    await session.run_turn()
+
+    # 第二轮：客户端没报
+    await session.on_audio(b"\x00\x00" * 160)
+    await session.run_turn()
+
+    lines = out.read_text(encoding="utf-8").strip().splitlines()
+    bill1 = json.loads(lines[0])  # 账单字段平铺在行顶层（recorder 的 **bill）
+    bill2 = json.loads(lines[1])
+    assert bill1["playback_ms"] == 42.5, bill1
+    assert bill1["playback_tail_ms"] == 120.0, bill1
+    assert "playback_ms" not in bill2, "上一轮的播放测量漂进了下一轮的账"
+
+
+def test_tx_stop_span_records_barge_in_hop_once() -> None:
+    """打断那一跳（检测 → audio.stop 落网线）记成 tx.stop：一次打断一格，
+    没打断不编 0ms 的假格。"""
+    session = _session(TurnRecorder.__new__(TurnRecorder))  # 不落盘，只看 tracer
+    assert session.metrics.tracer is not None
+
+    # 没投过 AudioStop（_stop_issued_ms=-1）→ 什么都不记
+    session.note_stop_send()
+    names = [s["name"] for s in session.metrics.tracer.to_list()]
+    assert "tx.stop" not in names
+
+    # 模拟 barge_in 已记起点（barge_in 需要 SPEAKING 态的完整上下文，
+    # 单测直接给起点时刻，只验这一跳的记录与取用即清）
+    session._stop_issued_ms = 100.0
+    session.note_stop_send()
+    session.note_stop_send()  # 第二次是 no-op：一次打断只记一格
+    spans = [s for s in session.metrics.tracer.to_list() if s["name"] == "tx.stop"]
+    assert len(spans) == 1, spans
+    assert spans[0]["start_ms"] == 100.0

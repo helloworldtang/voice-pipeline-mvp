@@ -30,6 +30,10 @@ class Entry:
 
     text: str
     data: bytes | None = None  # 非 None = 音频对：先发 text 再发 data
+    # 杀停帧标记（audio.stop）。发送协程据此回调 Session 记 `tx.stop` span——
+    # 打断那一跳「检测 → 停播帧落网线」的长度是「叫不停」的直接证据，
+    # 而只有真正发送出去的那一刻才量得到（入队时刻量的是队列左侧）。
+    kill: bool = False
 
 
 class OutboundQueue:
@@ -50,7 +54,7 @@ class OutboundQueue:
 
     def put_kill(self, text: str) -> None:
         """杀停帧：插队到一切积压之前。仅限 audio.stop 语义的帧。"""
-        self._put(self._kill, Entry(text))
+        self._put(self._kill, Entry(text, kill=True))
 
     def put_event(self, text: str) -> None:
         """保序事件（turn.end / session.closed / 转写流）。"""

@@ -147,6 +147,15 @@ class Session:
         # 没量到就是没量到（filler 开启时这一格会成为首音被压后的证据）。
         self._first_audio_enqueued_ms: float = -1.0
         self._first_audio_sent = False
+        self._first_audio_sent_ms: float = -1.0  # 客户端出声报告的锚点（见下）
+        # 打断那一跳：barge_in 记「检测到」，传输层真正发出 audio.stop 时回调
+        # note_stop_send() 补上终点。**没量到就是 -1**，不填 0。
+        self._stop_issued_ms: float = -1.0
+        # 客户端回传的播放侧测量（playback.report）：首片→出声、打断时的排程尾音。
+        # 服务端的追踪止于落网线，这两格是唯一能盖住「用户真正听到多少」的证据。
+        # 取用即清（_record_turn），避免上一轮的数字漂到下一轮——宁可缺失，不可错配。
+        self._playback_ms: float = -1.0
+        self._playback_tail_ms: float = -1.0
         # 本轮判停指标是否已抓进账单（防止被 reset 后的 0 覆盖）
         self._eou_collected = False
         # 空转写门的连续拦截计数（见 pending_end）
@@ -403,6 +412,9 @@ class Session:
             self._energy_gate.reset()  # 静音确认状态同步清零（打断后用户正在说）
         self.metrics.barge_in_count += 1
         self.metrics.barge_in_latency_ms = self._clock.elapsed_ms()
+        # 起点：检测到用户插话的这一刻。终点由传输层在 audio.stop **真正发到网线**
+        # 时补（note_stop_send）——中间那一段正是「叫不停」会变长的那一段。
+        self._stop_issued_ms = self._clock.elapsed_ms()
         self.outbox.put_nowait(AudioStop())  # L2：通知播放端停播
         self._fsm.move(TurnState.LISTENING)  # L3：回到听，等用户插话说完再答
         return True
@@ -499,6 +511,8 @@ class Session:
         self._recorded_this_turn = False
         self._first_audio_enqueued_ms = -1.0
         self._first_audio_sent = False
+        self._first_audio_sent_ms = -1.0
+        self._stop_issued_ms = -1.0
         # 每轮一本新账：TurnMetrics 的 mark 只记首次到达，跨轮复用不清账的话，
         # 第 2 轮起的账单会复读第 1 轮。必须在 _collect_eou_metrics 之前清——
         # 它要把上一轮的判停指标写进本轮账里。
@@ -578,12 +592,57 @@ class Session:
             return
         now = self._clock.elapsed_ms()
         self._first_audio_sent = True
+        self._first_audio_sent_ms = now
         tracer.record(
             "tx.first_audio",
             self._first_audio_enqueued_ms,
             now,
             parent=tracer.window or tracer.root,
             attrs={"wait_ms": round(now - self._first_audio_enqueued_ms, 3)},
+        )
+
+    def note_stop_send(self) -> None:
+        """传输层回调：**audio.stop 真正发到网线的那一刻**调一次（barge-in 那条道）。
+
+        量的是「检测到插话 → 停播帧落地」全程，中间含 outbox 排队与越过积压音频的
+        等待——这正是 `queues.py` 那条铁律（杀停帧必须跳队）在账单里的证据。
+        没有打断（没投过 AudioStop）就什么都不记，不编一个 0ms 的假格。
+        """
+        if self._stop_issued_ms < 0:
+            return
+        tracer = self.metrics.tracer
+        if tracer is None:
+            return
+        now = self._clock.elapsed_ms()
+        tracer.record(
+            "tx.stop",
+            self._stop_issued_ms,
+            now,
+            parent=tracer.root,
+            attrs={"wait_ms": round(now - self._stop_issued_ms, 3)},
+        )
+        self._stop_issued_ms = -1.0  # 取用即清：一次打断只记一格，不重复计
+
+    def note_playback_report(self, recv_to_play_ms: float, tail_ms: float | None = None) -> None:
+        """客户端回传的播放侧测量（wire 帧 `playback.report`）。
+
+        ⚠️ **位置是推算的，数值是客户端实测的**：服务端只知道首片何时落网线，
+        把它当作这段时长的起点；客户端的时钟与我们不同步，所以只认时长不认时刻。
+        落在 root 下（不是窗口）：它发生在口径B 终点**之后**，算进窗口等于把
+        口径B 的右边界往后拖——盲区要看见，但不能靠污染主指标来看见。
+        """
+        self._playback_ms = float(recv_to_play_ms)
+        if tail_ms is not None:
+            self._playback_tail_ms = float(tail_ms)
+        tracer = self.metrics.tracer
+        if tracer is None or self._first_audio_sent_ms < 0:
+            return
+        tracer.record(
+            "rx.playback",
+            self._first_audio_sent_ms,
+            self._first_audio_sent_ms + float(recv_to_play_ms),
+            parent=tracer.root,
+            attrs={"client_reported": 1},
         )
 
     def _record_turn(
@@ -607,6 +666,14 @@ class Session:
             premature = self._eou.take_premature()
             self.metrics.premature_eou = premature
             bill = {**bill, "premature_eou": 1.0 if premature else 0.0}
+        # 客户端回传的播放侧测量入账（取用即清：上一轮的出声延迟绝不能漂进
+        # 下一轮的账单——错配比缺失更糟）。-1 = 客户端没报/不支持，如实缺失。
+        if self._playback_ms >= 0:
+            bill = {**bill, "playback_ms": round(self._playback_ms, 3)}
+            if self._playback_tail_ms >= 0:
+                bill = {**bill, "playback_tail_ms": round(self._playback_tail_ms, 3)}
+            self._playback_ms = -1.0
+            self._playback_tail_ms = -1.0
         self._recorded_this_turn = True
         self._turn_index += 1
         self._recorder.record(
