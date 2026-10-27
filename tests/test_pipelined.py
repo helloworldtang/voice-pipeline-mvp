@@ -116,6 +116,10 @@ async def test_speculation_hit_cuts_out_the_wait():
     # 藏掉的量要能在账单里看出来：第一句就绪早于用户闭嘴
     assert 0 < bill["spec_ready_ms"] < bill["utterance_end"], bill
     assert [i for i in items if isinstance(i, AudioFragment)]
+    # 首句字数必须在命中轮里有值：投机跑在 run_turn 的 reset_turn **之前**，
+    # 那时设的 tts_first_chars 会被清账抹掉（与 eou_latency_ms 恒 0 同一个失效
+    # 模式），命中轮曾因此恒 -1（2026-10-27 真人 pipelined 10 轮实锤）。
+    assert bill["tts_first_chars"] > 0, bill
 
 
 async def test_stale_speculation_is_discarded_and_answer_is_correct():

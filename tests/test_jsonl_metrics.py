@@ -244,6 +244,27 @@ async def test_playback_report_lands_in_bill_and_does_not_leak(tmp_path: Path) -
     assert "playback_ms" not in bill2, "上一轮的播放测量漂进了下一轮的账"
 
 
+async def test_root_breakdown_lands_for_complete_turn(tmp_path: Path) -> None:
+    """完整轮也要有 `root_breakdown`——记账早于根闭合就会恒缺失。
+
+    真因：root 的闭合原本只在 `finish()` 的 finally 里，而 `_record_turn`
+    发生在消费 TurnEnd 的那一刻（早于 finally 几千微秒）→ 根还开着，
+    `dur_ms = -1` → `_breakdown` 返回 None。真人验收 10 轮全是完整轮，
+    于是 10/10 轮这一字段是 None，而打断轮（走 finally 路径）反而有值——
+    「看起来能work」恰好是它潜伏一整个迭代的原因。
+    """
+    out = tmp_path / "turns.jsonl"
+    session = _session(TurnRecorder(str(out)))
+    await session.on_audio(b"\x00\x00" * 160)
+    await session.run_turn()
+
+    row = json.loads(out.read_text(encoding="utf-8").strip().splitlines()[0])
+    rb = row.get("root_breakdown")
+    assert isinstance(rb, dict), f"完整轮的 root_breakdown 缺失：{rb!r}"
+    assert rb["total_ms"] > 0, f"整轮时长必须为正（根已闭合），实际 {rb['total_ms']}"
+    assert "unattributed_ms" in rb, "残差字段必须带上（root 层的语义另有说明）"
+
+
 def test_tx_stop_span_records_barge_in_hop_once() -> None:
     """打断那一跳（检测 → audio.stop 落网线）记成 tx.stop：一次打断一格，
     没打断不编 0ms 的假格。"""

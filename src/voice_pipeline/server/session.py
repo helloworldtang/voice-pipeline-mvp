@@ -546,6 +546,14 @@ class Session:
                 elif isinstance(item, TtsSentence):
                     assistant_parts.append(item.text)
                 elif isinstance(item, TurnEnd):
+                    # 根 span 必须在记账**之前**闭合：`_record_turn` 要算
+                    # `root_breakdown`，而根还开着时 `dur_ms = -1` → 整轮构成恒缺失。
+                    # 真人验收 10 轮里 10/10 轮 `root_breakdown=None` 才抓到
+                    # （只有打断轮走 finally 那条路，恰好晚于闭合，所以看起来"能work"）。
+                    # finish() 的 finally 里那次 finish_root 仍保留：闭合幂等，
+                    # 两条路径（TurnEnd / 打断）都要盖住。
+                    if self.metrics.tracer is not None:
+                        self.metrics.tracer.finish_root()
                     # 账单在这一刻定型。
                     self._record_turn(item.metrics, user_text, assistant_parts)
         finally:
