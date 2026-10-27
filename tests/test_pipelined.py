@@ -334,3 +334,52 @@ async def test_speculation_llm_span_is_visible() -> None:
     names = [(s["name"], s.get("a.speculative")) for s in spans]
     assert ("llm.request", 1) in names, names
     assert any(n == "llm.ttft" and spec == 1 for n, spec in names), names
+
+
+async def test_hit_replays_head_while_first_sentence_still_streaming() -> None:
+    """ready 的正确语义：第一句**首片**到手即命中，不等整句合成完。
+
+    2026-10-27 真人 pipelined 0/10 命中、全是 not_ready(sentences=1)——等整句
+    合成完，EOU（+500ms 静音窗）永远先到。这个测试钉住两件事：
+    ① 首片到了 ready 就置位（第二片还卡着也照样命中）；
+    ② 回放跟播增长中的 head，迟到的片按序补播，一片不丢。
+    """
+    release = asyncio.Event()
+
+    class SlowStreamTts(SimTts):
+        """首片立即可出，第二片卡到测试放行——模拟整句还没合成完。"""
+
+        tts_streams = True
+
+        async def synth(self, sentence: str) -> AsyncIterator[bytes]:
+            yield b"\x01" * 9600
+            await release.wait()
+            yield b"\x02" * 9600
+
+    sched = PipelinedScheduler(
+        asr=_converged_asr(),
+        llm=EchoLlm(),
+        tts=SlowStreamTts(),
+        metrics=TurnMetrics(clock=SessionClock()),
+    )
+    await sched.on_audio(FRAME)
+    await asyncio.sleep(0.1)  # 首片到手；第二片仍卡着（整句未合成完）
+
+    run = sched._run
+    assert run is not None
+    assert run.ready.is_set(), "首片已到手，ready 必须已置位（旧实现等整句，恒 False）"
+    assert len(run.head) == 2, "此刻 head = TtsSentence + 首片"  # noqa: PLR2004
+
+    gen = sched.on_end_of_utterance()
+    item = await gen.__anext__()
+    assert getattr(item, "type", None) == "turn.start"
+    # 推进到第一个音频片：不等整句合成完就必须能出声
+    while not isinstance(item, AudioFragment):
+        item = await gen.__anext__()
+    assert item.data[0:1] == b"\x01"
+
+    release.set()  # 放行第二片
+    rest = [x async for x in gen]
+    frags = [x for x in rest if isinstance(x, AudioFragment)]
+    assert [f.data[0:1] for f in frags] == [b"\x02"], "卡住后的迟到片必须补播，不丢"
+    assert sched.spec_hits == 1

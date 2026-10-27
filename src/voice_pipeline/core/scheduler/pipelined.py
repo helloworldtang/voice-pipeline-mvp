@@ -36,6 +36,10 @@ from .base import AudioFragment, TurnItem, synth_to_fragments
 class SpecRun:
     """一次投机尝试的状态与产物。head / tail 分开存，是为了「第一句先走」——
     首音只看第一句，没必要等整段答案合成完。
+
+    head 是**增量追加**的：ready 在第一句首片到手就置位（不等整句合成完），
+    回放（_replay）开始时 head 可能还在长——progress 每追加一片就置位一次，
+    消费端靠它跟播。
     """
 
     text: str
@@ -43,6 +47,7 @@ class SpecRun:
     tail: list[TurnItem] = field(default_factory=list)
     sentences: int = 0
     ready: asyncio.Event = field(default_factory=asyncio.Event)  # 第一句可播
+    progress: asyncio.Event = field(default_factory=asyncio.Event)  # head/tail 有新片
     valid: bool = True  # ASR 修正过 partial 后置 False
     ready_ms: float | None = None
 
@@ -244,7 +249,11 @@ class PipelinedScheduler:
             else None
         )
         head = tr.start("tts.first_chunk", synth) if tr and run.sentences == 1 else None
-        items: list[TurnItem] = [TtsSentence(seq=run.sentences, text=sentence)]
+        # 增量追加（不再是攒完一整句再赋值）：首片到手即 ready，回放开始时
+        # head 可能还在长，_replay 靠 run.progress 跟播（2026-10-27）。
+        target = run.head if run.sentences == 1 else run.tail
+        target.append(TtsSentence(seq=run.sentences, text=sentence))
+        run.progress.set()
         async for block in synth_to_fragments(
             self._tts, sentence, chunker, on_skip=self._metrics.note_tts_skip
         ):
@@ -253,6 +262,11 @@ class PipelinedScheduler:
                 warm = bool(getattr(self._tts, "last_warm", False))
                 self._metrics.mark("tts_first_chunk")
                 run.ready_ms = self._metrics.clock.elapsed_ms()
+                # 首片到手即可判定「用得上」：真人实测等整句合成完，EOU 永远先到
+                # （2026-10-27 真人 pipelined 0/10 命中，全是 not_ready(sentences=1)）。
+                # 整句合成完的那次 ready.set() 留在 _run_speculation 里兜底
+                # （首片永远不来的极端情形，如 TTS 静默失败零分片）。
+                run.ready.set()
                 if tr:
                     # 深拆（同 serial）：建连 vs 服务端合成首片。speculative 路径也要拆——
                     # 命中率低时这些合成注定作废，拆开才知道废掉的是哪一段。
@@ -262,13 +276,10 @@ class PipelinedScheduler:
                     phase_span(tr, "tts.first_byte", phases, open_key, "first_data", synth)
                 if tr and head:
                     tr.finish(head)
-            items.append(AudioFragment(seq=chunker.next_seq(), data=block))
+            target.append(AudioFragment(seq=chunker.next_seq(), data=block))
+            run.progress.set()
         if tr and synth:
             tr.finish(synth, {"warm": 1 if warm else 0})
-        if run.sentences == 1:
-            run.head = items
-        else:
-            run.tail += items
 
     # ---- EOU：校验 → 命中即刻播 / 未命中走串行 ---------------------------
 
@@ -374,23 +385,46 @@ class PipelinedScheduler:
         return None
 
     async def _replay(self, run: SpecRun) -> AsyncIterator[TurnItem]:
-        """把投机产物吐出去。此刻用户已经说完，发声不早于 EOU。"""
+        """把投机产物吐出去。此刻用户已经说完，发声不早于 EOU。
+
+        ready 在第一句**首片**到手就置位（见 _synth_into），所以 head 在回放途中
+        还会增长——跟播：追平后等 `run.progress`，直到投机任务结束；迟到的片
+        **按序补播，一片不丢**（清旗标后复查再等，append 与 clear 的竞争不会丢唤醒）。
+        """
         # 投机开跑时这几个点其实早已越过，如实补记，waterfall 才看得出「藏掉了多少」
         self._metrics.mark("llm_first_token")
         self._metrics.mark("first_sentence_done")
-        self._metrics.sentences += run.sentences
+        # tts_first_chars 在投机期设过，但 run_turn 开头的 reset_turn 会清掉它
+        # （投机跑在 reset 之前、EOU 之前）——命中轮的账单因此恒 -1（2026-10-27
+        # 真人 pipelined 实锤），这里按第一句原文补记。
+        if run.head and isinstance(run.head[0], TtsSentence):
+            self._metrics.tts_first_chars = len(run.head[0].text)
 
-        for item in run.head:
-            async for out in self._pass_through(item):
-                yield out
-
-        # 头部播音的同时后台还在算尾巴：给它一个上限，超时就砍掉
         task = self._task
-        if task is not None and not task.done():
+        i = 0
+        while True:
+            while i < len(run.head):
+                item = run.head[i]
+                i += 1
+                async for out in self._pass_through(item):
+                    yield out
+            if task is None or task.done():
+                break
+            run.progress.clear()
+            if i < len(run.head) or task.done():  # 清完旗标再复查：刚追的这片不算丢
+                continue
             try:
-                await asyncio.wait_for(asyncio.shield(task), timeout=self._tail_timeout_ms / 1000)
-            except (TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(
+                    asyncio.shield(run.progress.wait()),
+                    timeout=self._tail_timeout_ms / 1000,
+                )
+            except TimeoutError:
                 task.cancel()
+                break
+
+        # sentences 计数挪到任务收尾后取终值：早播开始时尾巴还没算完，
+        # 进 replay 那一刻的 run.sentences 是欠账（旧实现在这里 += 的是中间值）
+        self._metrics.sentences += run.sentences
 
         for item in run.tail:
             async for out in self._pass_through(item):
