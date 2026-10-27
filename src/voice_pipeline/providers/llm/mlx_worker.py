@@ -46,7 +46,8 @@ def main() -> None:
 
     model_id = _resolve_model(None)
     t0 = time.perf_counter()
-    model, tokenizer = load(model_id)
+    loaded = load(model_id)  # 新版 mlx-lm 可能带第三元素（generation kwargs），只取前两个
+    model, tokenizer = loaded[0], loaded[1]
     # 预热一次：Metal 首次编译实测 +900ms，不能算在第一轮头上
     try:
         stream_generate(model, tokenizer, prompt="你好", max_tokens=1)

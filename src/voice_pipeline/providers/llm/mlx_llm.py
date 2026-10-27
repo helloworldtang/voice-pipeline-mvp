@@ -107,7 +107,9 @@ class MlxLlm:
         if cached is None:
             from mlx_lm import load  # 延迟导入：缺依赖只在真正用本地时炸
 
-            cached = load(self.model)
+            loaded = load(self.model)
+            # 新版 mlx-lm 的 load 可能带第三元素（default generation kwargs），只留前两个
+            cached = (loaded[0], loaded[1])
             _MODEL_CACHE[self.model] = cached
         return cached
 

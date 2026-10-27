@@ -67,8 +67,22 @@ def test_missing_api_key_fails_loudly(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_auto_engine_falls_back_to_sim_without_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """缺 key 且**没有本地 mlx**才落到替身。装了 `--extra local` 的机器上 auto
+    会降级到 MlxLlm（文档语义，账单 llm 字段可判读）——所以这里要把 mlx
+    探测一并钉死，否则测试随本机依赖摆动（2026-10-27 装了 extra 后实锤）。"""
     monkeypatch.delenv(API_KEY_ENV, raising=False)
+    monkeypatch.setattr("voice_pipeline.providers.factory._mlx_available", lambda: False)
     assert isinstance(build_llm("auto"), SimLlm)
+
+
+def test_auto_engine_prefers_local_mlx_over_sim_without_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """缺 key 但有 mlx：降级到本地（比替身诚实——替身会让账单假装含 LLM）。"""
+    monkeypatch.delenv(API_KEY_ENV, raising=False)
+    monkeypatch.setattr("voice_pipeline.providers.factory._mlx_available", lambda: True)
+    llm = build_llm("auto")
+    assert type(llm).__name__ == "MlxLlm"
 
 
 def test_auto_engine_uses_real_llm_when_key_present(monkeypatch: pytest.MonkeyPatch) -> None:
