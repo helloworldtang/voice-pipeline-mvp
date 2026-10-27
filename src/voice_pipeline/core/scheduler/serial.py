@@ -174,7 +174,9 @@ class SerialScheduler:
         # TTS 单独一格 **且记字数**：本机最强的相关性就在这一格，`chars` 是解释它的唯一自变量
         synth = tr.start("tts.synth", root, {"seq": seq, "chars": len(sentence)}) if tr else None
         head = tr.start("tts.first_chunk", synth) if tr and seq == 1 else None
-        async for chunk in synth_to_fragments(self._tts, sentence, self._chunker):
+        async for chunk in synth_to_fragments(
+            self._tts, sentence, self._chunker, on_skip=self._metrics.note_tts_skip
+        ):
             if first_chunk:
                 first_chunk = False
                 warm = bool(getattr(self._tts, "last_warm", False))

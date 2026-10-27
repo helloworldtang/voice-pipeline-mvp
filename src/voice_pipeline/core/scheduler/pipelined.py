@@ -245,7 +245,9 @@ class PipelinedScheduler:
         )
         head = tr.start("tts.first_chunk", synth) if tr and run.sentences == 1 else None
         items: list[TurnItem] = [TtsSentence(seq=run.sentences, text=sentence)]
-        async for block in synth_to_fragments(self._tts, sentence, chunker):
+        async for block in synth_to_fragments(
+            self._tts, sentence, chunker, on_skip=self._metrics.note_tts_skip
+        ):
             if first_chunk and run.sentences == 1:
                 first_chunk = False
                 warm = bool(getattr(self._tts, "last_warm", False))
@@ -460,7 +462,9 @@ class PipelinedScheduler:
             else None
         )
         head = tr.start("tts.first_chunk", synth) if tr and seq == 1 else None
-        async for block in synth_to_fragments(self._tts, sentence, self._chunker):
+        async for block in synth_to_fragments(
+            self._tts, sentence, self._chunker, on_skip=self._metrics.note_tts_skip
+        ):
             if first_chunk:
                 first_chunk = False
                 warm = bool(getattr(self._tts, "last_warm", False))

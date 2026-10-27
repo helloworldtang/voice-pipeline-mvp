@@ -150,6 +150,7 @@ async def test_tts_failure_on_one_sentence_does_not_kill_turn() -> None:
             bill = item.metrics
 
     assert tts.failed == ["坏句。"], tts.failed  # 失败句确实试过（而非没送到）
+    assert bill["tts_skipped_sentences"] == 1.0, "跳句必须进账单（审查第 8 项）"
     assert sizes, "好句必须照播，不能整轮静音"
     assert bill["audio_bytes"] > 0, bill
     assert bill["caliber_b_ms"] > 0, "首句坏但第二句出了声，口径B 仍要记账"

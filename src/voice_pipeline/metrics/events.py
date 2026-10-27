@@ -89,6 +89,14 @@ class TurnMetrics:
     # barge-in 指标（M3）：用户插话打断 AI 的次数与时刻
     barge_in_count: int = 0  # 本轮被打断次数
     barge_in_latency_ms: float = -1.0  # 最近一次打断发生的会话钟时刻（ms）
+    # TTS 单句失败被跳过的句数（2026-10-17 turn 12 教训的沉淀）：跳过本身是
+    # 正确行为（一句念不出好过整轮静音），但它必须**可见**——只在日志里
+    # warning 的话，账单看起来一切正常（审查第 8 项）。
+    tts_skipped_sentences: int = 0
+
+    def note_tts_skip(self, sentence: str) -> None:
+        """synth_to_fragments 的跳句回调：句子进不了账单，但次数必须进。"""
+        self.tts_skipped_sentences += 1
 
     def mark(self, name: str) -> None:
         if name not in self.marks:
@@ -121,6 +129,7 @@ class TurnMetrics:
         self.eou_mode = ""
         self.barge_in_count = 0
         self.barge_in_latency_ms = -1.0
+        self.tts_skipped_sentences = 0
         # ⚠️ 这里**不清** span 树：树的生命周期归 Session 管（第一帧上行开根、
         # turn.end 闭根、下一轮第一帧 reset）。在 run_turn 开头清会把**判停前**的
         # 上行帧/EOU/partial 全部抹掉，trace 只剩"说完之后"那一段——2026-10-17
@@ -163,6 +172,10 @@ class TurnMetrics:
         # barge-in 指标（M3）
         bill["barge_in_count"] = float(self.barge_in_count)
         bill["barge_in_latency_ms"] = round(self.barge_in_latency_ms, 3)
+        # 跳句只在发生时才写键：absence = 没跳过（与 caliber_a 的条件写法同理，
+        # 不给每轮账单添一个恒 0 的键）。
+        if self.tts_skipped_sentences:
+            bill["tts_skipped_sentences"] = float(self.tts_skipped_sentences)
         if first_audio is not None and vad_onset is not None:
             bill["caliber_a_ms"] = round(first_audio - vad_onset, 3)
         # 体感首音（含 filler）：与口径B **分开报**——filler 省的是「用户以为在等」

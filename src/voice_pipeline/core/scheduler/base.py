@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from typing import Protocol, Union, runtime_checkable
 
@@ -58,7 +58,10 @@ async def play_filler(
 
 
 async def synth_to_fragments(
-    tts: TtsProvider, sentence: str, chunker: Chunker
+    tts: TtsProvider,
+    sentence: str,
+    chunker: Chunker,
+    on_skip: Callable[[str], None] | None = None,
 ) -> AsyncIterator[bytes]:
     """按 TTS 能力分流合成，产出固定尺寸音频分片。
 
@@ -72,7 +75,9 @@ async def synth_to_fragments(
     **单句失败不炸整轮**（2026-10-17 真人验收 turn 12 的教训）：provider 抛
     RuntimeError（如 DashScope 判文本 InvalidParameter）时跳过这一句、其余照播。
     一句念不出来，好过整轮静音 + "Task exception was never retrieved"。
-    CancelledError 不是 Exception，天然穿透——打断语义不受影响。
+    `on_skip` 把跳过的句子报给调用方（进账单的 `tts_skipped_sentences`——
+    只在日志里 warning 的话，账单看起来一切正常）。CancelledError 不是
+    Exception，天然穿透——打断语义不受影响。
     """
     if getattr(tts, "tts_streams", False):
         try:
@@ -81,6 +86,8 @@ async def synth_to_fragments(
                     yield block
         except RuntimeError:
             logger.warning("TTS 合成失败，跳过该句（其余照播）: %r", sentence[:60], exc_info=True)
+            if on_skip is not None:
+                on_skip(sentence)
             return
         for block in chunker.flush():
             yield block
@@ -89,6 +96,8 @@ async def synth_to_fragments(
             pcm = await asyncio.to_thread(tts.synth_blocking, sentence)
         except RuntimeError:
             logger.warning("TTS 合成失败，跳过该句（其余照播）: %r", sentence[:60], exc_info=True)
+            if on_skip is not None:
+                on_skip(sentence)
             return
         for block in chunker.feed_and_flush(pcm):
             yield block
