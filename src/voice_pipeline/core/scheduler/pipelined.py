@@ -157,14 +157,51 @@ class PipelinedScheduler:
         splitter = SentenceSplitter()
         chunker = Chunker()
 
-        async for piece in self._llm.astream(
-            run.text, history=list(self._history) if self._history else None
-        ):
-            for sentence in splitter.feed(piece):
-                await self._synth_into(run, sentence, chunker)
-                if run.sentences == 1:
-                    run.ready.set()
-            self._invalidate_if_stale(run)
+        # 投机的 LLM 段也开 span（审查第 5 项）：过去只有 fallback 包 llm.request，
+        # 投机那一次生成在账单上不可见——命中率低的时候看不出「CPU 花在注定作废的
+        # 生成上有多少」。与 tts.synth(speculative=1) 同一标记法。
+        tr = self._metrics.tracer
+        root = (tr.window or tr.root) if tr is not None else None
+        req = (
+            tr.start("llm.request", root, {"speculative": 1, "chars": len(run.text)})
+            if tr
+            else None
+        )
+        ttft = tr.start("llm.ttft", req, {"speculative": 1}) if tr else None
+        saw_token = False
+        try:
+            async for piece in self._llm.astream(
+                run.text, history=list(self._history) if self._history else None
+            ):
+                if not saw_token:
+                    saw_token = True
+                    if tr is not None and ttft is not None:
+                        phases = phases_of(self._llm)
+                        phase_span(tr, "llm.headers", phases, "start", "headers", ttft)
+                        phase_span(tr, "llm.prefill", phases, "headers", "first_content", ttft)
+                        phase_span(
+                            tr,
+                            "llm.worker_ttft",
+                            phases,
+                            "headers",
+                            "worker_first_token",
+                            ttft,
+                        )
+                        phase_span(
+                            tr, "llm.wakeup", phases, "worker_first_token", "first_content", ttft
+                        )
+                        tr.finish(ttft)
+                for sentence in splitter.feed(piece):
+                    await self._synth_into(run, sentence, chunker)
+                    if run.sentences == 1:
+                        run.ready.set()
+                self._invalidate_if_stale(run)
+        finally:
+            if tr:
+                if ttft is not None and ttft.open:
+                    tr.finish(ttft)
+                if req is not None:
+                    tr.finish(req, {"sentences": run.sentences})
 
         tail_sentence = splitter.flush()
         if tail_sentence:

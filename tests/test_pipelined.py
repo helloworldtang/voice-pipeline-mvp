@@ -311,3 +311,26 @@ async def test_speculation_can_be_switched_off(speculate: bool) -> None:
 
     assert [i for i in items if isinstance(i, AudioFragment)]
     assert bill["spec_hit"] == float(speculate)
+
+
+async def test_speculation_llm_span_is_visible() -> None:
+    """投机的 LLM 段也要进 span 树（speculative=1，审查第 5 项）——过去只有
+    fallback 包 llm.request，命中率低时看不出「CPU 花在注定作废的生成上有多少」。"""
+    from voice_pipeline.metrics.trace import Tracer
+
+    metrics = TurnMetrics(clock=SessionClock())
+    metrics.tracer = Tracer("spec-spans")
+    metrics.tracer.start_root("turn")
+    sched = PipelinedScheduler(
+        asr=_converged_asr(),
+        llm=EchoLlm(),
+        tts=_tts(cpu_ms=0.0),
+        metrics=metrics,
+    )
+    await sched.on_audio(FRAME)
+    await asyncio.sleep(0.1)
+
+    spans = metrics.tracer.to_list()
+    names = [(s["name"], s.get("a.speculative")) for s in spans]
+    assert ("llm.request", 1) in names, names
+    assert any(n == "llm.ttft" and spec == 1 for n, spec in names), names
