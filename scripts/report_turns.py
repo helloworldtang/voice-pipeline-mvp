@@ -304,6 +304,26 @@ def render(
         "",
     ]
 
+    # 播放侧实测（客户端回传）：服务端追踪止于落网线，这两格是唯一的对端证据。
+    # 没上报就如实不填——浏览器不给 outputLatency / 客户端没回传时，缺失比编造有价值。
+    _pb = [float(r["playback_ms"]) for r in records if float(r.get("playback_ms", -1)) >= 0]
+    _tail = [
+        float(r["playback_tail_ms"])
+        for r in interrupted
+        if float(r.get("playback_tail_ms", -1)) >= 0
+    ]
+    _skipped = sum(int(float(r.get("tts_skipped_sentences") or 0)) for r in records)
+    lines += [
+        "### 播放侧实测（客户端 `playback.report` 回传）",
+        "",
+        f"- 收到首片 → 出声：{summarize(_pb)}（{len(_pb)}/{len(records)} 轮有上报）",
+        f"- 打断时被丢弃的排程尾音：{summarize(_tail)}（{len(_tail)}/{len(interrupted)} 轮）",
+        f"- TTS 跳句（单句合成失败被跳过）：{_skipped} 句",
+        "> 口径：客户端只报**时长**不报时刻（两端时钟不同步）；含 `AudioContext.outputLatency`，",
+        "> 浏览器不给该值时如实偏小。服务端把它锚在首片落网线那一刻，画进 `rx.playback` span。",
+        "",
+    ]
+
     lines += [
         "## 四、逐轮明细",
         "",
@@ -327,6 +347,9 @@ def render(
 
     if spans:
         lines += render_span_section(records)
+        # 独立于窗口表：没有窗口的轮次（打断轮/异常轮）恰恰最需要看判停前那一段，
+        # 挂在 render_span_section 里会被它的“无窗口提前返回”一起吞掉。
+        lines += _render_root_spans(records)
     return "\n".join(lines) + "\n"
 
 
@@ -390,6 +413,44 @@ def render_span_section(records: list[dict[str, Any]]) -> list[str]:
         lines.append(
             f"| {name} | {len(vals)} | {p50:.0f}ms | {_pct(vals, 0.9):.0f}ms | "
             f"{max(vals):.0f}ms | {share} |"
+        )
+    lines.append("")
+    return lines
+
+
+# 窗口外的格子：判停前那一段（上行帧 / eou.decide）与首音之后的两跳
+# （tx.first_audio / rx.playback）。**口径B 窗口表看不到它们**——不是没埋，
+# 是它们本来就在窗口之外。分开成一节，免得被读成"又一段没归因的残差"。
+def _render_root_spans(records: list[dict[str, Any]]) -> list[str]:
+    per_name: dict[str, list[float]] = {}
+    n_rb = 0
+    for r in records:
+        rb = r.get("root_breakdown")
+        if not isinstance(rb, dict):
+            continue
+        n_rb += 1
+        sums: dict[str, float] = {}
+        for item in rb.get("items") or []:
+            name = str(item.get("name", "?"))
+            sums[name] = sums.get(name, 0.0) + float(item.get("ms", 0.0))
+        for name, ms in sums.items():
+            per_name.setdefault(name, []).append(ms)
+    if not n_rb:
+        return []
+    lines = [
+        "## 六、窗口外的格子（整轮 root 层，自有时间）",
+        "",
+        f"> 有 `root_breakdown` 的轮次：{n_rb}/{len(records)}。含**判停前**（上行帧 CPU、"
+        "`eou.decide`）与**首音之后**（`tx.first_audio`、客户端回传的 `rx.playback`）。",
+        "> ⚠️ 这里的“未归因”不等于漏埋——整轮里天然有等用户说话的空闲，那条纪律",
+        "> 只成立于口径B 窗口内。",
+        "",
+        "| span | 轮数 | 每轮 p50 | max |",
+        "|---|---|---|---|",
+    ]
+    for name, vals in sorted(per_name.items(), key=lambda kv: -statistics.median(kv[1])):
+        lines.append(
+            f"| {name} | {len(vals)} | {statistics.median(vals):.0f}ms | {max(vals):.0f}ms |"
         )
     lines.append("")
     return lines
