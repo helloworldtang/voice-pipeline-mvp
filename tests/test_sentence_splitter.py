@@ -58,3 +58,19 @@ def test_flush_drops_punctuation_only_remainder() -> None:
     s.feed("今天很冷。")
     s.feed("。..")
     assert s.flush() is None  # 残留全是标点/空白：不产出
+
+
+def test_ascii_quotes_normalized_to_chinese_pairs() -> None:
+    """LLM 对话体常吐英文直引号，中文里显示成 AI:"小偷… 很突兀（2026-10-27
+    验收反馈）。成对替换为「」，跨 feed 也要配对，轮末复位。"""
+    s = SentenceSplitter()
+    assert s.feed('警察问小偷："你从') == []
+    assert s.feed('哪儿来？"') == ["警察问小偷：「你从哪儿来？」"]
+    # 跨句配对：开引号在上句、闭引号在下句，状态由实例携带
+    s2 = SentenceSplitter()
+    assert s2.feed('他说："好。') == ["他说：「好。"]
+    # 闭引号紧跟句号之后：被 _scan 的闭合符吸收规则并入本句，不丢右半边
+    assert s2.feed('行。"') == ["行。」"]
+    # 轮末复位：上一轮没收尾的引号状态不传染下一轮
+    assert s2.flush() is None
+    assert s2.feed('新的"对"。') == ["新的「对」。"]

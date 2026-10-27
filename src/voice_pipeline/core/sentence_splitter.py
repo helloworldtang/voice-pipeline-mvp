@@ -20,6 +20,8 @@ import unicodedata
 logger = logging.getLogger(__name__)
 
 DEFAULT_TERMINATORS = "。！？；!?;\n"
+# 句末标点之后允许并入本句的闭合符号（见 _scan 的吸收规则）
+_CLOSERS = '」』"' + "”）)〉》"
 # 首句护栏的软断点：只在首句超长时退而求其次（逗号/顿号）
 SOFT_BREAKS = "，,、"
 ENV_FIRST_MAX = "VOICE_FIRST_SENTENCE_MAX_CHARS"
@@ -34,6 +36,28 @@ def _has_speech(text: str) -> bool:
     纯标点无声可言，丢弃是对的。
     """
     return any(unicodedata.category(ch)[0] in ("L", "N") for ch in text)
+
+
+def _normalize_quotes(text: str, open_next: bool) -> tuple[str, bool]:
+    """成对的英文直引号 " → 中文「」；返回(新文本, 下一个是否为开引号)。
+
+    为什么在分句器做：LLM 讲对话体（笑话/引用）时常吐 ASCII 直引号，中文句子里
+    显示成 AI:"小偷… 很突兀（2026-10-27 验收反馈）。按开/闭交替替换；
+    引号可能跨 token/跨句配对，所以奇偶状态由调用方（splitter 实例）跨 feed 携带，
+    轮末（flush）复位。奇数个直引号会留下单边「——流式下无法预知配对，
+    接受这一瑕疵（下一轮已复位）。
+    """
+    if '"' not in text:
+        return text, open_next
+    out: list[str] = []
+    opening = open_next
+    for ch in text:
+        if ch == '"':
+            out.append("「" if opening else "」")
+            opening = not opening
+        else:
+            out.append(ch)
+    return "".join(out), opening
 
 
 def _env_first_max() -> int:
@@ -71,6 +95,7 @@ class SentenceSplitter:
         )
         self._soft_breaks = SOFT_BREAKS
         self._emitted = 0  # 本轮已吐出的句数：护栏只认第 1 句
+        self._quote_open = True  # 直引号配对：True=下一个是开引号（跨 feed 携带，轮末复位）
 
     @property
     def first_sentence_max_chars(self) -> int:
@@ -91,15 +116,20 @@ class SentenceSplitter:
         """按句末标点切，返回本轮新吐出的句子。
 
         纯标点/空白的 piece 丢弃（无声可言，发给 TTS 只会换来 InvalidParameter）。
+        句末标点后的**闭合**引号/括号（"？」"这类）并入本句——不并会被切进
+        下一句开头或落进无内容残留被丢，引号就缺了右半边。
         """
         sentences: list[str] = []
         start = 0
         for i, char in enumerate(self._buffer):
             if char in self._terminators:
-                piece = self._buffer[start : i + 1].strip()
+                end = i + 1
+                while end < len(self._buffer) and self._buffer[end] in _CLOSERS:
+                    end += 1
+                piece = self._buffer[start:end].strip()
                 if piece and _has_speech(piece):
                     sentences.append(piece)
-                start = i + 1
+                start = end
         if start:
             self._buffer = self._buffer[start:]
         return sentences
@@ -107,6 +137,7 @@ class SentenceSplitter:
     def feed(self, text: str) -> list[str]:
         if not text:
             return []
+        text, self._quote_open = _normalize_quotes(text, self._quote_open)
         self._buffer += text
         sentences = self._scan()
         if self._first_max and self._emitted == 0:
@@ -134,4 +165,5 @@ class SentenceSplitter:
         rest = self._buffer.strip()
         self._buffer = ""
         self._emitted = 0  # 轮末：下一轮重新认「第 1 句」
+        self._quote_open = True  # 引号配对状态不复位会传染下一轮
         return rest if _has_speech(rest) else None
