@@ -313,6 +313,8 @@ function handleEvent(ev) {
         setState("", "就绪——点「开麦」开始");
         $("mic").disabled = false;
       }
+      // 生效模式以服务端回显为准（下拉只是意愿——四轮验收三轮没切上的教训）
+      $("activemode").textContent = ev.mode ? `当前: ${ev.mode}` : "";
       break;
     case "turn.start":
       setState("thinking", "思考中…"); lastAssistantLi = null;
@@ -418,8 +420,13 @@ $("mic").addEventListener("click", async () => {
 // mode/gating 是 session.begin 的一次性参数：连接建立后再改下拉，对已建会话无效
 // （2026-10-18 验收实锤：用户切到 real-pipelined，账单里三段会话仍全是 real-serial，
 // 切换被静默吞掉）。未开麦时改选 → 重连换会话；开麦中改选 → 明说本轮仍用旧值。
+// 模式/判停档的记忆：切过一次就记住，刷新不丢——"记得切下拉"这件事
+// 已经在四轮验收里失败了三次，不再依赖人的记忆
 for (const id of ["mode", "gating"]) {
+  const saved = localStorage.getItem("vp-" + id);
+  if (saved && [...$(id).options].some((o) => o.value === saved)) $(id).value = saved;
   $(id).addEventListener("change", () => {
+    localStorage.setItem("vp-" + id, $(id).value);
     if (state.micOn) {
       addLine("partial", `（${id === "mode" ? "模式" : "判停档"}已锁定本轮，关麦后再切换）`).className = "user";
       return;

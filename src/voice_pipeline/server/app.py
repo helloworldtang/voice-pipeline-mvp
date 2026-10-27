@@ -88,7 +88,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # 换模式会重建会话（新 trace_id），那里再绑一次。
         bind_trace_id(session.trace_id)
         await websocket.send_text(
-            dump_event(SessionReady(session_id=session.session_id, trace_id=session.trace_id))
+            dump_event(
+                SessionReady(
+                    session_id=session.session_id, trace_id=session.trace_id, mode=session.mode
+                )
+            )
         )
         # 本连接借到的本地推理资源（real 模式才有，sim/echo 为 None）。关闭路径
         # 有多个出口，统一在 finally 归还；release 幂等。
@@ -230,7 +234,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     pump_task = asyncio.create_task(pump(session.outbox))
                     await websocket.send_text(
                         dump_event(
-                            SessionReady(session_id=session.session_id, trace_id=session.trace_id)
+                            SessionReady(
+                                session_id=session.session_id,
+                                trace_id=session.trace_id,
+                                mode=session.mode,
+                            )
                         )
                     )
                     continue

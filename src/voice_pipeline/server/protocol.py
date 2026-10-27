@@ -133,6 +133,9 @@ class SessionReady(BaseModel):
     type: Literal["session.ready"] = "session.ready"
     session_id: str
     trace_id: str
+    # 服务端确认的**实际生效**模式：客户端靠它显示"当前会话在跑什么"——
+    # 下拉只是意愿，生效值才可信（2026-10-27 四轮验收三轮没切上，全是信了下拉）
+    mode: str | None = None
 
 
 class SessionClosed(BaseModel):

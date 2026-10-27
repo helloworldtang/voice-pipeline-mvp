@@ -117,7 +117,17 @@ def test_gating_and_grace_travel_on_the_wire() -> None:
 
 def test_server_events_wire_fields() -> None:
     ready = json.loads(dump_event(SessionReady(session_id="s1", trace_id="t1")))
-    assert ready == {"type": "session.ready", "session_id": "s1", "trace_id": "t1"}
+    assert ready == {
+        "type": "session.ready",
+        "session_id": "s1",
+        "trace_id": "t1",
+        "mode": None,
+    }
+    # mode 是服务端回显的生效值——客户端的"当前会话在跑什么"以此为准
+    ready_moded = json.loads(
+        dump_event(SessionReady(session_id="s1", trace_id="t1", mode="real-pipelined"))
+    )
+    assert ready_moded["mode"] == "real-pipelined"
 
     closed = json.loads(dump_event(SessionClosed(session_id="s1", frames_echoed=7)))
     assert closed == {"type": "session.closed", "session_id": "s1", "frames_echoed": 7}
