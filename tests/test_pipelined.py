@@ -383,3 +383,38 @@ async def test_hit_replays_head_while_first_sentence_still_streaming() -> None:
     frags = [x for x in rest if isinstance(x, AudioFragment)]
     assert [f.data[0:1] for f in frags] == [b"\x02"], "卡住后的迟到片必须补播，不丢"
     assert sched.spec_hits == 1
+
+
+async def test_prefix_hit_accepts_short_trailing_particle() -> None:
+    """前缀命中：final 只比投机前缀多 ≤2 字（"吗""一下"这类尾词）时算命中。
+
+    sherpa 尾词直到 finalize 才出现、从不进 partial 流——等值校验把这类轮次
+    全挡在门外（2026-10-27 晚间真人 4/9 miss 里 3 个是纯尾词延伸）。
+    """
+    llm = EchoLlm()
+    # partial 收敛成缺尾词的前缀，finalize 补出"吗"
+    asr = SimAsr("明天要下雨吗", partials=["明天要下雨"] * 5)
+    sched = PipelinedScheduler(
+        asr=asr, llm=llm, tts=_tts(cpu_ms=50.0), metrics=TurnMetrics(clock=SessionClock())
+    )
+    await sched.on_audio(FRAME)
+    await asyncio.sleep(0.15)
+    items, bill = await _drain(sched)
+    assert bill["spec_hit"] == 1.0, bill
+    assert bill["spec_prefix_hit"] == 1.0, "前缀命中要能在账单里数出来"
+    # 答案基于前缀（投机产物原样播），不重算
+    assert llm.prompts == ["明天要下雨"], llm.prompts
+
+
+async def test_prefix_hit_rejects_long_tail() -> None:
+    """缺失尾巴超过 2 字不算前缀命中——"……别/不要"这类翻转语义的真尾词要挡住。"""
+    asr = SimAsr("明天去北京别迟到", partials=["明天去北京"] * 5)
+    sched = PipelinedScheduler(
+        asr=asr, llm=EchoLlm(), tts=_tts(cpu_ms=50.0), metrics=TurnMetrics(clock=SessionClock())
+    )
+    await sched.on_audio(FRAME)
+    await asyncio.sleep(0.15)
+    items, bill = await _drain(sched)
+    assert bill["spec_hit"] == 0.0, bill
+    assert bill["spec_miss"] == 1.0
+    assert "text_differs" in sched.spec_last_reason

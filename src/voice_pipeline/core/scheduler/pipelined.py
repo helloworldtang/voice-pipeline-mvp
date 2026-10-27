@@ -19,6 +19,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
@@ -30,6 +31,15 @@ from voice_pipeline.providers.base import AsrProvider, LlmProvider, TtsProvider
 from voice_pipeline.server.protocol import AsrFinal, TtsSentence, TurnEnd, TurnStart
 
 from .base import AudioFragment, TurnItem, synth_to_fragments
+
+
+def _prefix_tail_limit() -> int:
+    """前缀命中允许的缺失尾词字数（0 = 关闭）。env 可调，供 A/B。"""
+    raw = os.environ.get("VOICE_SPEC_PREFIX_TAIL", "2").strip()
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 2
 
 
 @dataclass(slots=True)
@@ -107,6 +117,7 @@ class PipelinedScheduler:
         self.spec_hits = 0
         self.spec_misses = 0
         self.spec_aborts = 0
+        self.spec_prefix_hits = 0  # 靠前缀校验（尾词 ≤2 字）命中的次数
         self.spec_last_reason = "n/a"  # 上一次为什么没命中 —— 不可解释就不许调优
 
     # ---- 上行：边听边投机 ------------------------------------------------
@@ -336,6 +347,7 @@ class PipelinedScheduler:
                 **self._metrics.bill(),
                 "spec_hit": float(self.spec_hits),
                 "spec_miss": float(self.spec_misses),
+                "spec_prefix_hit": float(self.spec_prefix_hits),
                 "spec_ready_ms": round(run.ready_ms or -1.0, 3) if run else -1.0,
             }
         )
@@ -376,6 +388,16 @@ class PipelinedScheduler:
         if not run.valid:
             reason = "stale_partial"
         elif run.text != transcript:
+            # 前缀命中（2026-10-27 晚间真人数据拍板）：sherpa 的尾词（"吗""一下"）
+            # 直到 finalize 才出现、从不进 partial 流，等值校验把 4/9 的轮次挡在
+            # 门外，而尾词几乎都是语气助词——前缀已完整表达问题主体，答前缀≈答全句。
+            # 保护：缺失尾巴超过 MAX_SPEC_TAIL_CHARS 字不算命中（"……别/不要"这类
+            # 会翻转语义的真尾词通常更长，也更少见）。设 VOICE_SPEC_PREFIX_TAIL=0 关闭。
+            tail = len(transcript) - len(run.text)
+            if 0 < tail <= _prefix_tail_limit() and transcript.startswith(run.text):
+                self.spec_prefix_hits += 1
+                self.spec_last_reason = f"prefix_hit(tail={tail})"
+                return run
             reason = f"text_differs({run.text!r}!={transcript!r})"
         elif run.sentences == 0:
             reason = "no_sentence"
