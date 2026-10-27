@@ -149,6 +149,9 @@ async def test_stale_speculation_is_discarded_and_answer_is_correct():
 
     assert bill["spec_hit"] == 0.0, bill
     assert sched.spec_misses == 1
+    # 未命中轮也要有首句字数：这条出口（_fallback → _emit）曾漏设，
+    # 而慢轮恰恰全在这条路径上，那一列因此在最该分析的样本里恒 -1。
+    assert bill["tts_first_chars"] > 0, bill
     # 关键：没有对着过时的 partial 作答，最终答案基于正确全文
     assert llm.prompts[-1] == TRANSCRIPT
     assert said[-1] == TRANSCRIPT + "。"

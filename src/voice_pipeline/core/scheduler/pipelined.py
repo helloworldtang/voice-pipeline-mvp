@@ -508,6 +508,13 @@ class PipelinedScheduler:
 
     async def _emit(self, sentence: str, seq: int) -> AsyncIterator[TurnItem]:
         self._metrics.sentences += 1
+        if seq == 1:
+            # 未命中轮走这条出口（_fallback → _emit），而 _synth_into 里的同类赋值
+            # 只在投机期执行过、被 run_turn 开头的 reset_turn 清掉 ⇒ **慢的那一半
+            # 轮次**首句字数恒 -1（2026-10-27 真人 pipelined 5/10 实锤）。
+            # 与 _replay 的补记对齐：不补，则「首句字数↔口径B」的相关性恰好在
+            # 最该分析的那条路径上不可算。
+            self._metrics.tts_first_chars = len(sentence)
         yield TtsSentence(seq=seq, text=sentence)
         first_chunk = True
         warm = False
