@@ -10,6 +10,7 @@ from voice_pipeline.metrics.logging_ctx import (
     bind_trace_id,
     current_trace_id,
     install_trace_logging,
+    trace_id_of,
 )
 
 
@@ -26,12 +27,12 @@ def test_factory_injects_trace_id_into_every_record(caplog: pytest.LogCaptureFix
     with caplog.at_level(logging.WARNING):
         bind_trace_id("abc123")
         logging.getLogger("voice_pipeline.test").warning("hello")
-        assert caplog.records[-1].trace_id == "abc123"
+        assert trace_id_of(caplog.records[-1]) == "abc123"
 
         # 上下文切换后（换会话）同一工厂读新值——ContextVar 的意义就在这
         bind_trace_id("def456")
         logging.getLogger("voice_pipeline.test").warning("again")
-        assert caplog.records[-1].trace_id == "def456"
+        assert trace_id_of(caplog.records[-1]) == "def456"
 
 
 def test_install_is_idempotent() -> None:

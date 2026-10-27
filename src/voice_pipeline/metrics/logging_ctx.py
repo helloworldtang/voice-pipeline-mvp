@@ -48,6 +48,17 @@ def _factory(*args: object, **kwargs: object) -> logging.LogRecord:
     return record
 
 
+def trace_id_of(record: logging.LogRecord) -> str:
+    """读一条日志的 trace_id（自定义 handler / filter / 测试都走它）。
+
+    为什么不在调用处直接 `record.trace_id`：`LogRecord` 的类型定义里没有这个
+    属性（它是工厂在运行时注入的），mypy 会报 attr-defined。与其在每个调用点
+    加 ignore，不如把「这个属性是动态加的」这件事收在一个函数里。
+    """
+    value = record.__dict__.get("trace_id")
+    return value if isinstance(value, str) else NO_TRACE
+
+
 def install_trace_logging(level: int = logging.INFO, *, fmt: str = LOG_FORMAT) -> None:
     """装好 trace_id 注入 + 兜底的日志格式。**幂等，且只在没人配过时接管**。
 

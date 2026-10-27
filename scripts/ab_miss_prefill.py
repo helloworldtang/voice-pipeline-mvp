@@ -18,7 +18,6 @@ import argparse
 import asyncio
 import json
 import statistics
-import time
 from pathlib import Path
 
 from voice_pipeline.core.scheduler.pipelined import PipelinedScheduler
@@ -62,7 +61,7 @@ async def main_async(repeats: int, lead_ms: float, out: Path) -> None:
     llm = MlxLlm()
     llm.preload()  # load + Metal 编译不能算进第一轮
     rows: list[dict[str, object]] = []
-    for i in range(repeats):
+    for _i in range(repeats):
         row = await one_turn(llm, lead_ms)
         rows.append(row)
         print(json.dumps(row, ensure_ascii=False))
