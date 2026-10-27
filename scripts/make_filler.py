@@ -28,13 +28,19 @@ from datetime import datetime
 from pathlib import Path
 
 from voice_pipeline.core.filler import DEFAULT_FILLER_DIR
-from voice_pipeline.providers.tts.dashscope_tts import DEFAULT_MODEL, DEFAULT_VOICE, DashScopeTts
+from voice_pipeline.providers.tts.xfyun_tts import DEFAULT_VCN, XfyunTts
+
+# 音色必须与回答同源：filler（"我看看"）与真回答（讯飞 xiaoyan）若是两个声音，
+# 用户听感上就是"两个人在说话"（2026-10-27 验收反馈）。曾经用 DashScope 合成，
+# 回答切到讯飞后就分叉了。
 
 # 三条中性、短、互相不同：轮转着用，避免每条都是同一句。
 # ⚠️ 必须短：filler 与真回答走同一条 FIFO 下行，**比 TTS 首片（~650ms）长的 filler 会把
 # 真回答的「被听见起点」往后推**（2026-10-17 实测：1190ms 的片段把回答推后约 400ms）。
 # 目标是「搭话不占位」：片段结束前，真回答的首片已经就绪。
-DEFAULT_TEXTS = ("嗯。", "好的。", "我看看。")
+# 第三条曾是"我看看。"：DashScope 音色下 500ms 内，讯飞 xiaoyan 要 733ms
+# （提语速也只降到 644ms）——超上限会把真回答的出声推后，换"稍等。"。
+DEFAULT_TEXTS = ("嗯。", "好的。", "稍等。")
 # 片段时长上限（ms）：超过它 warning 并以非 0 退出（除非 --allow-long）——
 # 这不是美学约束，是上面那条 FIFO 的硬边界。
 DEFAULT_MAX_MS = 600.0
@@ -77,7 +83,7 @@ async def synth_all(
     texts: list[str], out: Path, *, max_ms: float, allow_long: bool
 ) -> list[dict[str, str]]:
     """在**同一个事件循环**里依次合成（SDK 的连接/回调绑 loop，见 probe_tts_firstchunk）。"""
-    tts = DashScopeTts()
+    tts = XfyunTts()  # 与回答同一引擎同一 vcn——音色统一是本脚本存在的隐性前提
     clips: list[dict[str, str]] = []
     for text in texts:
         pcm_raw = b"".join([chunk async for chunk in tts.synth(text)])
@@ -126,8 +132,8 @@ def main() -> None:
         json.dumps(
             {
                 "sample_rate": SAMPLE_RATE,
-                "model": DEFAULT_MODEL,
-                "voice": DEFAULT_VOICE,
+                "engine": "xfyun",
+                "voice": DEFAULT_VCN,
                 "ts": datetime.now().isoformat(timespec="seconds"),
                 "clips": clips,
             },
