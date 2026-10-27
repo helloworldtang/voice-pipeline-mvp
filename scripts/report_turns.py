@@ -213,7 +213,7 @@ def render(
                 "只是本机侧下界，不能当真实延迟报**（多半是起服务时缺 DASHSCOPE_API_KEY）。",
                 "",
             ]
-            if llm_engines - {"QwenLlm"}
+            if "SimLlm" in llm_engines
             else []
         ),
         "> 本文件由 `scripts/report_turns.py` 生成，数字全部来自落盘账单，未经人工修饰。",
