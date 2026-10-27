@@ -288,6 +288,10 @@ function stopMic() {
   state.micOn = false;
   $("mic").textContent = "开麦";
   $("mic").classList.remove("on");
+  // 关麦必须把状态带离「聆听中」——右上角对着一支已关的麦克风说"聆听中"
+  // 是误导（2026-10-27 验收反馈）。迟到的 turn.end/audio.stop 也不会再推进去
+  // （两处都按 micOn 分流）。
+  setState("", "已关麦——点「开麦」继续");
 }
 
 // ---- WS 事件 -----------------------------------------------------------------
@@ -335,7 +339,8 @@ function handleEvent(ev) {
         appendBreakdown(lastAssistantLi, m);
       }
       setChips(m);
-      setState("listening", "聆听中");
+      // 关麦后迟到的 turn.end：不再回到「聆听中」（麦克风已关，那是假状态）
+      setState(state.micOn ? "listening" : "", state.micOn ? "聆听中" : "已关麦——点「开麦」继续");
       break;
     }
     case "audio.stop":
@@ -347,7 +352,7 @@ function handleEvent(ev) {
         lat.textContent = "（被打断）";
         lastAssistantLi.appendChild(lat);
       }
-      setState("listening", "已打断，聆听中");
+      setState(state.micOn ? "listening" : "", state.micOn ? "已打断，聆听中" : "已关麦——点「开麦」继续");
       break;
     case "error":
       addLine("err", `错误 ${ev.code}: ${ev.message}`);
