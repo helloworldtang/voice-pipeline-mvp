@@ -116,18 +116,36 @@ def test_premature_eou_flagged_when_speech_resumes():
     assert det.premature_eou, "判停后窗口内又开口应记为抢话"
 
 
-def test_missed_eou_watchdog():
-    """漏判看门狗：用户**开过口**却始终没判停 → missed_eou=True。
+def test_missed_eou_on_fallback_cap():
+    """漏判的唯一信号：静音拖过兜底上限（档位阈值没拦住）。
 
-    `min_silence_ms` 故意设成 5s：让静音永远够不到档位阈值，只能由看门狗收尾。
+    `min_silence_ms` 故意设成 5s：档位阈值永远够不到，静音涨到
+    `max_silence_ms` 兜底才判停 → missed_eou=True。
+    （2026-10-28 复盘 83cc545：原看门狗「elapsed>max_wait 只打标记」含整个
+    说话时长，用户说得慢就被误标——8/15 个 500ms 正常判停全被标漏判。）
     """
-    det = FusedEou(gating=GatingMode.CONSERVATIVE, min_silence_ms=5000.0, max_wait_ms=400.0)
+    det = FusedEou(gating=GatingMode.CONSERVATIVE, min_silence_ms=5000.0)
     for _ in range(2):
         det.push_audio(_speech(100))  # 开过口——漏判以此为门槛
-    for _ in range(6):  # 越过 max_wait 仍未判停
+    for _ in range(25):  # 2500ms 静音：越过 2000ms 兜底，够不到 5000ms 档位
         det.push_audio(_silence(100))
-    assert not det.should_end(), "没到档位阈值就不该判停"
-    assert det.missed_eou, "说过话却判不出来，靠看门狗收尾 = 漏判"
+    assert det.should_end(), "兜底上限必须能收尾（否则链路卡死）"
+    assert det.missed_eou, "说过话却只能靠兜底收尾 = 漏判"
+
+
+def test_slow_speech_with_timely_stop_is_not_missed_eou():
+    """说得慢不等于漏判（2026-10-28 真人验收 8/15 假漏判的根因）：
+    整窗 elapsed 远超 max_wait，但静音一到档位阈值就正常判停 → 不记漏判。
+    """
+    det = FusedEou(gating=GatingMode.CONSERVATIVE, min_silence_ms=500.0, max_wait_ms=1000.0)
+    # 说 6s（含 <500ms 的小停顿——静音计数被话音重置，档位阈值够不到）
+    for _ in range(10):
+        det.push_audio(_speech(300))
+        det.push_audio(_silence(300))
+    for _ in range(5):  # 500ms 静音 → 档位阈值正常判停
+        det.push_audio(_silence(100))
+    assert det.should_end()
+    assert not det.missed_eou, "判停按档位阈值及时给出，elapsed 大不是漏判"
 
 
 def test_waiting_for_speech_is_not_missed_eou():

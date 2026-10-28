@@ -396,23 +396,23 @@ class FusedEou:
     def should_end(self) -> bool:
         if self._decided:
             return True
-        # 人声标记必须在看门狗判定**之前**打：否则「本帧才第一次出现人声」时
-        # 看门狗读到的是上一帧的旧值，漏判又记不上（写测试才暴露的顺序坑）。
+        # 人声标记必须先打：兜底判定要读它（「本帧才第一次出现人声」时读到旧值
+        # 就是又一次取值时机错位）。
         has_speech = isinstance(self._silence, VadSilenceEou) and self._silence.has_speech
         if has_speech:
             self._ever_speech = True
-        # 看门狗：用户**开过口**却始终没判停 → 漏判（由上层决定是否强制收尾）。
-        # ⚠️ 旧语义是「一直没等到人声也算漏判」，真人验收里被狠狠误导了一次：
-        # 用户照剧本读数秒才开口，等待时间越过 max_wait 就被记成漏判（7/10），
-        # 而每一轮的转写其实都拿到了——**等说话不是漏判**。故加 _ever_speech 门槛。
-        if self._elapsed > self.max_wait_ms and self._ever_speech:
-            self.missed_eou = True
         if not has_speech:
             return False
         sil = self._silence.silence_ms()
         if sil >= self.max_silence_ms:
-            # 静音拖到兜底上限才判停 = 判晚了（判停器没在档位阈值内判出来）
-            self.missed_eou = True
+            # 漏判的**唯一**信号：静音拖过兜底上限 = 档位阈值（远小于它）没拦住。
+            # `_ever_speech` 门槛：从没开过口的纯等待不算（等人说话不是漏判，
+            # 2026-10-27 真人验收 7/10 假漏判的根因）。
+            # ⚠️ 2026-10-28 复盘 83cc545：曾同时保留「elapsed>max_wait 只打标记」
+            # 的看门狗——但 elapsed 含整个说话时长，用户说得慢就被误标
+            # （8/15 个 500ms 正常判停全被标漏判），且它只打标记不参与判停，
+            # 标记语义无法兑现。删掉；真漏判由本兜底路径唯一负责。
+            self.missed_eou = self._ever_speech
             self._latch()
             return True
         if self.gating is GatingMode.CONSERVATIVE:
