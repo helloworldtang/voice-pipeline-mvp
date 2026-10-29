@@ -26,14 +26,14 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
-from .qwen_llm import build_messages
+from .qwen_llm import DEFAULT_SYSTEM, build_messages
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_MODEL = "mlx-community/Qwen2.5-1.5B-Instruct-4bit"
 MODEL_ENV = "VOICE_LLM_MLX_MODEL"
 SYSTEM_ENV = "VOICE_LLM_SYSTEM"
-DEFAULT_SYSTEM = "你是语音助手。回答要短，一句话说完，不要 markdown，不要用列表。直接给结论。"
+# DEFAULT_SYSTEM 从 qwen_llm 导入（云端/本地同一份：日期锚定与宣称类约束改一处即同步）
 
 # 进程内模型缓存：load 一次（1~3s），之后每轮共用
 _MODEL_CACHE: dict[str, tuple[Any, Any]] = {}

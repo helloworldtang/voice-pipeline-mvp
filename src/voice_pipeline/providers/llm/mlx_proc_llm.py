@@ -24,8 +24,7 @@ import time
 from collections.abc import AsyncIterator
 from typing import Any
 
-from .mlx_llm import DEFAULT_SYSTEM
-from .qwen_llm import build_messages
+from .qwen_llm import DEFAULT_SYSTEM, build_messages
 
 logger = logging.getLogger(__name__)
 

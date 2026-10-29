@@ -53,7 +53,8 @@ async def test_streams_chunks_and_keeps_system_and_history(monkeypatch: pytest.M
     llm = MlxLlm(model="test-model-a", system="SYS")
     chunks = [c async for c in llm.astream("天气", history=[{"role": "user", "content": "在吗"}])]
     assert "".join(chunks) == "今天晴。"
-    assert tok.seen[0] == {"role": "system", "content": "SYS"}
+    # system 原文在前、日期锚定行动态追加在后（qwen_llm.build_messages 的契约）
+    assert tok.seen[0]["content"].startswith("SYS\n今天的日期是")
     assert {"role": "user", "content": "在吗"} in tok.seen
     assert tok.seen[-1] == {"role": "user", "content": "天气"}
 

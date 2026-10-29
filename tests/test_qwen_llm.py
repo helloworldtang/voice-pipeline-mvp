@@ -108,9 +108,11 @@ def test_build_messages_inserts_history_between_system_and_user() -> None:
         {"role": "user", "content": "第一句问话"},
         {"role": "assistant", "content": "第一轮的回答。"},
     ]
-    messages = build_messages("系统提示", history, "第二句问话")
+    messages = build_messages(
+        "系统提示", history, "第二句问话", today_str="今天的日期是2026年10月29日。"
+    )
     assert messages == [
-        {"role": "system", "content": "系统提示"},
+        {"role": "system", "content": "系统提示\n今天的日期是2026年10月29日。"},
         {"role": "user", "content": "第一句问话"},
         {"role": "assistant", "content": "第一轮的回答。"},
         {"role": "user", "content": "第二句问话"},
@@ -118,14 +120,32 @@ def test_build_messages_inserts_history_between_system_and_user() -> None:
 
 
 def test_build_messages_without_history_is_first_turn() -> None:
-    assert build_messages("系统提示", None, "问话") == [
-        {"role": "system", "content": "系统提示"},
+    fixed = {"today_str": "今天的日期是2026年10月29日。"}
+    assert build_messages("系统提示", None, "问话", **fixed) == [
+        {"role": "system", "content": "系统提示\n今天的日期是2026年10月29日。"},
         {"role": "user", "content": "问话"},
     ]
-    assert build_messages("系统提示", [], "问话") == [
-        {"role": "system", "content": "系统提示"},
+    assert build_messages("系统提示", [], "问话", **fixed) == [
+        {"role": "system", "content": "系统提示\n今天的日期是2026年10月29日。"},
         {"role": "user", "content": "问话"},
     ]
+
+
+def test_build_messages_anchors_today_with_weekday() -> None:
+    """日期锚定（2026-10-10 真人验收实锤：问「今天几号」答 2024 年且被纠正仍坚持）。
+    锚定行追加在 system 末尾、不改原文；每次请求动态生成，跨午夜的长会话不会拿旧日期。"""
+    import datetime as dt
+
+    messages = build_messages("系统提示", None, "今天几号", today=dt.datetime(2026, 10, 29))
+    assert messages[0]["content"] == "系统提示\n今天的日期是2026年10月29日，星期四。"
+    # 不传 today 时用当前日期（只验结构，不验具体值——那是墙钟）
+    live = build_messages("系统提示", None, "问话")
+    assert "\n今天的日期是" in live[0]["content"]
+
+
+def test_default_system_forbids_claiming_actions() -> None:
+    """宣称类约束（真人验收：「我想订会议室」→答「已为您预订」，本仓无工具层）。"""
+    assert "不要声称已经完成" in DEFAULT_SYSTEM
 
 
 def test_build_messages_passes_history_verbatim() -> None:

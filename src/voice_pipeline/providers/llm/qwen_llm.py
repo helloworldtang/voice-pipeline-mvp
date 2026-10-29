@@ -23,6 +23,7 @@ null 又意味着空转。本类只取 `content`，于是「换成了推理模�
 
 from __future__ import annotations
 
+import datetime as dt
 import json
 import logging
 import os
@@ -41,7 +42,10 @@ DEFAULT_MODEL = "qwen-flash"
 # 语音助理口径：答案越短，首完整句到得越早——这直接压的是口径B 里 LLM 那一格。
 # 这是流程拆解后「唯一剩下的真实杠杆」（~79ms/字），所以必须能用环境变量
 # VOICE_LLM_SYSTEM 调——否则每次实验都要改代码。
-DEFAULT_SYSTEM = "你是语音助手。回答要短，一句话说完，不要 markdown，不要用列表。直接给结论。"
+DEFAULT_SYSTEM = (
+    "你是语音助手。回答要短，一句话说完，不要 markdown，不要用列表。直接给结论。"
+    "你不能代替系统执行预订、查询、发送等操作，不要声称已经完成它们，只能给建议。"
+)
 
 
 def _resolve_system(system: str | None) -> str:
@@ -77,15 +81,27 @@ def iter_content(lines: Iterable[str]) -> Iterator[str]:
 
 
 def build_messages(
-    system: str, history: list[dict[str, str]] | None, prompt: str
+    system: str,
+    history: list[dict[str, str]] | None,
+    prompt: str,
+    *,
+    today: dt.datetime | None = None,
+    today_str: str | None = None,
 ) -> list[dict[str, str]]:
-    """组装 messages：system + 历史轮次 + 本轮 user。
+    """组装 messages：system + 日期锚定行 + 历史轮次 + 本轮 user。
 
     抽成同步纯函数是为了在不联网的情况下测「历史插在 system 与 user 之间、原样透传」
     这条契约——history 的内容属于调用方（Session），这里不许增删改。
+
+    **日期锚定（2026-10-10 真人验收实锤的硬伤）**：模型不知道今天几号，问
+    「今天几号」答 2024 年且被纠正后仍坚持。锚定行**每次请求动态生成**并追加到
+    system 末尾——不改 system 原文（那是调用方/环境变量的内容），跨午夜的长会话
+    也不会拿着旧日期。`today`/`today_str` 仅供测试注入定值。
     """
+    now = today or dt.datetime.now()
+    anchor = today_str or f"今天的日期是{now:%Y年%m月%d日}，星期{'一二三四五六日'[now.weekday()]}。"
     return [
-        {"role": "system", "content": system},
+        {"role": "system", "content": f"{system}\n{anchor}"},
         *(history or []),
         {"role": "user", "content": prompt},
     ]
