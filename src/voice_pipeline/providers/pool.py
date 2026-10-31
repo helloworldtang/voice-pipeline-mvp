@@ -35,6 +35,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import os
 from collections.abc import Callable
@@ -192,6 +193,9 @@ class ProviderPool:
         self._shared = shared
         self._busy: set[int] = set()
         self._slots: dict[int, _Slot] = {}
+        # 仍在租约中的 real 租借：停机时 aclose 要能摸到它们（LLM 子进程等）
+        self._live_leases: set[ProviderLease] = set()
+        self._closed = False
         self.rejections = 0
 
     @property
@@ -248,6 +252,7 @@ class ProviderPool:
             slot=index,
             pool=self,
         )
+        self._live_leases.add(lease)
         return lease
 
     def _take_free_index(self) -> int | None:
@@ -264,3 +269,44 @@ class ProviderPool:
     def _free(self, lease: ProviderLease) -> None:
         if lease.slot is not None:
             self._busy.discard(lease.slot)
+            self._live_leases.discard(lease)
+        # 租借级 LLM 的生命周期到归还为止：MlxProcLlm 不 close 就子进程孤儿，
+        # 常驻吃 Metal + 内存（2026-11-01 审查缺陷 4）。QwenLlm/SimLlm/MlxLlm
+        # 没有 close（权重进程内共享，不随租借生死），getattr 落空即跳过。
+        close = getattr(lease.providers.llm, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.warning("LLM provider close 失败（忽略，不影响槽位归还）", exc_info=True)
+
+    async def aclose(self) -> None:
+        """停机收尾（幂等）：把仍带重资源的 provider 关干净。
+
+        两层：①未归还租借的租借级 LLM（连接取消可能晚于 lifespan；正常路径
+        release 已关，这里兜底）；②槽内重资产（讯飞 TTS 的 WS、未来其他
+        带 close/aclose 的槽内资源）。不收的代价：`VOICE_LLM_PROCESS=1` 时
+        MLX 子进程成孤儿常驻吃 Metal+内存（2026-11-01 审查缺陷 4）。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        for lease in list(self._live_leases):
+            close = getattr(lease.providers.llm, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
+        self._live_leases.clear()
+        for slot in self._slots.values():
+            tts = slot._tts  # noqa: SLF001  # 池与槽是同一个封装单元
+            if tts is None:
+                continue
+            aclose = getattr(tts, "aclose", None)
+            if callable(aclose):
+                with contextlib.suppress(Exception):
+                    await aclose()
+                continue
+            close = getattr(tts, "close", None)
+            if callable(close):
+                with contextlib.suppress(Exception):
+                    close()
