@@ -425,3 +425,33 @@ async def test_prefix_hit_rejects_long_tail() -> None:
     assert bill["spec_hit"] == 0.0, bill
     assert bill["spec_miss"] == 1.0
     assert "text_differs" in sched.spec_last_reason
+
+
+async def test_pending_debounce_timer_does_not_zombie_after_eou() -> None:
+    """EOU 入口必须收掉在途的 debounce 定时器（2026-11-01 审查缺陷 7）。
+
+    修前：末个 partial 与 EOU 同拍时定时器仍在飞，它会在 settle/abort/fallback
+    之后的某个 await 点补跑 _start_speculation——僵尸投机与 fallback 抢同一个
+    模型（MLX 子进程锁串行，fallback 首 token 排队变慢）。修后：EOU 入口立即
+    照常启动最后一次投机（命中机会不丢），定时器与待投文本一并清零。
+    """
+    llm = EchoLlm()
+    sched = PipelinedScheduler(
+        asr=_converged_asr(),
+        llm=llm,
+        tts=_tts(cpu_ms=0.0),
+        metrics=TurnMetrics(clock=SessionClock()),
+        debounce_ms=200.0,
+        grace_ms=200.0,
+    )
+    await sched.on_audio(FRAME)  # partial 变化 → 200ms debounce 定时器在途
+    timer_before = sched._timer
+    assert timer_before is not None, "测试前提：定时器确实在途"
+
+    items, bill = await _drain(sched)
+    timer_after = sched._timer
+    assert timer_after is None, "EOU 入口必须清掉在途定时器"
+    await asyncio.sleep(0.3)  # 跨过 debounce 死线：修前僵尸投机在这时补跑
+    assert len(llm.prompts) == 1, f"EOU 之后不许再起投机：{llm.prompts}"
+    # 收掉的定时器转为立即启动最后一次投机：收敛 partial 下应当命中
+    assert bill["spec_hit"] == 1.0, bill

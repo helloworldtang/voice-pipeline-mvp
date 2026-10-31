@@ -109,6 +109,8 @@ class PipelinedScheduler:
         self._task: asyncio.Task[None] | None = None
         self._run: SpecRun | None = None
         self._timer: asyncio.TimerHandle | None = None
+        # debounce 在途时待投机的文本：EOU 入口要用它立即补跑最后一次投机（见下）
+        self._pending_spec_text = ""
         self._last_partial = ""
         self._history = history
         # EOU 已经触发后，partial 前缀校验失效（final 才是权威）——见 _invalidate_if_stale。
@@ -144,11 +146,13 @@ class PipelinedScheduler:
         if self._timer is not None:
             self._timer.cancel()
             self.spec_aborts += 1
+        self._pending_spec_text = partial
         loop = asyncio.get_running_loop()
         self._timer = loop.call_later(self._debounce_ms / 1000.0, self._start_speculation, partial)
 
     def _start_speculation(self, text: str) -> None:
         self._timer = None
+        self._pending_spec_text = ""
         # 用户还在说：此刻预热 TTS 连接，建连那 ~260ms 藏在说话窗口里，
         # 不进口径B（与判停时那次预热互为兜底，幂等）。
         self._prewarm_tts()
@@ -297,6 +301,17 @@ class PipelinedScheduler:
     async def on_end_of_utterance(self) -> AsyncIterator[TurnItem]:
         # 判停即预热：没走过投机路径（partial 太短/被取消）时这是唯一一次预热机会
         self._prewarm_tts()
+        # 收掉在途的 debounce 定时器（2026-11-01 审查缺陷 7）：EOU 已成立，定时器
+        # 若还在飞，会在 settle/abort/fallback 之后的某个 await 点补跑
+        # _start_speculation——僵尸投机与 fallback 抢同一个模型（MLX 子进程锁串行，
+        # fallback 首 token 排队变慢）。修法：EOU 入口立即照常启动最后一次投机
+        # （命中机会不丢），定时器与待投文本一并清零。
+        if self._timer is not None:
+            self._timer.cancel()
+            self._timer = None
+            pending, self._pending_spec_text = self._pending_spec_text, ""
+            if pending:
+                self._start_speculation(pending)
         self._metrics.mark("utterance_end")
         yield TurnStart()
 
@@ -325,9 +340,12 @@ class PipelinedScheduler:
             self.spec_misses += 1
             self._abort_inflight_spec()
             if tr and root is not None:
+                # 哨兵与合法零值不许混用（2026-11-01 审查缺陷 8）：elapsed 恰为 0.0
+                # 时 `or -1.0` 会把真值吞成缺失。显式判 None。
+                elapsed = self._metrics.elapsed("utterance_end")
                 tr.record(
                     "spec.miss",
-                    self._metrics.elapsed("utterance_end") or -1.0,
+                    -1.0 if elapsed is None else elapsed,
                     self._metrics.clock.elapsed_ms(),
                     parent=root,
                     attrs={"reason": self.spec_last_reason},
@@ -342,13 +360,16 @@ class PipelinedScheduler:
         self._metrics.mark("turn_end")
         # 本轮收尾：放行下一轮说话期间的 partial 前缀校验。
         self._eou_done = False
+        # 哨兵与合法零值不许混用（2026-11-01 审查缺陷 8）：ready_ms 恰为 0.0 时
+        # `or -1.0` 会把真值吞成缺失。显式判 None。
+        ready_ms = run.ready_ms if run is not None else None
         yield TurnEnd(
             metrics={
                 **self._metrics.bill(),
                 "spec_hit": float(self.spec_hits),
                 "spec_miss": float(self.spec_misses),
                 "spec_prefix_hit": float(self.spec_prefix_hits),
-                "spec_ready_ms": round(run.ready_ms or -1.0, 3) if run else -1.0,
+                "spec_ready_ms": round(ready_ms, 3) if ready_ms is not None else -1.0,
             }
         )
 
@@ -560,6 +581,7 @@ class PipelinedScheduler:
         if self._timer is not None:
             self._timer.cancel()
             self._timer = None
+        self._pending_spec_text = ""
         if self._task is not None and not self._task.done():
             self._task.cancel()
         self._task = None
