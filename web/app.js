@@ -248,6 +248,9 @@ async function startMic() {
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
   });
+  // 必须把 stream 留在 state 里：关麦时要 track.stop() 释放系统麦克风——
+  // 只关 AudioContext 的话指示灯不灭、反复开关还会泄漏 track（2026-11-01 审查缺陷 6）
+  state.micStream = stream;
   const ctx = new AudioContext(); // 采集用原生采样率，worklet 里降到 16k
   state.micCtx = ctx;
   await ctx.audioWorklet.addModule("/downsample-worklet.js");
@@ -284,6 +287,10 @@ async function startMic() {
 }
 
 function stopMic() {
+  if (state.micStream) {
+    state.micStream.getTracks().forEach((t) => t.stop());
+    state.micStream = null;
+  }
   if (state.micCtx) { state.micCtx.close().catch(() => {}); state.micCtx = null; }
   state.micOn = false;
   $("mic").textContent = "开麦";
