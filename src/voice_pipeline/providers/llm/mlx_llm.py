@@ -43,6 +43,26 @@ def _resolve_model(model: str | None) -> str:
     return model or os.environ.get(MODEL_ENV) or DEFAULT_MODEL
 
 
+def _local_model_path(model: str) -> str | None:
+    """模型能**离线**加载（本地目录，或 HF 缓存已有完整快照）→ 返回路径；否则 None。
+
+    为什么不把 repo id 直接交给 `mlx_lm.load`：模型不在本地缓存时它会发起
+    **无超时的 Hub 网络探测**（huggingface_hub 的 etag 请求），断网/直连不通的
+    机器上 preload 卡死在 executor 线程——2026-11-01 审查实锤：executor 线程永不
+    退出，TestClient 收尾 `executor.shutdown(wait=True)` join 不到，整套门禁 30s
+    超时；生产上则表现为会话建好、首轮永远不出字。本仓纪律是「缺了要响亮失败」：
+    指到 fetch 命令离线拉好再启动，不在会话路径上偷偷下载。
+    """
+    if os.path.isdir(model):
+        return model
+    try:
+        from huggingface_hub import snapshot_download
+
+        return snapshot_download(model, local_files_only=True)
+    except Exception:  # noqa: BLE001 - 不在缓存/缺 hub 依赖 → 一律按「不在本地」处理
+        return None
+
+
 def _apply_template(tokenizer: Any, messages: list[dict[str, str]]) -> Any:
     """套聊天模板，并**关掉思考链**。
 
@@ -107,7 +127,18 @@ class MlxLlm:
         if cached is None:
             from mlx_lm import load  # 延迟导入：缺依赖只在真正用本地时炸
 
-            loaded = load(self.model)
+            local = _local_model_path(self.model)
+            if local is None:
+                msg = (
+                    f"本地 LLM 模型不在缓存里：{self.model}。不在会话路径上无超时联网"
+                    "下载（断网即挂死），先离线拉好再启动：\n"
+                    "  uv run --with modelscope python scripts/fetch_model.py --repo "
+                    f"{self.model}\n"
+                    f"  VOICE_LLM_MLX_MODEL=<上条打印的路径>  # 或改 DASHSCOPE_API_KEY / "
+                    "VOICE_LLM_ENGINE=sim"
+                )
+                raise RuntimeError(msg)
+            loaded = load(local)
             # 新版 mlx-lm 的 load 可能带第三元素（default generation kwargs），只留前两个
             cached = (loaded[0], loaded[1])
             _MODEL_CACHE[self.model] = cached

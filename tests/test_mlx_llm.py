@@ -15,7 +15,8 @@ from typing import Any
 
 import pytest
 
-from voice_pipeline.providers.llm.mlx_llm import MlxLlm
+import voice_pipeline.providers.llm.mlx_llm as mlx_llm_mod
+from voice_pipeline.providers.llm.mlx_llm import MlxLlm, _local_model_path
 
 
 class _FakeTokenizer:
@@ -40,6 +41,9 @@ def _install(monkeypatch: pytest.MonkeyPatch, generate: Callable[..., Any]) -> _
     fake.load = lambda model: ("MODEL", tok)  # type: ignore[attr-defined]
     fake.stream_generate = generate  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, "mlx_lm", fake)
+    # 2026-11-01 新纪律：repo id 不在本地缓存时不许联网（见 _local_model_path）。
+    # 契约测试统一假装「模型已在本地」，路径解析本身的行为在下面单测。
+    monkeypatch.setattr(mlx_llm_mod, "_local_model_path", lambda model: f"/fake/models/{model}")
     return tok
 
 
@@ -83,3 +87,64 @@ async def test_generation_error_surfaces_after_partial_output(
         async for chunk in llm.astream("x"):
             got.append(chunk)
     assert got == ["半句"]
+
+
+# ---- 模型解析：本地缓存优先，绝不联网（2026-11-01 门禁挂死实锤的回归钉） ----
+
+
+def test_local_model_path_prefers_existing_dir(tmp_path: Any) -> None:
+    assert _local_model_path(str(tmp_path)) == str(tmp_path)
+
+
+def test_local_model_path_offline_cache_check_never_goes_to_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """repo id 不在缓存 → 返回 None；且对 hub 只允许 `local_files_only=True` 的查询。
+
+    修前的事故：`mlx_lm.load(repo_id)` 在未缓存时发无超时的 etag 网络请求，
+    executor 线程永不退出，TestClient 收尾 join 不到 → 整套门禁 30s 超时。
+    """
+
+    class _FakeHub:
+        calls: list[bool] = []
+
+        @staticmethod
+        def snapshot_download(repo_id: str, local_files_only: bool = False) -> str:
+            _FakeHub.calls.append(local_files_only)
+            raise RuntimeError("simulated: not in cache / offline")
+
+    monkeypatch.setitem(sys.modules, "huggingface_hub", _FakeHub)
+    assert _local_model_path("mlx-community/__never_cached_test__") is None
+    assert _FakeHub.calls == [True]
+
+
+def test_missing_model_fails_loudly_with_fetch_hint(monkeypatch: pytest.MonkeyPatch) -> None:
+    """未缓存 → 响亮失败，报错里带 fetch 命令；绝不走到 load / 网络。"""
+    fake = types.ModuleType("mlx_lm")
+
+    def _no_load(model: Any) -> None:
+        raise AssertionError("模型不在本地时不许调 load")
+
+    fake.load = _no_load  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake)
+    monkeypatch.setattr(mlx_llm_mod, "_local_model_path", lambda model: None)
+    llm = MlxLlm(model="test-model-not-cached")
+    with pytest.raises(RuntimeError, match="fetch_model.py"):
+        llm._ensure()
+
+
+async def test_astream_surfaces_missing_model_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """astream 路径同样响亮失败：缺模型不许静默挂住首轮。"""
+    fake = types.ModuleType("mlx_lm")
+    fake.stream_generate = lambda *a, **k: iter(())  # type: ignore[attr-defined]  # import 要能过
+
+    def _no_load(model: Any) -> None:
+        raise AssertionError("模型不在本地时不许调 load")
+
+    fake.load = _no_load  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "mlx_lm", fake)
+    monkeypatch.setattr(mlx_llm_mod, "_local_model_path", lambda model: None)
+    llm = MlxLlm(model="test-model-not-cached")
+    with pytest.raises(RuntimeError, match="fetch_model.py"):
+        async for _ in llm.astream("x"):
+            pass
