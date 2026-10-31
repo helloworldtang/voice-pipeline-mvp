@@ -37,18 +37,21 @@ class Entry:
 
 
 class OutboundQueue:
-    """双车道下行队列：杀停道无界优先；主道严格保序、音频有界丢最旧并计数。"""
+    """双车道下行队列：杀停道无界优先；主道严格保序、音频与事件各自有界丢最旧并计数。"""
 
-    def __init__(self, max_audio_frames: int = 200) -> None:
+    def __init__(self, max_audio_frames: int = 200, max_event_frames: int = 400) -> None:
         self._kill = deque[Entry]()  # audio.stop 等「晚到不如早到」的帧
         self._main = deque[Entry]()  # 其余一切，含音频
         self._audio_in_main = 0
+        self._event_in_main = 0
         self._max_audio = max_audio_frames
+        self._max_events = max_event_frames
         self._event = asyncio.Event()
         self._unfinished = 0
         self._drained = asyncio.Event()
         self._drained.set()
         self.dropped_audio = 0
+        self.dropped_events = 0
 
     # ---- 生产（多协程安全：同一事件循环内无 await，天然原子） -----------------
 
@@ -57,8 +60,28 @@ class OutboundQueue:
         self._put(self._kill, Entry(text, kill=True))
 
     def put_event(self, text: str) -> None:
-        """保序事件（turn.end / session.closed / 转写流）。"""
+        """保序事件（turn.end / session.closed / 转写流）。事件道同样有界。
+
+        为什么事件也要有界（2026-11-01 审查缺陷 5）：背压原本只丢音频，
+        sender 被半开连接/慢客户端堵住时事件无限积压——每轮 turn.start/final/
+        sentence/end 各一条，长会话慢漏气。丢最旧并计数；客户端既然收不动，
+        最旧的事件对它也没有价值。
+        """
+        if self._event_in_main >= self._max_events:
+            for i, entry in enumerate(self._main):
+                if entry.data is None:  # 找主道里最旧的一个**事件**单元原地删除
+                    del self._main[i]
+                    self._event_in_main -= 1
+                    self.dropped_events += 1
+                    self._unfinished -= 1
+                    break
+            logger.warning(
+                "下行事件积压超限（≥%s 条），丢弃最旧事件（累计 %s）",
+                self._max_events,
+                self.dropped_events,
+            )
         self._put(self._main, Entry(text))
+        self._event_in_main += 1
 
     def put_audio(self, notice: str, data: bytes) -> None:
         """音频对（audio.chunk JSON + PCM）。主道积压超限时丢**最旧的音频对**
@@ -103,6 +126,8 @@ class OutboundQueue:
                 entry = self._main.popleft()
                 if entry.data is not None:
                     self._audio_in_main -= 1
+                else:
+                    self._event_in_main -= 1
                 return entry
             self._event.clear()
             await self._event.wait()
@@ -122,3 +147,21 @@ class OutboundQueue:
 
     def qsize(self) -> tuple[int, int]:
         return len(self._kill), len(self._main)
+
+    def drop_all(self) -> int:
+        """清空两车道（sender 异常死亡时的止损）：返回丢弃条数。
+
+        sender 死了就没人消费，`join` 会永挂、SessionEnd 收尾会卡死。
+        清空后 `_unfinished` 归零、`_drained` 置位，join 立刻可完成——调用方
+        （app 的 sender 异常分支）随后走正常关闭，槽位由 finally 归还。
+        """
+        n = self._unfinished
+        self._kill.clear()
+        self.dropped_audio += self._audio_in_main
+        self.dropped_events += self._event_in_main
+        self._main.clear()
+        self._audio_in_main = 0
+        self._event_in_main = 0
+        self._unfinished = 0
+        self._drained.set()
+        return n

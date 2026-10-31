@@ -7,14 +7,17 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import time
+from collections.abc import AsyncIterator, Callable
 
 import pytest
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+import voice_pipeline.providers.pool as pool_mod
 from voice_pipeline.config import Settings
 from voice_pipeline.providers.asr.sim_asr import SimAsr
+from voice_pipeline.providers.llm.sim_llm import SimLlm
 from voice_pipeline.providers.pool import (
     DEFAULT_MAX_SESSIONS,
     ProviderLease,
@@ -23,7 +26,7 @@ from voice_pipeline.providers.pool import (
 )
 from voice_pipeline.providers.tts.sim_tts import SimTts
 from voice_pipeline.server.app import create_app
-from voice_pipeline.server.protocol import SessionBegin
+from voice_pipeline.server.protocol import SessionBegin, SessionEnd
 
 
 @pytest.fixture
@@ -143,15 +146,181 @@ async def test_two_sessions_do_not_deadlock_each_other(light: Callable[..., Prov
             lease.release()
 
 
+class _ClosableLlm(SimLlm):
+    """带 close 计数的替身：MlxProcLlm 的子进程不 close 就孤儿（审查缺陷 4）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+
+
+class _HangingLlm(SimLlm):
+    """先吐半句再永久挂住的替身：把一轮吊在 LLM 上，供「收掉旧轮」验证。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = False
+        self.cancelled = False
+
+    async def astream(
+        self, prompt: str, history: list[dict[str, str]] | None = None
+    ) -> AsyncIterator[str]:
+        self.started = True
+        try:
+            yield "半句"
+            await asyncio.Event().wait()  # 挂住：模拟一次生成很久的轮次，直到被取消
+        except asyncio.CancelledError:
+            self.cancelled = True
+            raise
+
+
+def test_mode_switch_cancels_running_turn(
+    light: Callable[..., ProviderPool], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """换模式必须先收掉在跑的旧轮（2026-11-01 审查缺陷 1）。
+
+    修前：SessionBegin 只 cancel pump_task，旧轮任务句柄被覆盖——它拿着已归还/
+    将被复用的槽资源继续推理，与新会话抢算力，finally 也收不掉它。
+    """
+    stub = _HangingLlm()
+    monkeypatch.setattr(pool_mod, "build_llm", lambda *a, **k: stub)
+
+    class _InstantEou:
+        """should_end 恒真：第一帧音频就判停，立刻起一轮——把轮次吊在 LLM 上。"""
+
+        def push_audio(self, chunk: bytes) -> None: ...
+
+        def update_text(self, text: str) -> None: ...
+
+        def should_end(self) -> bool:
+            return True
+
+        def reset(self) -> None: ...
+
+        def unlatch(self) -> None: ...
+
+    import voice_pipeline.server.session as session_mod
+
+    monkeypatch.setattr(session_mod, "build_eou", lambda gating: _InstantEou())
+
+    client = TestClient(create_app(Settings(max_sessions=1)))
+    with client.websocket_connect("/ws") as ws:
+        ws.receive_json()  # 首帧 ready（默认 serial）
+        ws.send_text(SessionBegin(mode="real").model_dump_json())
+        assert ws.receive_json()["type"] == "session.ready"
+        # 一帧有声音频：能量门放行 → ASR 出字 → _InstantEou 即刻判停 → 起一轮，吊在 LLM
+        ws.send_bytes(b"\x00\x40")
+        deadline = time.monotonic() + 5.0
+        while not stub.started and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert stub.started, "轮次没进 LLM，测试前提不成立"
+
+        # 换模式：旧轮必须被取消，且新会话照常建好
+        ws.send_text(SessionBegin(mode="echo").model_dump_json())
+        while True:
+            msg = ws.receive_json()
+            if msg["type"] == "session.ready":
+                break
+        assert stub.cancelled, "换模式后旧轮必须被取消，不许拿着槽资源继续算"
+
+
+def test_turn_failure_reaches_client_as_error_frame(monkeypatch: pytest.MonkeyPatch) -> None:
+    """一轮生成异常必须让客户端知道（2026-11-01 审查缺陷 3）。
+
+    修前：run_turn 的任务异常无人取——客户端收不到 turn.end 也不知道为什么。
+    修后：守卫接住异常、下发 error(turn_failed)，会话照常收尾（closed 照发）。
+    """
+
+    class _RaisingLlm(SimLlm):
+        async def astream(
+            self, prompt: str, history: list[dict[str, str]] | None = None
+        ) -> AsyncIterator[str]:
+            raise RuntimeError("llm boom")
+            yield ""  # type: ignore[unreachable]  # pragma: no cover —— 让它成为异步生成器
+
+    monkeypatch.setattr(pool_mod, "SimLlm", _RaisingLlm)  # sim 租借从这里取 LLM
+    client = TestClient(create_app())
+    with client.websocket_connect("/ws") as ws:
+        ws.receive_json()  # 首帧 ready（连接初始会话，LLM 来自 factory）
+        # 显式 begin：租借路径的 LLM 从 pool_mod.SimLlm 取（被 patch 的那个）
+        ws.send_text(SessionBegin(mode="serial").model_dump_json())
+        assert ws.receive_json()["type"] == "session.ready"
+        ws.send_text(SessionEnd().model_dump_json())
+        # error 帧由守卫直发（不经过下行队列），可能抢在 turn.start/asr.final 之前到，
+        # 所以断言不依赖顺序：error(turn_failed) 与 session.closed 都要出现。
+        seen: list[dict[str, object]] = []
+        while True:
+            msg = ws.receive_json()
+            seen.append(msg)
+            if msg["type"] == "session.closed" or len(seen) > 20:
+                break
+        assert any(m.get("code") == "turn_failed" for m in seen), f"缺少 error 帧：{seen}"
+        assert seen[-1]["type"] == "session.closed", f"异常后会话生命周期仍要闭环：{seen}"
+
+
+async def test_release_closes_lease_level_llm(
+    light: Callable[..., ProviderPool], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """租借归还时必须关掉租借级 LLM：`VOICE_LLM_PROCESS=1` 下不 close 的
+    MlxProcLlm 子进程常驻吃 Metal+内存（2026-11-01 审查缺陷 4）。
+    QwenLlm/SimLlm/MlxLlm 没有 close——getattr 落空跳过，权重进程内共享不随租借生死。"""
+    closable = _ClosableLlm()
+    monkeypatch.setattr(pool_mod, "build_llm", lambda *a, **k: closable)
+    pool = light(1)
+    lease = await pool.acquire("real")
+    assert lease is not None
+    assert closable.close_calls == 0, "租着的时候不该被关"
+    lease.release()
+    assert closable.close_calls == 1
+    lease.release()  # 幂等：重复归还不能重复关
+    assert closable.close_calls == 1
+
+
+async def test_aclose_closes_live_lease_and_slot_tts(
+    light: Callable[..., ProviderPool], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """停机收尾：未归还租借的 LLM 与槽内 TTS（aclose/close）都要被关，且幂等。"""
+    closable = _ClosableLlm()
+    monkeypatch.setattr(pool_mod, "build_llm", lambda *a, **k: closable)
+    pool = light(1)
+    lease = await pool.acquire("real")
+    assert lease is not None and lease.slot is not None
+
+    class _TtsWithAclose:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def aclose(self) -> None:
+            self.calls += 1
+
+    tts = _TtsWithAclose()
+    pool._slots[lease.slot]._tts = tts  # type: ignore[assignment]  # noqa: SLF001
+
+    await pool.aclose()
+    assert closable.close_calls == 1, "停机时仍连着的会话，其 LLM 也要收"
+    assert tts.calls == 1, "槽内 TTS 的 aclose 必须被调"
+    await pool.aclose()  # 幂等：重复收尾不重复关
+    assert closable.close_calls == 1
+    assert tts.calls == 1
+
+
 @pytest.mark.skipif(
     not __import__("pathlib").Path("models/asr-zipformer/joiner.int8.onnx").is_file(),
     reason="real models not downloaded",
 )
-def test_overloaded_ws_connection_is_rejected_not_queued() -> None:
+def test_overloaded_ws_connection_is_rejected_not_queued(monkeypatch: pytest.MonkeyPatch) -> None:
     """WS 层：满载后第 N+1 路必须收到明确的 session_limit + 1013。
 
     这是判据 9 的另一半——capacity 的一半是容量管理，另一半是**拒绝要说出来**。
+
+    ⚠️ LLM 引擎钉在 sim：本测与 LLM 无关，而 auto 会因缺 key 降级 MlxLlm——
+    修前它 preload 时对未缓存模型发无超时的 Hub 网络请求，断网机器上
+    executor 线程永不退出，TestClient 收尾 join 不到 → 30s 超时（2026-11-01 审查）。
     """
+    monkeypatch.setenv("VOICE_LLM_ENGINE", "sim")
     client = TestClient(create_app(Settings(max_sessions=1)))
     with client.websocket_connect("/ws") as first:
         first.receive_json()

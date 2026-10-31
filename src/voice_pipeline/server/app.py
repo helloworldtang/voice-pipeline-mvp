@@ -54,6 +54,10 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_WEB_DIR = Path(__file__).resolve().parents[3] / "web"
 
+# SessionEnd 收尾时等两级队列排空的兜底超时：排不空多半是 sender 已死（异常分支
+# 会 drop_all）或极端慢客户端——继续等就是连接挂死、槽位悬空，不如放充尾巴关连接。
+_DRAIN_TIMEOUT_S = 5.0
+
 
 def create_app(settings: Settings | None = None) -> FastAPI:
     cfg = settings or Settings()
@@ -63,6 +67,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @asynccontextmanager
     async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         yield
+        # 停机收尾：把带重资源的 provider 关干净——MlxProcLlm 的子进程不 terminate
+        # 就是孤儿（常驻吃 Metal+内存，2026-11-01 审查缺陷 4），讯飞 TTS 的 WS 同理。
+        await pool.aclose()
 
     app = FastAPI(title="voice-pipeline", version="0.2.0", lifespan=lifespan)
     app.state.settings = cfg
@@ -120,6 +127,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     outbox.task_done()
             except asyncio.CancelledError:
                 return
+            except Exception:
+                # 静默死亡的下场：outbox.join() 永挂、SessionEnd 收尾卡死、槽位悬空
+                # （2026-11-01 审查缺陷 3）。丢弃残余保证 join 可完成，调用方的下一次
+                # send 会抛错并走 finally 关闭连接。
+                logger.exception("pump 分类协程异常退出，丢弃队列残余（join 保底可完成）")
+                while True:
+                    try:
+                        outbox.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    outbox.task_done()
 
         async def sender() -> None:
             """唯一常驻发送协程：从 tx 取发送单元下发（音频对原子发送）。"""
@@ -142,6 +160,29 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     tx.task_done()
             except asyncio.CancelledError:
                 return
+            except Exception:
+                # 半开连接/异常帧会让 send 抛非 CancelledError 的异常；不接住就是
+                # 静默死亡 → tx.join() 永挂、槽位悬空到断连（2026-11-01 审查缺陷 3）。
+                # drop_all 清空两车道让 join 立刻可完成；接收循环的下一次 send 会
+                # 抛错并走 finally 关闭。
+                logger.exception("sender 发送协程异常退出，丢弃下行队列残余")
+                tx.drop_all()
+
+        def spawn_run_turn() -> asyncio.Task[None]:
+            """后台跑一轮的唯一起点：异常必须接住——不接住则任务静默死亡，
+            客户端等不到 turn.end 也不知道为什么（2026-11-01 审查缺陷 3）。"""
+
+            async def _guarded() -> None:
+                try:
+                    await session.run_turn()
+                except Exception:
+                    logger.exception("一轮生成异常退出（trace=%s）", session.trace_id)
+                    with contextlib.suppress(Exception):
+                        await websocket.send_text(
+                            dump_event(ErrorEvent(code="turn_failed", message="生成失败，本轮中止"))
+                        )
+
+            return asyncio.create_task(_guarded())
 
         pump_task = asyncio.create_task(pump(session.outbox))
         sender_task = asyncio.create_task(sender())
@@ -159,7 +200,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     # 播放期间的新帧已在 on_audio 内做 barge-in 检测并往 outbox 投 AudioStop；
                     # real 模式下 EOU 判停触发即自动起一轮（不依赖客户端 session.end）。
                     if not session._turn_running and session.pending_end():
-                        turn_task = asyncio.create_task(session.run_turn())
+                        turn_task = spawn_run_turn()
                     continue
 
                 text = message.get("text")
@@ -188,6 +229,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         )
                         await websocket.close(code=1008)
                         return
+                    # 换模式前先收掉旧轮：句柄马上要被覆盖，不收的话旧轮拿着已归还/
+                    # 将被复用的槽资源继续推理，与新会话抢算力，finally 也收不掉它
+                    # （2026-11-01 审查缺陷 1）。cancel 后要等它退出——finish() 内部
+                    # 吞 CancelledError（作废在飞投机的预期路径），await 返回即干净。
+                    if turn_task is not None and not turn_task.done():
+                        turn_task.cancel()
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            await turn_task
+                    turn_task = None
                     # 借本地推理资源（real 系列才占槽）。先还旧的再借新的：同一条连接
                     # 换模式不该同时占两个名额——在 capacity=2 的机器上，自己占着自己
                     # 去申请第二个，会被自己挤到拒绝。
@@ -248,7 +298,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     # 则不重复），然后回 session.closed 并关闭连接。real 模式持续对话时不靠
                     # 这个，靠 EOU 自动判停。
                     if not session._turn_running:
-                        turn_task = asyncio.create_task(session.run_turn())
+                        turn_task = spawn_run_turn()
                     if turn_task is not None:
                         with contextlib.suppress(asyncio.CancelledError):
                             await turn_task
@@ -257,7 +307,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     # 队列排空再收尾——否则 break 后的 finally 会 cancel 两个协程，
                     # 剩余事件（含 turn.end）永远到不了客户端，测试/客户端就卡在等 turn.end。
                     # closed 走保序事件道（排在残余音频之后），不抢道。
-                    await session.outbox.join()
+                    # wait_for 是兜底不是主路径：排不空说明 sender/pump 已死（异常分支
+                    # 会 drop_all）或极端慢客户端——等下去就是连接挂死、槽位悬空，
+                    # 不如放充尾巴关连接（2026-11-01 审查缺陷 3）。
+                    await asyncio.wait_for(session.outbox.join(), timeout=_DRAIN_TIMEOUT_S)
                     tx.put_event(
                         dump_event(
                             SessionClosed(
@@ -266,7 +319,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                             )
                         )
                     )
-                    await tx.join()
+                    await asyncio.wait_for(tx.join(), timeout=_DRAIN_TIMEOUT_S)
                     break
 
                 if isinstance(frame, PlaybackReport):

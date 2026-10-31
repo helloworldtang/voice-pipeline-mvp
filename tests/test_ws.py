@@ -32,6 +32,24 @@ def test_healthz() -> None:
     assert client.get("/healthz").json() == {"status": "ok"}
 
 
+def test_lifespan_closes_pool_on_shutdown(monkeypatch: Any) -> None:
+    """停机时 lifespan 必须调 pool.aclose()（2026-11-01 审查缺陷 4）：
+    `VOICE_LLM_PROCESS=1` 的 MLX 子进程不 terminate 就是孤儿，常驻吃 Metal+内存。"""
+    from voice_pipeline.config import Settings
+
+    app = create_app(Settings())
+    pool = app.state.pool
+    calls: list[int] = []
+
+    async def _spy() -> None:
+        calls.append(1)
+
+    monkeypatch.setattr(pool, "aclose", _spy)
+    with TestClient(app):
+        assert calls == [], "运行中不该收尾"
+    assert calls == [1], "停机时必须收尾池内的重资源"
+
+
 def test_ws_handshake_then_echo_audio() -> None:
     with TestClient(create_app()).websocket_connect("/ws") as ws:
         ws.receive_json()  # 首帧_ready（默认 serial）
