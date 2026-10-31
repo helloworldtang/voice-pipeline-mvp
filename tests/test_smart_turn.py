@@ -117,6 +117,43 @@ def test_build_eou_falls_back_without_weights(
     assert eou.neural is None
 
 
+# ---- 模型路径解析（2026-11-01 审查缺陷 2 的回归钉） ------------------------
+
+
+def test_default_model_path_is_cwd_independent(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """默认路径必须与 CWD 无关：原先 CWD 相对路径在非仓根启动时静默丢掉神经档
+    （生产靠 systemd 的 WorkingDirectory 侥幸没踩中）。"""
+    from voice_pipeline.providers.eou.smart_turn import default_model_path
+
+    monkeypatch.delenv("VOICE_MODEL_ROOT", raising=False)
+    monkeypatch.chdir(tmp_path)  # 换到任意目录，解析结果不变
+    p = default_model_path()
+    assert p.is_absolute()
+    assert p.parts[-3:] == ("models", "eou", "smart-turn-v3.2-cpu.onnx")
+
+
+def test_model_root_env_overrides_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """部署可把模型挂到任意目录：VOICE_MODEL_ROOT 与 sherpa.py 同一套约定。"""
+    from voice_pipeline.providers.eou.smart_turn import default_model_path
+
+    monkeypatch.setenv("VOICE_MODEL_ROOT", str(tmp_path / "deploy-models"))
+    p = default_model_path()
+    assert p == tmp_path / "deploy-models" / "eou" / "smart-turn-v3.2-cpu.onnx"
+
+
+def test_missing_weights_error_names_the_path_and_envs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """缺权重的报错要能直接照着修：给全试过的路径与两个环境变量名。"""
+    from voice_pipeline.providers.eou.smart_turn import SmartTurnEou
+
+    monkeypatch.setenv("SMART_TURN_ONNX", str(tmp_path / "nope.onnx"))
+    with pytest.raises(FileNotFoundError, match="SMART_TURN_ONNX.*VOICE_MODEL_ROOT"):
+        SmartTurnEou(sample_rate=16000)
+
+
 def test_official_clip_probability_separates_end_from_pause() -> None:
     """端到端自检：官方测试集上，句末样本的概率应显著高于句中停顿样本。
 

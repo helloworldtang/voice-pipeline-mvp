@@ -29,8 +29,23 @@ from voice_pipeline.core.eou_mel import (
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL_PATH = Path("models/eou/smart-turn-v3.2-cpu.onnx")
+# 模型定位与 sherpa.py 同一套约定：模块相对定位 + VOICE_MODEL_ROOT 部署覆盖。
+# 2026-11-01 审查缺陷 2：原先 DEFAULT_MODEL_PATH 是 CWD 相对（"models/eou/..."）——
+# 非仓根启动（systemd 没设 WorkingDirectory、docker 外的任何方式）找不到权重，
+# factory 静默降回 conservative，神经档的账单数字混成启发式数字。生产没踩中
+# 纯属 deploy/voice-pipeline.service 设了 WorkingDirectory，是运气不是约定。
+_DEFAULT_MODEL_ROOT = Path(__file__).resolve().parents[4] / "models"
+MODEL_ROOT_ENV = "VOICE_MODEL_ROOT"
+DEFAULT_MODEL_RELPATH = Path("eou/smart-turn-v3.2-cpu.onnx")
 MODEL_PATH_ENV = "SMART_TURN_ONNX"
+
+
+def default_model_path() -> Path:
+    """权重默认落点：仓库模型根（或 VOICE_MODEL_ROOT 覆盖）下的 eou/ 子目录。"""
+    root = os.environ.get(MODEL_ROOT_ENV)
+    return (Path(root) if root else _DEFAULT_MODEL_ROOT) / DEFAULT_MODEL_RELPATH
+
+
 DEFAULT_THRESHOLD = 0.5
 
 
@@ -65,11 +80,11 @@ class SmartTurnEou:
         self.min_speech_ms = min_speech_ms
         self.energy_floor = energy_floor
 
-        path = Path(model_path or os.environ.get(MODEL_PATH_ENV) or DEFAULT_MODEL_PATH)
+        path = Path(model_path or os.environ.get(MODEL_PATH_ENV) or default_model_path())
         if not path.exists():
             msg = (
                 f"Smart Turn 权重不存在: {path} —— 先下载 pipecat-ai/smart-turn-v3.2-cpu.onnx "
-                f"（或设 {MODEL_PATH_ENV}）"
+                f"（scripts/fetch_eou_model.py，或设 {MODEL_PATH_ENV} / {MODEL_ROOT_ENV}）"
             )
             raise FileNotFoundError(msg)
         self.model_path = path

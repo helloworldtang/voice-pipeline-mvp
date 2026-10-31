@@ -109,3 +109,73 @@ def test_pcm_helpers_roundtrip() -> None:
     samples = np.array([0.0, 0.5, -0.5, 1.0, -1.0], dtype=np.float32)
     decoded = mod._decode(base64.b64encode(mod._encode(samples)).decode())
     assert np.allclose(decoded, samples, atol=1e-4)
+
+
+# ---- 首片前失败冷重试（2026-11-01 审查缺陷 8） --------------------------------
+
+
+class _ScriptedWS:
+    """recv 按剧本走的假连接：事件用尽/遇异常即抛。"""
+
+    def __init__(self, events: list[object]) -> None:
+        self._events = list(events)
+        self.closed = False
+
+    async def send(self, payload: object) -> None: ...
+
+    async def recv(self) -> str:
+        if not self._events:
+            raise TimeoutError("recv timeout")
+        ev = self._events.pop(0)
+        if isinstance(ev, Exception):
+            raise ev
+        assert isinstance(ev, str)
+        return ev
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+def _audio_event(status: int) -> str:
+    # 1600 样本（100ms）：soxr 流式重采样的滤波器 warmup 会吃掉整个首块——
+    # 10ms 的事件产不出任何 chunk（out.size==0），剧本会失真。
+    pcm16 = (np.ones(1600, dtype=np.float32) * 0.25).astype("<i2").tobytes()
+    import json as _json
+
+    return _json.dumps(
+        {"code": 0, "data": {"audio": base64.b64encode(pcm16).decode(), "status": status}}
+    )
+
+
+async def test_retry_once_before_first_chunk(
+    tts: XfyunTts, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """首连在首片前失败（recv 超时）→ 冷重试一次，整句不再无声。"""
+    conns = [_ScriptedWS([]), _ScriptedWS([_audio_event(status=2)])]
+
+    async def fake_take() -> _ScriptedWS:
+        return conns.pop(0)
+
+    monkeypatch.setattr(tts, "_take", fake_take)  # noqa: SLF001
+    chunks = [chunk async for chunk in tts.synth("今天天气怎么样")]
+    assert chunks, "首连失败后重试必须出片"
+    assert len(conns) == 0
+
+
+async def test_no_retry_after_first_chunk(tts: XfyunTts, monkeypatch: pytest.MonkeyPatch) -> None:
+    """已经出过片的失败不重试：调用方已消费的音频不能重放第二遍。"""
+    conns = [
+        _ScriptedWS([_audio_event(status=0), TimeoutError("mid-stream death")]),
+        _ScriptedWS([_audio_event(status=2)]),  # 若误重试会消费这条
+    ]
+
+    async def fake_take() -> _ScriptedWS:
+        return conns.pop(0)
+
+    monkeypatch.setattr(tts, "_take", fake_take)  # noqa: SLF001
+    got = 0
+    with pytest.raises(TimeoutError):
+        async for _ in tts.synth("今天天气怎么样"):
+            got += 1
+    assert got == 1
+    assert len(conns) == 1, "出片后的失败不许重试（第二条连接不该被碰）"

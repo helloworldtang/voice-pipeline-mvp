@@ -197,7 +197,26 @@ class XfyunTts:
     # ---- 合成 ----------------------------------------------------------------
 
     async def synth(self, sentence: str) -> AsyncIterator[bytes]:
-        """边收边转：每个 WS 音频包 → 16k PCM → 流式重采样 → 24k PCM 片。"""
+        """边收边转：每个 WS 音频包 → 16k PCM → 流式重采样 → 24k PCM 片。
+
+        首片前失败冷重试一次（2026-11-01 审查缺陷 8）：recv 超时/错误码单发即败
+        就是整句无声——对齐 dashscope_tts「未出片重试一次」的纪律；已经出过片
+        的失败不许重试（调用方已消费的音频不能重放第二遍）。
+        """
+        for attempt in (0, 1):
+            yielded = False
+            try:
+                async for chunk in self._synth_once(sentence):
+                    yielded = True
+                    yield chunk
+                return
+            except Exception:
+                if yielded or attempt == 1:
+                    raise
+                logger.warning("[xfyun] 首片前失败，冷重试一次", exc_info=True)
+
+    async def _synth_once(self, sentence: str) -> AsyncIterator[bytes]:
+        """单次合成尝试（含建连与整个收流循环）；重试语义在 synth 包装层。"""
         # 流式重采样器（带状态）：按块独立重采样会在每 200ms 边界爆音
         resampler = soxr.ResampleStream(SRC_RATE, OUT_RATE, 1, dtype="float32")
         _t0 = time.perf_counter()

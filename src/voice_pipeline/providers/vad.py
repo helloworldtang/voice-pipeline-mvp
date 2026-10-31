@@ -56,7 +56,11 @@ class SileroVad:
         return self.cfg.window_size / 16000 * 1000.0
 
     def push_audio(self, chunk: bytes) -> list[tuple[float, float]]:
-        """喂一段 16k/PCM16，返回本段里 VAD 判定结束的语音段 [(start_ms, end_ms)]。"""
+        """喂一段 16k/PCM16，返回本段里 VAD 判定结束的语音段 [(start_ms, dur_ms)]。
+
+        ⚠️ 第二元是**时长**不是终点（sherpa 的 seg.samples 长度换算），
+        接线时别当 end_ms 用（2026-11-01 审查纠偏：docstring 曾写错）。
+        """
         self._vad.accept_waveform(pcm16_to_f32(chunk))
         out: list[tuple[float, float]] = []
         while not self._vad.empty():

@@ -54,7 +54,13 @@ def _models(root: Path | str | None = None) -> Path:
 
 
 def pcm16_bytes(samples: np.ndarray) -> bytes:
-    return (np.asarray(samples, dtype=np.float32) * 32767.0).astype("<i2").tobytes()
+    # clip 防回绕（与 xfyun_tts._encode 同一纪律）：soxr 重采样过冲/高幅样本
+    # ×32767 会溢出 int16——溢出是静默回绕，听感为爆音（2026-11-01 审查缺陷 8）。
+    return (
+        (np.clip(np.asarray(samples, dtype=np.float32), -1.0, 1.0) * 32767.0)
+        .astype("<i2")
+        .tobytes()
+    )
 
 
 def pcm16_to_f32(chunk: bytes) -> np.ndarray:
