@@ -120,12 +120,12 @@ def test_build_messages_inserts_history_between_system_and_user() -> None:
 
 
 def test_build_messages_without_history_is_first_turn() -> None:
-    fixed = {"today_str": "今天的日期是2026年10月29日。"}
-    assert build_messages("系统提示", None, "问话", **fixed) == [
+    today_str = "今天的日期是2026年10月29日。"
+    assert build_messages("系统提示", None, "问话", today_str=today_str) == [
         {"role": "system", "content": "系统提示\n今天的日期是2026年10月29日。"},
         {"role": "user", "content": "问话"},
     ]
-    assert build_messages("系统提示", [], "问话", **fixed) == [
+    assert build_messages("系统提示", [], "问话", today_str=today_str) == [
         {"role": "system", "content": "系统提示\n今天的日期是2026年10月29日。"},
         {"role": "user", "content": "问话"},
     ]
