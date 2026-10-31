@@ -555,7 +555,7 @@ class Session:
                     if self.metrics.tracer is not None:
                         self.metrics.tracer.finish_root()
                     # 账单在这一刻定型。
-                    self._record_turn(item.metrics, user_text, assistant_parts)
+                    await self._record_turn(item.metrics, user_text, assistant_parts)
         finally:
             self._turn_running = False
             # 被打断的轮次产不出 TurnEnd（finish() 在 interrupted 时 break），
@@ -563,7 +563,7 @@ class Session:
             # `interrupted` 会是个永远为假的死字段。（初版曾把「不落盘」当成
             # 「天然只落完整轮次」，实际上是漏掉了最需要记录的那一类。）
             if self.interrupted and not self._recorded_this_turn:
-                self._record_turn(self.metrics.bill(), user_text, assistant_parts)
+                await self._record_turn(self.metrics.bill(), user_text, assistant_parts)
             if user_text is not None:
                 self._history.append({"role": "user", "content": user_text})
                 if assistant_parts:
@@ -653,7 +653,7 @@ class Session:
             attrs={"client_reported": 1},
         )
 
-    def _record_turn(
+    async def _record_turn(
         self,
         bill: dict[str, float],
         user_text: str | None,
@@ -684,7 +684,11 @@ class Session:
             self._playback_tail_ms = -1.0
         self._recorded_this_turn = True
         self._turn_index += 1
-        self._recorder.record(
+        # 写盘提出事件循环（2026-11-01 审查缺陷 8）：整行 JSON（含 spans 全树）同步
+        # open+write，磁盘一抖就堵住所有会话共用的那个循环。to_thread 派发且
+        # **await 到落盘**——run_turn 返回时账已在盘上，测试与验收的读盘时序不变。
+        await asyncio.to_thread(
+            self._recorder.record,
             session_id=self.session_id,
             trace_id=self.trace_id,
             mode=self.mode,
