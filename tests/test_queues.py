@@ -91,3 +91,40 @@ async def test_audio_counter_decreases_on_consume() -> None:
     entry = await q.get()
     q.task_done()
     assert entry.data == b"y", "误报路径还会把刚入队的新音频丢掉"
+
+
+async def test_event_lane_bounded_drops_oldest_and_counts() -> None:
+    """事件道同样有界（2026-11-01 审查缺陷 5）：背压原本只丢音频，sender 被半开
+    连接堵住时事件无限积压——每轮 turn.start/final/sentence/end 各一条，长会话
+    慢漏气。丢最旧并计数，音频道与杀停道不受影响。"""
+    q = OutboundQueue(max_event_frames=3)
+    for i in range(5):
+        q.put_event(f'{{"i":{i}}}')
+    assert q.dropped_events == 2
+    entries = []
+    while q.qsize()[1] > 0:
+        entries.append(await q.get())
+        q.task_done()
+    assert [e.text for e in entries] == ['{"i":2}', '{"i":3}', '{"i":4}']
+    assert q.dropped_events == 2
+
+
+async def test_drop_all_unblocks_join() -> None:
+    """sender 异常死亡时的止损：清空两车道后 join 立刻可完成（app.py 的 sender
+    异常分支靠它避免 tx.join() 永挂、槽位悬空——审查缺陷 3）。"""
+    import asyncio
+
+    q = OutboundQueue()
+    q.put_event("a")
+    q.put_audio('{"seq":1}', b"x")
+    await q.get()  # 取走一条但不 task_done——模拟 sender 已死、消费停滞
+    join_task = asyncio.create_task(q.join())
+    await asyncio.sleep(0)
+    assert not join_task.done(), "有未完成单元时 join 必须还在等"
+    dropped = q.drop_all()
+    assert dropped == 2
+    await asyncio.wait_for(join_task, timeout=1.0)
+    # 清空后队列可继续正常使用
+    q.put_event("b")
+    entry = await q.get()
+    assert entry.text == "b"
