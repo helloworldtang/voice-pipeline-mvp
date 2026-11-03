@@ -83,9 +83,25 @@
   #log .assistant { color: #8ab4f8; }
   #log .err { color: #f28b82; font-size: 13px; }
   footer { margin-top: 16px; font-size: 11px; opacity: .5; }
+  /* 录视频用的「闭嘴→出声」大号秒表：顶居中浮层，不参与对话布局。
+     running 态变黄并实时跳动，冻结后显示本轮体感毫秒数；口径B 拆账走 chips。 */
+  #hud { position: fixed; top: 8px; left: 50%; transform: translateX(-50%);
+         z-index: 20; text-align: center; pointer-events: none;
+         background: rgba(20,24,32,.74); border: 1px solid #3a4356; border-radius: 12px;
+         padding: 5px 18px; min-width: 196px; backdrop-filter: blur(4px); }
+  #hud-label { font-size: 11px; color: #9aa3b2; letter-spacing: .5px; }
+  #hud-val { font-size: 36px; font-weight: 700; color: #8ab4f8; line-height: 1.12;
+             font-variant-numeric: tabular-nums; }
+  #hud-val.running { color: #fbbc04; }
+  #hud-sub { font-size: 11px; color: #9aa3b2; font-variant-numeric: tabular-nums; }
 </style>
 </head>
 <body>
+<div id="hud" aria-hidden="true">
+  <div id="hud-label">闭嘴 → 出声</div>
+  <div id="hud-val">—</div>
+  <div id="hud-sub"></div>
+</div>
 <header>
   <h1>voice-pilot</h1>
   <span id="dot"></span>

@@ -25,6 +25,11 @@ const state = {
   reconnectAttempt: 0,
   beginSent: false,
   fatalError: false, // 档位类终止性错误：断开后不再自动重连（重试必败）
+  // ——「闭嘴→出声」大号秒表（仅录视频用，不参与口径B 计量）——
+  hudRunning: false,   // 是否正在计时（说话段结束 → 首个下行音频到达）
+  hudStart: 0,         // 本轮 RMS 跌破语音阈值并维持 QUIET_MS 的 performance.now()
+  hudSpeech: false,    // 当前是否处于一次说话段内
+  hudQuietSince: 0,    // RMS 跌破语音阈值的起始时刻（0=正在说话）
 };
 
 // ---- 验收剧本（句子是实测选定的：kokoro 合成→真 ASR 回灌打分，满分句优先，
@@ -65,6 +70,33 @@ function setState(kind, text) {
   const dot = $("dot");
   dot.className = kind || "";
   if (text) $("status").textContent = text;
+}
+
+// ---- 闭嘴→出声 大号秒表 ------------------------------------------------------
+// 起点 = 本地麦克风 RMS 跌破语音阈值并维持 QUIET_MS（与观众「我说完了」的直觉对齐，
+// 不依赖服务端 EOU——那已含 500ms 判停窗）。终点 = 首个下行音频帧到达客户端。
+// 只报体感，不与口径B（chips）抢定义；数字冻结后由 turn.end 补上口径B 拆账。
+const HUD_SPEECH_RMS = 0.015;
+const HUD_QUIET_MS = 250;
+
+function showHud(val, running, sub) {
+  const v = $("hud-val");
+  v.textContent = val;
+  v.classList.toggle("running", !!running);
+  if (sub !== undefined) $("hud-sub").textContent = sub;
+}
+
+function tickHud() {
+  if (!state.hudRunning) return;
+  $("hud-val").textContent = Math.round(performance.now() - state.hudStart) + "ms";
+  requestAnimationFrame(tickHud);
+}
+
+function resetHud() {
+  state.hudRunning = false;
+  state.hudSpeech = false;
+  state.hudQuietSince = 0;
+  showHud("—", false, "");
 }
 
 // ---- 转写区 -----------------------------------------------------------------
@@ -213,6 +245,11 @@ function playPcm16(arrayBuffer) {
     const ms = Math.max(0, Math.round((startAt + outLat - state.firstRecvCtx) * 1000));
     state.lastRecvToPlayMs = ms;
     sendPlaybackReport(ms);
+    // 闭嘴→出声 秒表冻结：本轮首个下行音频到达（≈出声前 ~outputLatency）
+    if (state.hudRunning) {
+      showHud(Math.round(performance.now() - state.hudStart) + "ms", false, $("hud-sub").textContent);
+      state.hudRunning = false;
+    }
   }
 }
 
@@ -279,6 +316,29 @@ async function startMic() {
       addLine("partial", "（打断）").className = "user";
     }
     if (state.recentRms.length === 0 || rms < INTERRUPT_RMS) state.interruptArmed = true;
+
+    // 闭嘴→出声 秒表：说话段结束后开始计时，首个下行音频到达时冻结（见 playPcm16）。
+    if (!state.micOn) {
+      state.hudSpeech = false;
+    } else if (rms >= HUD_SPEECH_RMS) {
+      if (!state.hudSpeech) {
+        // 新说话段开始才是清零点：上一轮冻结的数字保持到此刻，拍视频才拍得到。
+        // 不能挂在 turn.start 上清——conservative 判停 ~500ms > HUD 起表 250ms，
+        // turn.start 会把在跑的秒表掐死，首音到达时永远冻结不了。
+        resetHud();
+      }
+      state.hudSpeech = true;
+      state.hudQuietSince = 0;
+    } else if (state.hudSpeech) {
+      const now = performance.now();
+      if (state.hudQuietSince === 0) state.hudQuietSince = now;
+      if (!state.hudRunning && now - state.hudQuietSince >= HUD_QUIET_MS) {
+        state.hudRunning = true;
+        state.hudStart = state.hudQuietSince;
+        showHud("计时中…", true, "");
+        tickHud();
+      }
+    }
   };
   ctx.createMediaStreamSource(stream).connect(node);
   state.micOn = true;
@@ -293,6 +353,7 @@ function stopMic() {
     state.micStream = null;
   }
   if (state.micCtx) { state.micCtx.close().catch(() => {}); state.micCtx = null; }
+  resetHud(); // 关麦即停表，不残留上一轮数字
   state.micOn = false;
   $("mic").textContent = "开麦";
   $("mic").classList.remove("on");
@@ -330,6 +391,8 @@ function handleEvent(ev) {
       setState("thinking", "思考中…"); lastAssistantLi = null;
       // 播放侧测量按轮清零：上一轮的出声延迟绝不带到下一轮（错配比缺失糟）
       state.firstRecvCtx = null; state.lastRecvToPlayMs = null;
+      // HUD 不在这里清：turn.start 可能晚于秒表起表（conservative 判停 ~500ms >
+      // 起表 250ms），清了就永远冻结不了——清零点在下一说话段开始（见 RMS 回调）
       break;
     case "asr.partial": setPartial(ev.text); break;
     case "asr.final":
@@ -351,6 +414,13 @@ function handleEvent(ev) {
         appendBreakdown(lastAssistantLi, m);
       }
       setChips(m);
+      // 秒表副行补口径B 拆账：体感（闭嘴→出声）已由 playPcm16 冻结，这里只挂原因
+      if (m.caliber_b_ms >= 0) {
+        const eou = m.eou_latency_ms >= 0 ? Math.round(m.eou_latency_ms) : "?";
+        const fs = m.first_sound_ms >= 0 ? Math.round(m.first_sound_ms) : "?";
+        showHud($("hud-val").textContent, false,
+                `口径B ${Math.round(m.caliber_b_ms)}ms · 判停${eou}+首音${fs}`);
+      }
       // 关麦后迟到的 turn.end：不再回到「聆听中」（麦克风已关，那是假状态）
       setState(state.micOn ? "listening" : "", state.micOn ? "聆听中" : "已关麦——点「开麦」继续");
       break;
