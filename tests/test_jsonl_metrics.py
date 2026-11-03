@@ -284,3 +284,27 @@ def test_tx_stop_span_records_barge_in_hop_once() -> None:
     spans = [s for s in session.metrics.tracer.to_list() if s["name"] == "tx.stop"]
     assert len(spans) == 1, spans
     assert spans[0]["start_ms"] == 100.0
+
+
+async def test_profile_lands_in_bill_extra(tmp_path: Path) -> None:
+    """引擎档必须落盘（None=跟随部署）：云档/延迟档延迟差是数量级级的，
+    不落盘就无法事后分组，数字会静默混账。"""
+    out = tmp_path / "turns.jsonl"
+    session = _session(TurnRecorder(str(out)))
+    await session.on_audio(b"\x00\x00" * 160)
+    await session.run_turn()
+    records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert records[0]["profile"] is None
+
+    profiled = Session(
+        mode="serial",
+        asr=SimAsr(),
+        llm=SimLlm(),
+        tts=SimTts(),
+        recorder=TurnRecorder(str(out)),
+        profile="cloud",
+    )
+    await profiled.on_audio(b"\x00\x00" * 160)
+    await profiled.run_turn()
+    records = [json.loads(line) for line in out.read_text(encoding="utf-8").splitlines()]
+    assert records[1]["profile"] == "cloud"

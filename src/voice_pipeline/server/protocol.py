@@ -136,6 +136,10 @@ class SessionReady(BaseModel):
     # 服务端确认的**实际生效**模式：客户端靠它显示"当前会话在跑什么"——
     # 下拉只是意愿，生效值才可信（2026-10-27 四轮验收三轮没切上，全是信了下拉）
     mode: str | None = None
+    # 引擎档（URL ?profile=，None=跟随部署 env）。回显理由同 mode：下拉只是
+    # 意愿，生效值才可信。注意 sim 系模式（serial/pipelined/echo）走替身三件套，
+    # 档位不生效——回显的是**通过校验的请求值**，别当替身也在跑云引擎。
+    profile: str | None = None
 
 
 class SessionClosed(BaseModel):

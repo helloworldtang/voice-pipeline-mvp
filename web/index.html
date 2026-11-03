@@ -113,6 +113,11 @@
 
 <div id="controls">
   <input id="token" type="password" placeholder="token（可空）" style="width:130px">
+  <select id="profile" title="引擎档：全云=云端 LLM+TTS；响应时间优先=本地 LLM+讯飞快档。切换会重连；服务端缺对应能力会明确报错">
+    <option value="" selected>跟随部署</option>
+    <option value="cloud">全云</option>
+    <option value="latency">响应时间优先</option>
+  </select>
   <select id="mode">
     <option value="real-serial" selected>real-serial</option>
     <option value="real-pipelined">real-pipelined</option>

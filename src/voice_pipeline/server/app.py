@@ -30,6 +30,7 @@ from voice_pipeline.config import Settings
 from voice_pipeline.core.filler import FillerBank
 from voice_pipeline.core.scheduler.base import AudioFragment, TurnItem
 from voice_pipeline.metrics.logging_ctx import bind_trace_id, install_trace_logging
+from voice_pipeline.providers.factory import PROFILES, EngineProfile, profile_error
 from voice_pipeline.providers.pool import ProviderLease, ProviderPool
 
 from .protocol import (
@@ -89,15 +90,46 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.websocket("/ws")
     async def ws_endpoint(websocket: WebSocket) -> None:
+        # 引擎档（URL ?profile=cloud|latency，缺省=跟随部署 env）。校验必须在
+        # 建 Session/占槽/发首帧 ready 之前：全是廉价检查（env 存在性 + importlib，
+        # 见 factory.profile_error）。不可用就明确拒绝并断连，绝不静默降级回 env 档
+        # ——那会让 cloud/latency 的数字混进同一份账单。档是连接级固定值，
+        # 换档只能重连（web 端切下拉即触发）。
+        profile_name = websocket.query_params.get("profile")
+        profile: EngineProfile | None = None
+        if profile_name is not None:
+            reason = profile_error(profile_name)
+            if reason is not None:
+                await websocket.accept()
+                await websocket.send_text(
+                    dump_event(
+                        ErrorEvent(
+                            code=(
+                                "profile_unavailable"
+                                if profile_name in PROFILES
+                                else "bad_profile"
+                            ),
+                            message=reason,
+                        )
+                    )
+                )
+                # bad_profile=客户端错 → 1008（同 unauthorized）；profile_unavailable
+                # =本机缺能力，重试无用 → 1011。
+                await websocket.close(code=1011 if profile_name in PROFILES else 1008)
+                return
+            profile = PROFILES[profile_name]
         await websocket.accept()
-        session = Session()
+        session = Session(profile=profile_name)
         # 绑定后本连接派生的所有协程（pump/sender/run_turn）日志都带 trace_id。
         # 换模式会重建会话（新 trace_id），那里再绑一次。
         bind_trace_id(session.trace_id)
         await websocket.send_text(
             dump_event(
                 SessionReady(
-                    session_id=session.session_id, trace_id=session.trace_id, mode=session.mode
+                    session_id=session.session_id,
+                    trace_id=session.trace_id,
+                    mode=session.mode,
+                    profile=profile_name,
                 )
             )
         )
@@ -244,7 +276,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     if lease is not None:
                         lease.release()
                         lease = None
-                    lease = await pool.acquire(frame.mode)
+                    lease = await pool.acquire(
+                        frame.mode,
+                        # 档的引擎对在这里展开：显式档压过 env（见 pool.acquire docstring）。
+                        # sim 系模式不占槽、走替身三件套，档不生效——属预期（README 有写）。
+                        tts_engine=profile.tts_engine if profile else None,
+                        llm_engine=profile.llm_engine if profile else None,
+                    )
                     if lease is None:
                         # 满是**背压**，不是错误：明确拒绝，不让新会话静默挤占旧会话
                         # 的推理（隐性串行比 1013 糟——后者至少能被客户端解释）。
@@ -273,9 +311,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                         llm=lease.providers.llm,
                         tts=lease.providers.tts,
                         filler=filler_bank,
-                        # 账单落盘走环境变量 VOICE_EVENTS_JSONL（Session 默认
-                        # 从 env 读，见 metrics/jsonl.py）：这是运维开关，
-                        # 不是每次会话的实验旋钮，所以不上 wire 协议。
+                        # 引擎档来自 URL ?profile=（连接级固定），经上面的 acquire
+                        # 引擎覆盖参数生效、这里落进账单 extra。账单落盘本身走
+                        # 环境变量 VOICE_EVENTS_JSONL（Session 默认从 env 读，见
+                        # metrics/jsonl.py）：这是运维开关，不是每次会话的实验
+                        # 旋钮，所以不上 wire 协议。
+                        profile=profile_name,
                     )
                     bind_trace_id(session.trace_id)
                     pump_task.cancel()
@@ -288,6 +329,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                                 session_id=session.session_id,
                                 trace_id=session.trace_id,
                                 mode=session.mode,
+                                profile=profile_name,
                             )
                         )
                     )

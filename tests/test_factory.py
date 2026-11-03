@@ -11,7 +11,9 @@ from voice_pipeline.providers.asr.sim_asr import SimAsr
 from voice_pipeline.providers.factory import (
     DEFAULT_ASR_ENGINE,
     DEFAULT_TTS_ENGINE,
+    PROFILES,
     build_providers,
+    profile_error,
     resolve_tts_engine,
 )
 from voice_pipeline.providers.llm.sim_llm import SimLlm
@@ -106,3 +108,56 @@ def test_real_providers_are_cached_across_builds() -> None:
     assert a.tts is b.tts
     assert a.asr is not b.asr  # 会话状态不可共享
     assert a.asr._recognizer is b.asr._recognizer  # type: ignore[attr-defined]
+
+
+def test_profiles_are_fixed_pairs() -> None:
+    """档位组合定死：cloud=(qwen, dashscope)、latency=(mlx, xfyun)。
+
+    这是「政策」不是「旋钮」——客户端挑的是全云/响应时间优先，不是具体引擎。
+    有人"顺手"调档（比如 latency 的 TTS 换成 melo），数字口径就变了，而账单里
+    只落 profile 名——要改先拿实测数字说话（风格同
+    test_default_tts_engine_is_measured_not_assumed）。
+    """
+    assert set(PROFILES) == {"cloud", "latency"}
+    assert (PROFILES["cloud"].llm_engine, PROFILES["cloud"].tts_engine) == ("qwen", "dashscope")
+    assert (PROFILES["latency"].llm_engine, PROFILES["latency"].tts_engine) == ("mlx", "xfyun")
+
+
+def test_profile_error_unknown_name() -> None:
+    """未知档名必须明确拒绝（bad_profile），不能静默当默认档处理。"""
+    reason = profile_error("nope")
+    assert reason is not None
+    assert "unknown profile" in reason
+
+
+def test_profile_error_cloud_needs_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    """cloud 档一个检查覆盖 LLM+TTS：QwenLlm 与 DashScopeTts 共用 DASHSCOPE_API_KEY。"""
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    reason = profile_error("cloud")
+    assert reason is not None
+    assert "DASHSCOPE_API_KEY" in reason
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "sk-test-not-used")
+    assert profile_error("cloud") is None
+
+
+def test_profile_error_latency_needs_mlx_and_xfyun(monkeypatch: pytest.MonkeyPatch) -> None:
+    """latency 档三项预检：mlx 依赖（MlxLlm 构造不抛，必须显式检）+ 讯飞三凭证。"""
+    import voice_pipeline.providers.factory as factory
+
+    monkeypatch.setattr(factory, "_mlx_available", lambda: False)
+    monkeypatch.setenv("XFYUN_TTS_APPID", "app")
+    monkeypatch.setenv("XFYUN_TTS_API_KEY", "key")
+    monkeypatch.setenv("XFYUN_TTS_API_SECRET", "secret")
+    reason = profile_error("latency")
+    assert reason is not None
+    assert "mlx" in reason
+
+    monkeypatch.setattr(factory, "_mlx_available", lambda: True)
+    monkeypatch.delenv("XFYUN_TTS_APPID", raising=False)
+    reason = profile_error("latency")
+    assert reason is not None
+    assert "XFYUN_TTS_APPID" in reason
+
+    monkeypatch.setenv("XFYUN_TTS_APPID", "app")
+    assert profile_error("latency") is None

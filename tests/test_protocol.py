@@ -122,12 +122,18 @@ def test_server_events_wire_fields() -> None:
         "session_id": "s1",
         "trace_id": "t1",
         "mode": None,
+        "profile": None,
     }
     # mode 是服务端回显的生效值——客户端的"当前会话在跑什么"以此为准
     ready_moded = json.loads(
         dump_event(SessionReady(session_id="s1", trace_id="t1", mode="real-pipelined"))
     )
     assert ready_moded["mode"] == "real-pipelined"
+    # profile 是 URL ?profile= 引擎档的回显（None=跟随部署 env），契约一并钉住
+    ready_profiled = json.loads(
+        dump_event(SessionReady(session_id="s1", trace_id="t1", profile="latency"))
+    )
+    assert ready_profiled["profile"] == "latency"
 
     closed = json.loads(dump_event(SessionClosed(session_id="s1", frames_echoed=7)))
     assert closed == {"type": "session.closed", "session_id": "s1", "frames_echoed": 7}

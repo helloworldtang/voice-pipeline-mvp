@@ -79,6 +79,7 @@ ln -sf "$(pwd)/.venv/lib/python3.12/site-packages/onnxruntime/capi/libonnxruntim
   - **静态 token 鉴权**：`VOICE_WS_TOKEN` 设了才启用，错/缺回 `error(unauthorized)`+1008；QwenLlm 共享 httpx 连接（每轮省一次 TLS 握手）
   - **浏览器客户端 `web/`**：vanilla JS + AudioWorklet，浏览器 AEC 免耳机；FastAPI 挂静态（显式路由之后，防 mount 吞 /healthz）
   - **混合部署**（`docs/ecs-baseline.md`，2C/2G 腾讯 ECS 实测定档）：本地 ASR（RTF 0.044）+ 本地 EOU（SmartTurn）+ 云 LLM + **云 TTS（DashScope CosyVoice 流式，首片 0.6s——本地 melo 同句 11.9s 判死）**；调度器按 `tts_streams` 能力分流，流式 provider 边合成边出片；provider 缓存消掉 session.begin 的秒级模型重载
+  - **引擎档 URL 开关**（2026-11-03）：`/ws?profile=cloud`（qwen + DashScope TTS 全云）或 `?profile=latency`（本地 mlx + 讯飞快档，响应时间优先），无参=跟随部署 env（systemd/bench 不受影响）。档是**连接级**参数（换档重连，web 端切下拉即重连）；本机缺对应能力（无 mlx、无 key/凭证）回 `error(profile_unavailable)`+1011 明确拒绝，**不静默降级**——否则云/延迟档数字混账。`session.ready` 回显档名，账单 extra 落 `profile` 字段。单个引擎仍是部署配置不进 wire 协议，进协议的只有这个两值策略档（`factory.PROFILES`）
   - **ECS 实测端到端口径B = 1553.9ms**（判停+ASR 本地，LLM+TTS 云端），达成 <2s 试点验收线
   - 部署：systemd + caddy（`deploy/`，含 release.sh 与首次部署手册；libonnxruntime 1.28.2 需 GitHub release 中转，onnxruntime 钉上界 <1.29）
 

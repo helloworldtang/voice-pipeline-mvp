@@ -24,6 +24,7 @@ const state = {
   interruptArmed: true,
   reconnectAttempt: 0,
   beginSent: false,
+  fatalError: false, // 档位类终止性错误：断开后不再自动重连（重试必败）
 };
 
 // ---- 验收剧本（句子是实测选定的：kokoro 合成→真 ASR 回灌打分，满分句优先，
@@ -321,7 +322,9 @@ function handleEvent(ev) {
         $("mic").disabled = false;
       }
       // 生效模式以服务端回显为准（下拉只是意愿——四轮验收三轮没切上的教训）
-      $("activemode").textContent = ev.mode ? `当前: ${ev.mode}` : "";
+      $("activemode").textContent = ev.mode
+        ? `当前: ${ev.mode}${ev.profile ? ` · ${ev.profile}` : ""}`
+        : "";
       break;
     case "turn.start":
       setState("thinking", "思考中…"); lastAssistantLi = null;
@@ -365,6 +368,8 @@ function handleEvent(ev) {
       break;
     case "error":
       addLine("err", `错误 ${ev.code}: ${ev.message}`);
+      // 档位类错误是终止性的（重试必败）：别让自动重连拿 15s 上限永久锤它
+      if (ev.code === "bad_profile" || ev.code === "profile_unavailable") state.fatalError = true;
       break;
     case "session.closed":
       setState("", "会话已关闭");
@@ -379,10 +384,13 @@ function handleEvent(ev) {
 
 function connect() {
   const proto = location.protocol === "https:" ? "wss" : "ws";
-  const ws = new WebSocket(`${proto}://${location.host}/ws`);
+  // 引擎档走 URL 参数（连接级固定，换档必须重连）；空=跟随服务端部署 env
+  const prof = $("profile").value;
+  const ws = new WebSocket(`${proto}://${location.host}/ws${prof ? `?profile=${prof}` : ""}`);
   state.ws = ws;
   state.ws.binaryType = "arraybuffer";
   state.beginSent = false;
+  state.fatalError = false;
 
   state.ws.onopen = () => { $("status").textContent = "已连接"; };
   state.ws.onmessage = (msg) => {
@@ -401,10 +409,12 @@ function connect() {
     setState("", "连接断开");
     $("mic").disabled = true;
     stopPlayback();
-    // 自动重连：指数退避，上限 15s。手动关麦不重连。
-    const delay = Math.min(15000, 1000 * 2 ** state.reconnectAttempt++);
-    setState("", `断开，${Math.round(delay / 1000)}s 后重连…`);
-    if (state.micOn) setTimeout(connect, delay);
+    // 自动重连：指数退避，上限 15s。手动关麦不重连；终止性错误（档位不可用）不重连。
+    if (!state.fatalError) {
+      const delay = Math.min(15000, 1000 * 2 ** state.reconnectAttempt++);
+      setState("", `断开，${Math.round(delay / 1000)}s 后重连…`);
+      if (state.micOn) setTimeout(connect, delay);
+    }
   };
   state.ws.onerror = () => { /* onclose 会接手 */ };
 }
@@ -424,24 +434,26 @@ $("mic").addEventListener("click", async () => {
   }
 });
 
-// mode/gating 是 session.begin 的一次性参数：连接建立后再改下拉，对已建会话无效
-// （2026-10-18 验收实锤：用户切到 real-pipelined，账单里三段会话仍全是 real-serial，
-// 切换被静默吞掉）。未开麦时改选 → 重连换会话；开麦中改选 → 明说本轮仍用旧值。
-// 模式/判停档的记忆：切过一次就记住，刷新不丢——"记得切下拉"这件事
-// 已经在四轮验收里失败了三次，不再依赖人的记忆
-for (const id of ["mode", "gating"]) {
+// mode/gating 是 session.begin 的一次性参数，profile 是 URL 级连接参数——
+// 三者共同点：连接建立后再改下拉，对已建会话无效（2026-10-18 验收实锤：用户切到
+// real-pipelined，账单里三段会话仍全是 real-serial，切换被静默吞掉）。未开麦时
+// 改选 → 重连换会话；开麦中改选 → 明说本轮仍用旧值。
+// 记忆：切过一次就记住，刷新不丢——"记得切下拉"这件事已经在四轮验收里失败了
+// 三次，不再依赖人的记忆
+const CONTROL_LABELS = { mode: "模式", gating: "判停档", profile: "引擎档" };
+for (const id of ["mode", "gating", "profile"]) {
   const saved = localStorage.getItem("vp-" + id);
   if (saved && [...$(id).options].some((o) => o.value === saved)) $(id).value = saved;
   $(id).addEventListener("change", () => {
     localStorage.setItem("vp-" + id, $(id).value);
     if (state.micOn) {
-      addLine("partial", `（${id === "mode" ? "模式" : "判停档"}已锁定本轮，关麦后再切换）`).className = "user";
+      addLine("partial", `（${CONTROL_LABELS[id]}已锁定本轮，关麦后再切换）`).className = "user";
       return;
     }
     state.reconnectAttempt = 0;
     state.ws?.close(1000, "mode-change");
     connect();
-    $("status").textContent = `切换中… 目标 ${$("mode").value} / ${$("gating").value}`;
+    $("status").textContent = `切换中… 目标 ${$("mode").value} / ${$("gating").value}${$("profile").value ? ` / ${$("profile").value}` : ""}`;
   });
 }
 

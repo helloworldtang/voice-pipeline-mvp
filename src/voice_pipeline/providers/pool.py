@@ -210,11 +210,20 @@ class ProviderPool:
         """还有名额吗。shared 模式恒为真——它就是「不设限地挤」的那个对照组。"""
         return self._shared or self.busy < self.capacity
 
-    async def acquire(self, mode: str, tts_engine: str | None = None) -> ProviderLease | None:
+    async def acquire(
+        self,
+        mode: str,
+        tts_engine: str | None = None,
+        llm_engine: str | None = None,
+    ) -> ProviderLease | None:
         """借一套 provider。**返回 None = 满了**，这不是异常，是背压信号。
 
         调用方必须把它翻译成给客户端的明确错误（见 app.py 的 session_limit），
         不要静默降级回共享资源——共享正是要消灭的那个隐性串行。
+
+        `tts_engine` / `llm_engine` 是 `/ws?profile=` 的展开值（factory.PROFILES）：
+        非 None 时压过 env/构造默认（显式档 > env，与 resolve_tts_engine 同构）；
+        不传则逐字节走原 env 路径——bench / systemd 部署不受影响。
         """
         if not needs_exclusive_slot(mode):
             return ProviderLease(
@@ -246,7 +255,10 @@ class ProviderPool:
         lease = ProviderLease(
             ProviderSet(
                 asr=slot.wrap_asr(self._asr_engine),
-                llm=build_llm(self._llm_engine, self._llm_model),
+                llm=build_llm(
+                    llm_engine if llm_engine is not None else self._llm_engine,
+                    self._llm_model,
+                ),
                 tts=slot._tts or SimTts(),  # noqa: SLF001
             ),
             slot=index,

@@ -54,8 +54,9 @@ class ProviderSet:
 def resolve_llm_engine(explicit: str | None = None) -> str:
     """定 LLM 引擎：显式（非 auto）> `VOICE_LLM_ENGINE` > auto。
 
-    与 `resolve_tts_engine` 同一套理由：引擎是部署配置，不上 wire 协议；
-    A/B 与服务端探针要把引擎当旋钮拧，只能走 env。
+    与 `resolve_tts_engine` 同一套理由：**单个**引擎是部署配置，不上 wire 协议；
+    A/B 与服务端探针要把引擎当旋钮拧，只能走 env。例外是 `PROFILES` 的两值
+    策略档（`/ws?profile=`）——进协议的是档不是引擎，见其 docstring。
     """
     if explicit and explicit != "auto":
         return explicit
@@ -116,12 +117,66 @@ def resolve_tts_engine(explicit: str | None = None) -> str:
 
     环境变量 `VOICE_PIPELINE_TTS_ENGINE` 存在的唯一理由是 A/B：端到端 bench 的
     服务端跑在独立进程里（`bench_ws.py` 起 uvicorn 子进程），要把引擎当旋钮拧
-    只能走 env。**部署配置不该进 WS 协议** —— gating/grace_ms 是每次会话都可能
-    不同的实验旋钮，引擎不是。
+    只能走 env。**单个引擎不进 WS 协议** —— gating/grace_ms 是每次会话都可能
+    不同的实验旋钮，引擎不是。例外是 `PROFILES` 的两值策略档（`/ws?profile=`）：
+    进协议的是档（cloud/latency）不是具体引擎，bench 路径仍走 env。
     """
     if explicit:
         return explicit
     return os.environ.get("VOICE_PIPELINE_TTS_ENGINE", DEFAULT_TTS_ENGINE)
+
+
+@dataclass(frozen=True, slots=True)
+class EngineProfile:
+    """一档「策略档」= 定死的 (LLM, TTS) 引擎对。
+
+    客户端经 `/ws?profile=` 挑政策（全云能力 / 响应时间优先），不挑具体引擎——
+    单个引擎仍是部署配置不进 wire 协议，进协议的只有这个两值档。可用性由
+    部署侧决定（`profile_error` 预检），客户端选了本机不具备的档会被明确拒绝。
+    """
+
+    llm_engine: str
+    tts_engine: str
+
+
+PROFILES: dict[str, EngineProfile] = {
+    # 全云：qwen-flash + DashScope 流式 TTS（LLM 与 TTS 共用 DASHSCOPE_API_KEY）
+    "cloud": EngineProfile(llm_engine="qwen", tts_engine="dashscope"),
+    # 响应时间优先：本机 mlx 1.5B + 讯飞 v2 流式（首包 p50 137ms，快档 ~50ms）。
+    # 命中投机时轮次 16~31ms（README 10-28 复核），代价是答案比 qwen 笼统。
+    "latency": EngineProfile(llm_engine="mlx", tts_engine="xfyun"),
+}
+
+
+def profile_error(name: str) -> str | None:
+    """该档在本机是否可用。None=可用；返回字符串=拒绝原因（含缺失项的 env 名）。
+
+    全部是廉价检查（env 存在性 + importlib），不加载模型、不建网络连接——
+    必须发生在占槽/建会话之前。不可用就明确拒绝、绝不静默降级回 env 档：
+    那会让 cloud/latency 的数字混进同一份账单（静默降级是最坏失败形态）。
+    """
+    profile = PROFILES.get(name)
+    if profile is None:
+        return f"unknown profile: {name} (可选 {sorted(PROFILES)})"
+    if profile is PROFILES["cloud"]:
+        # QwenLlm 与 DashScopeTts 共用同一个 key，一处检查覆盖 LLM+TTS
+        if not os.environ.get(API_KEY_ENV, "").strip():
+            return f"cloud 档需要 {API_KEY_ENV}（LLM 与 TTS 共用），本服务未配置"
+        return None
+    # latency 档：MlxLlm 构造不抛（加载都在 preload），必须显式预检依赖——
+    # 不检的话要到首轮 preload 才炸，晚失败正是要消灭的形态
+    if not _mlx_available():
+        return "latency 档需要本地 mlx-lm 依赖（仅 macOS/arm64），本服务未安装"
+    from voice_pipeline.providers.tts.xfyun_tts import APP_ID_ENV, KEY_ENV, SECRET_ENV
+
+    missing = [
+        env
+        for env in (APP_ID_ENV, KEY_ENV, SECRET_ENV)
+        if not os.environ.get(env, "").strip()
+    ]
+    if missing:
+        return f"latency 档的 TTS 需要讯飞凭证 {', '.join(missing)}"
+    return None
 
 
 def build_providers(

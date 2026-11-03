@@ -309,7 +309,8 @@ async def main() -> None:
     tts_engines = [e.strip() for e in args.tts.split(",") if e.strip()]
     all_rows: list[Row] = []
     for tts_engine in tts_engines:
-        # 引擎只能经 env 传给服务端子进程（部署配置不进 WS 协议，见 factory.resolve_tts_engine）
+        # 引擎仍只经 env 传给 bench 服务端子进程（单个引擎是部署配置不进 WS 协议，
+        # 见 factory.resolve_tts_engine；?profile= 策略档是浏览器客户端的开关，bench 不用）
         env = {**os.environ, "VOICE_PIPELINE_TTS_ENGINE": tts_engine}
         proc = subprocess.Popen(  # noqa: S603
             [

@@ -109,10 +109,15 @@ class Session:
         # 短音频，把那一格 ~650ms 的固定成本盖住。None = 关闭（默认）。
         # ⚠️ 口径B 一分不省：filler 只打 first_sound，见 core/filler.py 的计量纪律。
         filler: FillerBank | None = None,
+        # 引擎档（/ws?profile=，None=跟随部署 env）：只入账单 extra，不改变任何
+        # 行为——provider 由 WS 层经 pool.acquire 的引擎覆盖参数组装。落盘是为了
+        # cloud/latency 的数字永不静默混进同一份账单（数字可信度护栏）。
+        profile: str | None = None,
     ) -> None:
         self.session_id = uuid4().hex[:12]
         self.trace_id = uuid4().hex[:16]
         self.mode = mode
+        self._profile = profile
         self.frames_echoed = 0
         self.interrupted = False
         self._clock = clock or SessionClock()
@@ -697,6 +702,9 @@ class Session:
             extra={
                 "interrupted": self.interrupted,
                 "llm": self._llm_name,
+                # 引擎档（None=跟随部署 env）：云档/延迟档延迟差异是数量级级的，
+                # 不落盘就无法事后分组，数字会静默混账（report_turns 按它分组）。
+                "profile": self._profile,
                 "user_text": user_text or "",
                 "assistant_text": "".join(assistant_parts),
                 # span 树随账单一起落盘：事后能按 trace_id 重建一棵完整的调用树，

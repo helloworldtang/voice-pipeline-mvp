@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+import pytest
 from fastapi.testclient import TestClient
 
 from voice_pipeline.server.app import create_app
@@ -233,3 +234,130 @@ def test_intermediate_event_shapes_are_stable() -> None:
     }
     assert TurnEnd(metrics={"caliber_b_ms": 1.0}).type == "turn.end"
     assert Interrupt(reason="stop").type == "interrupt"
+
+
+# ---- 引擎档（URL ?profile=cloud|latency）--------------------------------------------
+
+
+def _light_pool(monkeypatch: Any, engines: list[str], tts_names: list[str]) -> None:
+    """把槽的重资产构建与 LLM 组装换成记录器：不加载模型、不联网（CI 零模型零网络）。
+
+    记录的是**传给组装层的引擎名**——档位是否真的展开到引擎，从这采证。
+    """
+    from voice_pipeline.providers import pool as pool_mod
+    from voice_pipeline.providers.asr.sim_asr import SimAsr
+    from voice_pipeline.providers.llm.sim_llm import SimLlm
+    from voice_pipeline.providers.tts.sim_tts import SimTts
+
+    def fake_build(slot: Any, asr_engine: str, tts_name: str) -> None:
+        tts_names.append(tts_name)
+        slot._recognizer = object()
+        slot._tts = SimTts()
+        slot._tts_engine_name = tts_name
+
+    monkeypatch.setattr(pool_mod._Slot, "_build", fake_build)
+    monkeypatch.setattr(pool_mod._Slot, "wrap_asr", lambda self, asr_engine: SimAsr())
+    monkeypatch.setattr(
+        pool_mod, "build_llm", lambda engine, model="m": (engines.append(engine), SimLlm())[1]
+    )
+
+
+def test_ws_bad_profile_rejected_before_ready(monkeypatch: Any) -> None:
+    """未知档名：第一帧即 error(bad_profile)，不发 session.ready，随接关闭。"""
+    from starlette.websockets import WebSocketDisconnect
+
+    with TestClient(create_app()).websocket_connect("/ws?profile=nope") as ws:
+        err = ws.receive_json()
+        assert err["type"] == "error"
+        assert err["code"] == "bad_profile"
+        assert "unknown profile" in err["message"]
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
+def test_ws_cloud_profile_without_key_rejected(monkeypatch: Any) -> None:
+    """cloud 档缺 DASHSCOPE_API_KEY：明确拒绝（profile_unavailable），不静默降级 env 档。"""
+    from starlette.websockets import WebSocketDisconnect
+
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    with TestClient(create_app()).websocket_connect("/ws?profile=cloud") as ws:
+        err = ws.receive_json()
+        assert err["type"] == "error"
+        assert err["code"] == "profile_unavailable"
+        assert "DASHSCOPE_API_KEY" in err["message"]
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
+def test_ws_latency_profile_without_mlx_rejected(monkeypatch: Any) -> None:
+    """latency 档缺 mlx 依赖（ECS 2C 形态）：明确拒绝，不静默换引擎。"""
+    from starlette.websockets import WebSocketDisconnect
+
+    monkeypatch.setattr("voice_pipeline.providers.factory._mlx_available", lambda: False)
+    monkeypatch.setenv("XFYUN_TTS_APPID", "app")
+    monkeypatch.setenv("XFYUN_TTS_API_KEY", "key")
+    monkeypatch.setenv("XFYUN_TTS_API_SECRET", "secret")
+    with TestClient(create_app()).websocket_connect("/ws?profile=latency") as ws:
+        err = ws.receive_json()
+        assert err["type"] == "error"
+        assert err["code"] == "profile_unavailable"
+        assert "mlx" in err["message"]
+        with pytest.raises(WebSocketDisconnect):
+            ws.receive_json()
+
+
+def test_ws_latency_profile_builds_mlx_and_xfyun(monkeypatch: Any) -> None:
+    """档位生效采证：latency 档下 LLM 组装收到 mlx、槽按 xfyun 建重资产、ready 回显档名。"""
+    monkeypatch.setattr("voice_pipeline.providers.factory._mlx_available", lambda: True)
+    monkeypatch.setenv("XFYUN_TTS_APPID", "app")
+    monkeypatch.setenv("XFYUN_TTS_API_KEY", "key")
+    monkeypatch.setenv("XFYUN_TTS_API_SECRET", "secret")
+    engines: list[str] = []
+    tts_names: list[str] = []
+    _light_pool(monkeypatch, engines, tts_names)
+
+    with TestClient(create_app()).websocket_connect("/ws?profile=latency") as ws:
+        ready = ws.receive_json()
+        assert ready["profile"] == "latency"
+        ws.send_text(SessionBegin(mode="real-serial").model_dump_json())
+        rebound = ws.receive_json()
+        assert rebound["type"] == "session.ready"
+        assert rebound["profile"] == "latency"
+        assert engines == ["mlx"], "LLM 必须按档展开为 mlx，而非 env/auto 默认"
+        assert tts_names == ["xfyun"], "槽的重资产必须按档用 xfyun 建"
+
+
+def test_ws_no_profile_param_is_env_behavior(monkeypatch: Any) -> None:
+    """裸 /ws 零变化：无档覆盖、引擎走 env/默认——systemd 部署与 bench 的后向兼容钉死。"""
+    monkeypatch.setenv("VOICE_PIPELINE_TTS_ENGINE", "melo")
+    engines: list[str] = []
+    tts_names: list[str] = []
+    _light_pool(monkeypatch, engines, tts_names)
+
+    with TestClient(create_app()).websocket_connect("/ws") as ws:
+        ready = ws.receive_json()
+        assert ready["profile"] is None
+        ws.send_text(SessionBegin(mode="real-serial").model_dump_json())
+        rebound = ws.receive_json()
+        assert rebound["type"] == "session.ready"
+        assert rebound["profile"] is None
+        assert engines == ["auto"], "无档时不得有 LLM 引擎覆盖"
+        assert tts_names == ["melo"], "TTS 仍走 VOICE_PIPELINE_TTS_ENGINE"
+
+
+def test_ws_profile_overrides_env_tts(monkeypatch: Any) -> None:
+    """优先级钉死：显式档压过 env（env=melo + latency 档 → 槽按 xfyun 建）。"""
+    monkeypatch.setattr("voice_pipeline.providers.factory._mlx_available", lambda: True)
+    monkeypatch.setenv("VOICE_PIPELINE_TTS_ENGINE", "melo")
+    monkeypatch.setenv("XFYUN_TTS_APPID", "app")
+    monkeypatch.setenv("XFYUN_TTS_API_KEY", "key")
+    monkeypatch.setenv("XFYUN_TTS_API_SECRET", "secret")
+    engines: list[str] = []
+    tts_names: list[str] = []
+    _light_pool(monkeypatch, engines, tts_names)
+
+    with TestClient(create_app()).websocket_connect("/ws?profile=latency") as ws:
+        ws.receive_json()
+        ws.send_text(SessionBegin(mode="real-serial").model_dump_json())
+        assert ws.receive_json()["type"] == "session.ready"
+        assert tts_names == ["xfyun"]
