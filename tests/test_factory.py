@@ -142,18 +142,36 @@ def test_profile_error_cloud_needs_key(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_profile_error_latency_needs_mlx_and_xfyun(monkeypatch: pytest.MonkeyPatch) -> None:
-    """latency 档三项预检：mlx 依赖（MlxLlm 构造不抛，必须显式检）+ 讯飞三凭证。"""
+    """latency 档四项预检：mlx 依赖（构造不抛必须显式检）+ 模型在本地 + 讯飞三凭证。
+
+    模型检查是 2026-11-03 验收实锤补的：HF 缓存快照缺 .gitattributes/README 这类
+    琐碎文件，权重齐全也会被 `snapshot_download(local_files_only=True)` 判
+    IncompleteSnapshotError——不预检的话首轮 astream 才炸成 turn_failed。
+    """
     import voice_pipeline.providers.factory as factory
 
+    monkeypatch.setattr(
+        "voice_pipeline.providers.llm.mlx_llm._local_model_path", lambda model: "/models/qwen"
+    )
     monkeypatch.setattr(factory, "_mlx_available", lambda: False)
     monkeypatch.setenv("XFYUN_TTS_APPID", "app")
     monkeypatch.setenv("XFYUN_TTS_API_KEY", "key")
     monkeypatch.setenv("XFYUN_TTS_API_SECRET", "secret")
     reason = profile_error("latency")
     assert reason is not None
-    assert "mlx" in reason
+    assert "mlx-lm" in reason
 
     monkeypatch.setattr(factory, "_mlx_available", lambda: True)
+    monkeypatch.setattr(
+        "voice_pipeline.providers.llm.mlx_llm._local_model_path", lambda model: None
+    )
+    reason = profile_error("latency")
+    assert reason is not None
+    assert "fetch_model" in reason, "缺模型要给出离线拉取命令，不是一句干巴巴的不可用"
+
+    monkeypatch.setattr(
+        "voice_pipeline.providers.llm.mlx_llm._local_model_path", lambda model: "/models/qwen"
+    )
     monkeypatch.delenv("XFYUN_TTS_APPID", raising=False)
     reason = profile_error("latency")
     assert reason is not None

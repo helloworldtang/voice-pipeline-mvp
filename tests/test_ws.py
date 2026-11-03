@@ -309,6 +309,9 @@ def test_ws_latency_profile_without_mlx_rejected(monkeypatch: Any) -> None:
 def test_ws_latency_profile_builds_mlx_and_xfyun(monkeypatch: Any) -> None:
     """档位生效采证：latency 档下 LLM 组装收到 mlx、槽按 xfyun 建重资产、ready 回显档名。"""
     monkeypatch.setattr("voice_pipeline.providers.factory._mlx_available", lambda: True)
+    monkeypatch.setattr(
+        "voice_pipeline.providers.llm.mlx_llm._local_model_path", lambda model: "/models/qwen"
+    )
     monkeypatch.setenv("XFYUN_TTS_APPID", "app")
     monkeypatch.setenv("XFYUN_TTS_API_KEY", "key")
     monkeypatch.setenv("XFYUN_TTS_API_SECRET", "secret")
@@ -348,6 +351,9 @@ def test_ws_no_profile_param_is_env_behavior(monkeypatch: Any) -> None:
 def test_ws_profile_overrides_env_tts(monkeypatch: Any) -> None:
     """优先级钉死：显式档压过 env（env=melo + latency 档 → 槽按 xfyun 建）。"""
     monkeypatch.setattr("voice_pipeline.providers.factory._mlx_available", lambda: True)
+    monkeypatch.setattr(
+        "voice_pipeline.providers.llm.mlx_llm._local_model_path", lambda model: "/models/qwen"
+    )
     monkeypatch.setenv("VOICE_PIPELINE_TTS_ENGINE", "melo")
     monkeypatch.setenv("XFYUN_TTS_APPID", "app")
     monkeypatch.setenv("XFYUN_TTS_API_KEY", "key")

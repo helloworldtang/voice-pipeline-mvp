@@ -163,10 +163,20 @@ def profile_error(name: str) -> str | None:
         if not os.environ.get(API_KEY_ENV, "").strip():
             return f"cloud 档需要 {API_KEY_ENV}（LLM 与 TTS 共用），本服务未配置"
         return None
-    # latency 档：MlxLlm 构造不抛（加载都在 preload），必须显式预检依赖——
-    # 不检的话要到首轮 preload 才炸，晚失败正是要消灭的形态
+    # latency 档：MlxLlm 构造不抛（加载都在 preload），必须显式预检依赖与
+    # 模型——不检的话要到首轮 astream 才炸成 turn_failed，晚失败正是要消灭
+    # 的形态（2026-11-03 验收实锤：快照缺 .gitattributes/README 也会被判
+    # 「不在本地」，权重齐全照样首轮炸）
     if not _mlx_available():
         return "latency 档需要本地 mlx-lm 依赖（仅 macOS/arm64），本服务未安装"
+    from voice_pipeline.providers.llm.mlx_llm import _local_model_path, _resolve_model
+
+    if _local_model_path(_resolve_model(None)) is None:
+        return (
+            "latency 档的本地模型不在缓存（快照不完整也算不在）：先 "
+            "uv run --with modelscope python scripts/fetch_model.py --repo "
+            "mlx-community/Qwen2.5-1.5B-Instruct-4bit 离线拉好再连"
+        )
     from voice_pipeline.providers.tts.xfyun_tts import APP_ID_ENV, KEY_ENV, SECRET_ENV
 
     missing = [
