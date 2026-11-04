@@ -4,7 +4,8 @@
 # 前提：本机免密 ssh ubuntu@ECS 可达；首次部署见 deploy/SETUP.md。
 set -euo pipefail
 
-HOST="${VOICE_PILOT_HOST:-ubuntu@YOUR_SERVER_IP}"
+# 服务器地址不进仓：export VOICE_PILOT_HOST=ubuntu@your-server-ip
+HOST="${VOICE_PILOT_HOST:?未设置 VOICE_PILOT_HOST（例：export VOICE_PILOT_HOST=ubuntu@1.2.3.4）}"
 # rsync 目标里 ~ 不展开，用相对 home 的路径
 REMOTE_DIR=voice-pipeline-mvp
 

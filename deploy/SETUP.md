@@ -102,8 +102,9 @@ jq -c '{turn, caliber_b_ms, eou_latency_ms, spans: (.spans|length)}' \
 ## 7. 验收
 
 ```bash
+# 下文用 $HOST 指代你的服务器（例：export HOST=ubuntu@1.2.3.4）
 curl -s http://127.0.0.1:8000/healthz          # {"status":"ok"}
-curl -s http://YOUR_SERVER_IP/                # voice-pilot 页面 HTML
+curl -s "http://${HOST#*@}/"                   # voice-pilot 页面 HTML
 # 本机开麦（secure context）：浏览器访问 http://localhost:8888
-ssh -L 8888:localhost:8000 ubuntu@YOUR_SERVER_IP
+ssh -L 8888:localhost:8000 "$HOST"
 ```
